@@ -502,6 +502,8 @@
       ]
     }
   ],
+  "variables": [],
+  "business_objects": [],
   "elements": [
     {
       "page": "Products",

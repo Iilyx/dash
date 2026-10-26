@@ -32,6 +32,124 @@ def columns(node: dict | None) -> list[dict]:
     return result
 
 
+def string_list(node) -> list[str]:
+    if isinstance(node, list):
+        return [str(item) for item in node]
+    if isinstance(node, dict):
+        return [str(item) for item in numbered(node)]
+    if isinstance(node, str) and node:
+        return [node]
+    return []
+
+
+def dialog_items(info: dict) -> list[dict]:
+    item_nodes = info.get("Items")
+    parsed = []
+    for item in numbered(item_nodes) if isinstance(item_nodes, dict) else item_nodes or []:
+        if not isinstance(item, dict):
+            continue
+        row = {"key": item.get("Key"), "value": item.get("Value")}
+        if item.get("KeyTo") not in (None, ""):
+            row["key_to"] = item.get("KeyTo")
+        if item.get("ValueTo") not in (None, ""):
+            row["value_to"] = item.get("ValueTo")
+        parsed.append(row)
+    if parsed:
+        return parsed
+    keys = string_list(info.get("Keys"))
+    values = string_list(info.get("Values"))
+    rows = []
+    for index in range(max(len(keys), len(values))):
+        rows.append(
+            {
+                "key": keys[index] if index < len(keys) else None,
+                "value": values[index] if index < len(values) else None,
+            }
+        )
+    return rows
+
+
+def dialog_info(node: dict | None) -> dict | None:
+    """StiDialogInfo: the list a user picks from when the variable is requested."""
+    if not isinstance(node, dict):
+        return None
+    info: dict = {}
+    items = dialog_items(node)
+    if items:
+        info["items"] = items
+    for source, target in (
+        ("KeysColumn", "keys_column"),
+        ("ValuesColumn", "values_column"),
+        ("BindingValuesColumn", "binding_values_column"),
+        ("Mask", "mask"),
+        ("DateTimeType", "date_time_type"),
+        ("ItemsInitializationType", "items_from"),
+    ):
+        value = node.get(source)
+        if value not in (None, ""):
+            info[target] = value
+    if "AllowUserValues" in node:
+        info["allow_user_values"] = bool(node.get("AllowUserValues"))
+    binding = node.get("BindingVariable")
+    if isinstance(binding, dict) and binding.get("Name"):
+        info["binding_variable"] = binding.get("Name")
+    elif isinstance(binding, str) and binding:
+        info["binding_variable"] = binding
+    return info or None
+
+
+def variables(node: dict | None) -> list[dict]:
+    result = []
+    for variable in numbered(node):
+        if not isinstance(variable, dict) or not variable.get("Name"):
+            continue
+        item = {
+            "name": variable.get("Name"),
+            "alias": variable.get("Alias") or variable.get("Name"),
+            "type": variable.get("Type"),
+            "value": variable.get("Value"),
+        }
+        for source, target in (
+            ("Category", "category"),
+            ("Description", "description"),
+            ("InitBy", "init_by"),
+            ("InitByExpressionFrom", "from"),
+            ("InitByExpressionTo", "to"),
+            ("Selection", "selection"),
+        ):
+            value = variable.get(source)
+            if value not in (None, ""):
+                item[target] = value
+        if variable.get("RequestFromUser"):
+            item["request_from_user"] = True
+        if variable.get("AllowUseAsSqlParameter"):
+            item["sql_parameter"] = True
+        if variable.get("ReadOnly"):
+            item["read_only"] = True
+        dialog = dialog_info(variable.get("DialogInfo"))
+        if dialog:
+            item["dialog"] = dialog
+        result.append(item)
+    return result
+
+
+def business_objects(node: dict | None) -> list[dict]:
+    result = []
+    for obj in numbered(node):
+        if not isinstance(obj, dict) or not obj.get("Name"):
+            continue
+        item = {
+            "name": obj.get("Name"),
+            "alias": obj.get("Alias") or obj.get("Name"),
+            "columns": columns(obj.get("Columns")),
+        }
+        nested = business_objects(obj.get("BusinessObjects"))
+        if nested:
+            item["objects"] = nested
+        result.append(item)
+    return result
+
+
 def parameters(node: dict | None) -> list[dict]:
     result = []
     for parameter in numbered(node):
@@ -127,6 +245,9 @@ def catalog_from_report(report: dict) -> dict:
             }
         )
 
+    variables_list = variables(dictionary.get("Variables"))
+    objects = business_objects(dictionary.get("BusinessObjects"))
+
     elements = []
     for page in numbered(report.get("Pages")):
         if not isinstance(page, dict):
@@ -149,13 +270,19 @@ def catalog_from_report(report: dict) -> dict:
                 }
             )
 
-    return {
+    catalog = {
         "report": report.get("ReportName") or report.get("ReportAlias"),
         "databases": databases,
         "sources": sources,
         "relations": relations,
+        "variables": variables_list,
+        "business_objects": objects,
         "elements": elements,
     }
+    description = report.get("ReportDescription")
+    if description:
+        catalog["description"] = description
+    return catalog
 
 
 def load_mrt(path: Path) -> dict:
@@ -177,6 +304,7 @@ def main() -> None:
     args.output.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(
         f"{catalog['report']}: {len(catalog['sources'])} sources, "
+        f"{len(catalog['variables'])} variables, "
         f"{len(catalog['relations'])} relations, {len(catalog['elements'])} elements"
     )
 
