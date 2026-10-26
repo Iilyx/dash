@@ -1,5 +1,8 @@
 {
-  "report": "Sales of Products",
+  "report": {
+    "name": "Sales of Products",
+    "alias": "Sales Of Products"
+  },
   "databases": [
     {
       "name": "MySQL",
@@ -481,6 +484,7 @@
   "relations": [
     {
       "name": "Categories",
+      "alias": "Categories",
       "parent": "categories",
       "child": "products",
       "parent_columns": [
@@ -492,6 +496,7 @@
     },
     {
       "name": "Name",
+      "alias": "Name",
       "parent": "suppliers",
       "child": "products",
       "parent_columns": [
@@ -502,53 +507,125 @@
       ]
     }
   ],
-  "variables": [],
-  "business_objects": [],
-  "elements": [
+  "pages": [
     {
-      "page": "Products",
-      "name": "TreeView1",
-      "type": "StiTreeViewElement",
-      "title": "Tree View",
-      "expressions": [
-        "Products.ProductName"
-      ]
-    },
-    {
-      "page": "Products",
-      "name": "Indicator1",
-      "type": "StiIndicatorElement",
-      "title": "Volume in Stock",
-      "expressions": [
-        "Sum(products.UnitPrice)"
-      ]
-    },
-    {
-      "page": "Products",
-      "name": "Gauge1",
-      "type": "StiGaugeElement",
-      "title": "Units In Stock",
-      "expressions": [
-        "Sum(products.UnitsInStock)"
-      ]
-    },
-    {
-      "page": "Products",
-      "name": "Gauge2",
-      "type": "StiGaugeElement",
-      "title": "Units on Order",
-      "expressions": [
-        "Sum(products.UnitsOnOrder)"
-      ]
-    },
-    {
-      "page": "Products",
-      "name": "RegionMap1",
-      "type": "StiRegionMapElement",
-      "title": "Units in Stock by Country",
-      "expressions": [
-        "suppliers.Country",
-        "products.UnitsInStock"
+      "name": "Dashboard1",
+      "alias": "Products",
+      "type": "StiDashboard",
+      "elements": [
+        {
+          "name": "Text1",
+          "type": "StiTextElement",
+          "title": "Text",
+          "text": "Products",
+          "interaction": {
+            "on_click": "OpenHyperlink"
+          }
+        },
+        {
+          "name": "TreeView1",
+          "type": "StiTreeViewElement",
+          "title": "Tree View",
+          "expressions": [
+            "Products.ProductName"
+          ],
+          "parent": "a9f9d175c06246bab6a884a49197b9c1"
+        },
+        {
+          "name": "Indicator1",
+          "type": "StiIndicatorElement",
+          "title": "Volume in Stock",
+          "expressions": [
+            "Sum(products.UnitPrice)"
+          ],
+          "formats": [
+            {
+              "type": "StiCurrencyFormatService",
+              "decimals": 2,
+              "state": "DecimalDigits, Abbreviation",
+              "negative": 0,
+              "positive": 0,
+              "kind": "TextFormat"
+            },
+            {
+              "type": "StiPercentageFormatService",
+              "decimals": 2,
+              "symbol": "%",
+              "negative": 1,
+              "positive": 1,
+              "kind": "TargetFormat"
+            }
+          ]
+        },
+        {
+          "name": "Gauge1",
+          "type": "StiGaugeElement",
+          "title": "Units In Stock",
+          "expressions": [
+            "0",
+            "33",
+            "66",
+            "100",
+            "Sum(products.UnitsInStock)"
+          ],
+          "formats": [
+            {
+              "type": "StiNumberFormatService",
+              "decimals": 0,
+              "state": "DecimalDigits, Abbreviation",
+              "negative": 1,
+              "kind": "ValueFormat"
+            }
+          ],
+          "interaction": {
+            "on_click": "ApplyFilter"
+          }
+        },
+        {
+          "name": "Gauge2",
+          "type": "StiGaugeElement",
+          "title": "Units on Order",
+          "expressions": [
+            "0",
+            "33",
+            "66",
+            "100",
+            "Sum(products.UnitsOnOrder)"
+          ],
+          "formats": [
+            {
+              "type": "StiNumberFormatService",
+              "decimals": 0,
+              "state": "DecimalDigits, Abbreviation",
+              "negative": 1,
+              "kind": "ValueFormat"
+            }
+          ],
+          "interaction": {
+            "on_click": "ApplyFilter"
+          }
+        },
+        {
+          "name": "RegionMap1",
+          "type": "StiRegionMapElement",
+          "title": "Units in Stock by Country",
+          "expressions": [
+            "suppliers.Country",
+            "products.UnitsInStock"
+          ],
+          "formats": [
+            {
+              "type": "StiNumberFormatService",
+              "decimals": 1,
+              "state": "DecimalDigits, Abbreviation",
+              "negative": 1,
+              "kind": "ValueFormat"
+            }
+          ],
+          "interaction": {
+            "on_click": "ApplyFilter"
+          }
+        }
       ]
     }
   ]

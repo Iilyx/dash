@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sales of Products</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Дашборд</p>
+      <h1>Sales of Products</h1>
+    </div>
+    <div class="slice" id="slice">Срез не выбран</div>
+  </header>
+  <main>
+    <section class="board">
+      <iframe title="Дашборд" src="/viewer"></iframe>
+    </section>
+    <aside class="chat">
+      <div class="log" id="log"></div>
+      <form id="ask">
+        <textarea id="question" rows="3" placeholder="Спросить про текущий срез" required></textarea>
+        <button type="submit">Спросить</button>
+      </form>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
