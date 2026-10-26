@@ -1,0 +1,553 @@
+{
+  "report": "Sales of Products",
+  "databases": [
+    {
+      "name": "MySQL",
+      "alias": "MySQL",
+      "type": "StiMySqlDatabase"
+    }
+  ],
+  "sources": [
+    {
+      "name": "categories",
+      "alias": "categories",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from categories",
+      "columns": [
+        {
+          "name": "CategoryID",
+          "alias": "CategoryID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "CategoryName",
+          "alias": "CategoryName",
+          "type": "System.String"
+        },
+        {
+          "name": "Description",
+          "alias": "Description",
+          "type": "System.String"
+        },
+        {
+          "name": "Picture",
+          "alias": "Picture",
+          "type": "System.Byte[]"
+        }
+      ]
+    },
+    {
+      "name": "customers",
+      "alias": "customers",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from customers",
+      "columns": [
+        {
+          "name": "CustomerID",
+          "alias": "CustomerID",
+          "type": "System.String"
+        },
+        {
+          "name": "CompanyName",
+          "alias": "CompanyName",
+          "type": "System.String"
+        },
+        {
+          "name": "ContactName",
+          "alias": "ContactName",
+          "type": "System.String"
+        },
+        {
+          "name": "ContactTitle",
+          "alias": "ContactTitle",
+          "type": "System.String"
+        },
+        {
+          "name": "Address",
+          "alias": "Address",
+          "type": "System.String"
+        },
+        {
+          "name": "City",
+          "alias": "City",
+          "type": "System.String"
+        },
+        {
+          "name": "Region",
+          "alias": "Region",
+          "type": "System.String"
+        },
+        {
+          "name": "PostalCode",
+          "alias": "PostalCode",
+          "type": "System.String"
+        },
+        {
+          "name": "Country",
+          "alias": "Country",
+          "type": "System.String"
+        },
+        {
+          "name": "Phone",
+          "alias": "Phone",
+          "type": "System.String"
+        },
+        {
+          "name": "Fax",
+          "alias": "Fax",
+          "type": "System.String"
+        },
+        {
+          "name": "Image",
+          "alias": "Image",
+          "type": "System.Byte[]"
+        },
+        {
+          "name": "ImageThumbnail",
+          "alias": "ImageThumbnail",
+          "type": "System.Byte[]"
+        }
+      ]
+    },
+    {
+      "name": "employees",
+      "alias": "employees",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from employees",
+      "columns": [
+        {
+          "name": "EmployeeID",
+          "alias": "EmployeeID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "LastName",
+          "alias": "LastName",
+          "type": "System.String"
+        },
+        {
+          "name": "FirstName",
+          "alias": "FirstName",
+          "type": "System.String"
+        },
+        {
+          "name": "Title",
+          "alias": "Title",
+          "type": "System.String"
+        },
+        {
+          "name": "TitleOfCourtesy",
+          "alias": "TitleOfCourtesy",
+          "type": "System.String"
+        },
+        {
+          "name": "BirthDate",
+          "alias": "BirthDate",
+          "type": "System.DateTime"
+        },
+        {
+          "name": "HireDate",
+          "alias": "HireDate",
+          "type": "System.DateTime"
+        },
+        {
+          "name": "Address",
+          "alias": "Address",
+          "type": "System.String"
+        },
+        {
+          "name": "City",
+          "alias": "City",
+          "type": "System.String"
+        },
+        {
+          "name": "Region",
+          "alias": "Region",
+          "type": "System.String"
+        },
+        {
+          "name": "PostalCode",
+          "alias": "PostalCode",
+          "type": "System.String"
+        },
+        {
+          "name": "Country",
+          "alias": "Country",
+          "type": "System.String"
+        },
+        {
+          "name": "HomePhone",
+          "alias": "HomePhone",
+          "type": "System.String"
+        },
+        {
+          "name": "Extension",
+          "alias": "Extension",
+          "type": "System.String"
+        },
+        {
+          "name": "Photo",
+          "alias": "Photo",
+          "type": "System.Byte[]"
+        },
+        {
+          "name": "Notes",
+          "alias": "Notes",
+          "type": "System.String"
+        },
+        {
+          "name": "ReportsTo",
+          "alias": "ReportsTo",
+          "type": "System.Int32"
+        }
+      ]
+    },
+    {
+      "name": "order details",
+      "alias": "order details",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from `order details`",
+      "columns": [
+        {
+          "name": "OrderID",
+          "alias": "OrderID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "ProductID",
+          "alias": "ProductID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "UnitPrice",
+          "alias": "UnitPrice",
+          "type": "System.Decimal"
+        },
+        {
+          "name": "Quantity",
+          "alias": "Quantity",
+          "type": "System.Int32"
+        },
+        {
+          "name": "Discount",
+          "alias": "Discount",
+          "type": "System.Single"
+        }
+      ]
+    },
+    {
+      "name": "orders",
+      "alias": "orders",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from orders",
+      "columns": [
+        {
+          "name": "OrderID",
+          "alias": "OrderID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "CustomerID",
+          "alias": "CustomerID",
+          "type": "System.String"
+        },
+        {
+          "name": "EmployeeID",
+          "alias": "EmployeeID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "OrderDate",
+          "alias": "OrderDate",
+          "type": "System.DateTime"
+        },
+        {
+          "name": "RequiredDate",
+          "alias": "RequiredDate",
+          "type": "System.DateTime"
+        },
+        {
+          "name": "ShippedDate",
+          "alias": "ShippedDate",
+          "type": "System.DateTime"
+        },
+        {
+          "name": "ShipVia",
+          "alias": "ShipVia",
+          "type": "System.Int32"
+        },
+        {
+          "name": "Freight",
+          "alias": "Freight",
+          "type": "System.Decimal"
+        },
+        {
+          "name": "ShipName",
+          "alias": "ShipName",
+          "type": "System.String"
+        },
+        {
+          "name": "ShipAddress",
+          "alias": "ShipAddress",
+          "type": "System.String"
+        },
+        {
+          "name": "ShipCity",
+          "alias": "ShipCity",
+          "type": "System.String"
+        },
+        {
+          "name": "ShipRegion",
+          "alias": "ShipRegion",
+          "type": "System.String"
+        },
+        {
+          "name": "ShipPostalCode",
+          "alias": "ShipPostalCode",
+          "type": "System.String"
+        },
+        {
+          "name": "ShipCountry",
+          "alias": "ShipCountry",
+          "type": "System.String"
+        }
+      ]
+    },
+    {
+      "name": "products",
+      "alias": "products",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from products where products.CategoryID = @Category",
+      "columns": [
+        {
+          "name": "ProductID",
+          "alias": "ProductID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "ProductName",
+          "alias": "ProductName",
+          "type": "System.String"
+        },
+        {
+          "name": "SupplierID",
+          "alias": "SupplierID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "CategoryID",
+          "alias": "CategoryID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "QuantityPerUnit",
+          "alias": "QuantityPerUnit",
+          "type": "System.String"
+        },
+        {
+          "name": "UnitPrice",
+          "alias": "UnitPrice",
+          "type": "System.Decimal"
+        },
+        {
+          "name": "UnitsInStock",
+          "alias": "UnitsInStock",
+          "type": "System.Int32"
+        },
+        {
+          "name": "UnitsOnOrder",
+          "alias": "UnitsOnOrder",
+          "type": "System.Int32"
+        },
+        {
+          "name": "ReorderLevel",
+          "alias": "ReorderLevel",
+          "type": "System.Int32"
+        },
+        {
+          "name": "Discontinued",
+          "alias": "Discontinued",
+          "type": "System.SByte"
+        }
+      ],
+      "parameters": [
+        {
+          "name": "Category",
+          "expression": "8",
+          "type": 8
+        }
+      ]
+    },
+    {
+      "name": "shippers",
+      "alias": "shippers",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from shippers",
+      "columns": [
+        {
+          "name": "ShipperID",
+          "alias": "ShipperID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "CompanyName",
+          "alias": "CompanyName",
+          "type": "System.String"
+        },
+        {
+          "name": "Phone",
+          "alias": "Phone",
+          "type": "System.String"
+        }
+      ]
+    },
+    {
+      "name": "suppliers",
+      "alias": "suppliers",
+      "type": "StiMySqlSource",
+      "database": "MySQL",
+      "sql": "select * from suppliers",
+      "columns": [
+        {
+          "name": "SupplierID",
+          "alias": "SupplierID",
+          "type": "System.Int32"
+        },
+        {
+          "name": "CompanyName",
+          "alias": "CompanyName",
+          "type": "System.String"
+        },
+        {
+          "name": "ContactName",
+          "alias": "ContactName",
+          "type": "System.String"
+        },
+        {
+          "name": "ContactTitle",
+          "alias": "ContactTitle",
+          "type": "System.String"
+        },
+        {
+          "name": "Address",
+          "alias": "Address",
+          "type": "System.String"
+        },
+        {
+          "name": "City",
+          "alias": "City",
+          "type": "System.String"
+        },
+        {
+          "name": "Region",
+          "alias": "Region",
+          "type": "System.String"
+        },
+        {
+          "name": "PostalCode",
+          "alias": "PostalCode",
+          "type": "System.String"
+        },
+        {
+          "name": "Country",
+          "alias": "Country",
+          "type": "System.String"
+        },
+        {
+          "name": "Phone",
+          "alias": "Phone",
+          "type": "System.String"
+        },
+        {
+          "name": "Fax",
+          "alias": "Fax",
+          "type": "System.String"
+        },
+        {
+          "name": "HomePage",
+          "alias": "HomePage",
+          "type": "System.String"
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "name": "Categories",
+      "parent": "categories",
+      "child": "products",
+      "parent_columns": [
+        "CategoryID"
+      ],
+      "child_columns": [
+        "CategoryID"
+      ]
+    },
+    {
+      "name": "Name",
+      "parent": "suppliers",
+      "child": "products",
+      "parent_columns": [
+        "SupplierID"
+      ],
+      "child_columns": [
+        "SupplierID"
+      ]
+    }
+  ],
+  "elements": [
+    {
+      "page": "Products",
+      "name": "TreeView1",
+      "type": "StiTreeViewElement",
+      "title": "Tree View",
+      "expressions": [
+        "Products.ProductName"
+      ]
+    },
+    {
+      "page": "Products",
+      "name": "Indicator1",
+      "type": "StiIndicatorElement",
+      "title": "Volume in Stock",
+      "expressions": [
+        "Sum(products.UnitPrice)"
+      ]
+    },
+    {
+      "page": "Products",
+      "name": "Gauge1",
+      "type": "StiGaugeElement",
+      "title": "Units In Stock",
+      "expressions": [
+        "Sum(products.UnitsInStock)"
+      ]
+    },
+    {
+      "page": "Products",
+      "name": "Gauge2",
+      "type": "StiGaugeElement",
+      "title": "Units on Order",
+      "expressions": [
+        "Sum(products.UnitsOnOrder)"
+      ]
+    },
+    {
+      "page": "Products",
+      "name": "RegionMap1",
+      "type": "StiRegionMapElement",
+      "title": "Units in Stock by Country",
+      "expressions": [
+        "suppliers.Country",
+        "products.UnitsInStock"
+      ]
+    }
+  ]
+}
