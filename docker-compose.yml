@@ -11,7 +11,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - pgdata67:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./data:/data:ro
     healthcheck:
@@ -20,5 +20,12 @@ services:
       timeout: 5s
       retries: 10
 
+  # Локальный Postgres MCP. Хост: docker compose run --rm -i mcp
+  mcp:
+    image: mcp/postgres
+    container_name: mcp_pg_bi_mcp
+    command:
+      - "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
+
 volumes:
-  pgdata67:
+  pgdata:

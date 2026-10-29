@@ -1,38 +1,52 @@
-# extract_mrt
+# dash
 
-Превращает Stimulsoft `.mrt` (JSON) в компактный каталог для LLM: источники, SQL, колонки, параметры, связи, переменные с DialogInfo, выражения виджетов, форматы чисел и фильтры шаблона.
+Пайплайн вопросов по Stimulsoft `.mrt`:
 
-Строки подключения, layout, картинки и скрипты в каталог не попадают. XML `.mrt` не поддерживаются.
+1. `extract_mrt` → `catalog.json`
+2. каталог и дефолтные параметры → системный промпт
+3. локальная LLM находит SQL
+4. локальный Postgres MCP (`query`, read-only) → строки
+5. логика дашборда → ответ
 
-Нужен Python 3.10+. Зависимостей у скрипта нет; окружение поднимается через `uv`.
+## Инфраструктура (compose)
 
-## Окружение
+Пока в compose только **БД** и **MCP**:
+
+```bash
+docker compose up -d db
+docker pull mcp/postgres
+```
+
+MCP — сервис `mcp` (образ `mcp/postgres`), в одной сети с `db`.  
+Хост поднимает его локально по stdio:
+
+```bash
+docker compose run --rm -i mcp
+```
+
+## Хост и модель — на машине
 
 ```bash
 uv venv --python 3.12
 uv pip install -r requirements.txt
+cp .env.example .env
+# задай LLM_MODEL
+docker compose up -d db
+.venv/bin/python host.py
 ```
 
-## Запуск
+- API: `http://127.0.0.1:8090`
+- LLM: `http://127.0.0.1:8080/v1`
+- Postgres: `127.0.0.1:5432`
 
 ```bash
-.venv/bin/python extract_mrt.py SalesOfProducts.mrt
-.venv/bin/python extract_mrt.py SalesOfProducts.mrt -o catalog.json
+curl -s http://127.0.0.1:8090/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"сколько на складе"}'
 ```
 
-Без `-o` каталог печатается в stdout.
+## Каталог
 
-## Что в каталоге
-
-| Раздел | Содержание |
-| --- | --- |
-| `report` | имя, alias, описание |
-| `databases` | имя и тип БД без connection string |
-| `sources` | SQL/запрос, колонки, параметры, фильтры источника |
-| `relations` | связи parent/child и колонки join |
-| `variables` | переменные, в том числе DialogInfo (keys/values, привязки) |
-| `business_objects` | бизнес-объекты и их колонки |
-| `resources` / `functions` | имя и тип, без содержимого |
-| `pages` | страницы и элементы: title/text, expressions, formats, filters, interaction |
-
-Пример: `SalesOfProducts.mrt` → `catalog.json`.
+```bash
+.venv/bin/python extract_mrt.py SalesOfProducts.mrt -o catalog.json
+```
