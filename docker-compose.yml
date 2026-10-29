@@ -11,7 +11,7 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata67:/var/lib/postgresql/data
       - ./init:/docker-entrypoint-initdb.d:ro
       - ./data:/data:ro
     healthcheck:
@@ -28,4 +28,4 @@ services:
       - "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
 
 volumes:
-  pgdata:
+  pgdata67:
