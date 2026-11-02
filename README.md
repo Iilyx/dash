@@ -3,10 +3,10 @@
 Пайплайн вопросов по Stimulsoft `.mrt`:
 
 1. `extract_mrt` → `catalog.json`
-2. SQL из `.mrt` — шаблоны; `@Name` / `{Name}` — переменные
-3. значение из вопроса / `parameters`, иначе дефолт из mrt
-4. **Postgres MCP Pro** (`crystaldba/postgres-mcp`, `execute_sql`, restricted)
-5. логика виджетов → ответ
+2. `Dictionary.Variables` → в SQL только как `{Name}` (например `{year}`)
+3. голое `year` / `CategoryID` в SQL — колонка БД, не переменная
+4. из вопроса заполняем Variables; иначе дефолт из mrt; подставляем только `{Name}`
+5. **Postgres MCP Pro** (`execute_sql`, restricted) → строки → ответ
 
 ## Compose
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Ask pipeline: .mrt catalog → Postgres MCP Pro → answer.
 
-SQL templates and @Name/{Name} variables come from the .mrt.
+Dictionary.Variables → placeholders {Name} in SQL.
+Bare identifiers (year, CategoryID, …) are DB columns, not variables.
 MCP is crystaldba/postgres-mcp via docker run -i --rm (restricted).
 """
 
@@ -33,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 MAX_TOOL_ROUNDS = 4
 MAX_TOOL_CHARS = 24_000
 LOG_PREVIEW = 400
-PLACEHOLDER_AT = re.compile(r"@([A-Za-z_][A-Za-z0-9_]*)")
+# Only {Name} is a Stimulsoft variable. Bare Name is a column.
 PLACEHOLDER_BRACE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 log = logging.getLogger("host")
@@ -137,11 +138,11 @@ def ensure_catalog() -> dict:
     return json.loads(catalog_path.read_text(encoding="utf-8"))
 
 
-def placeholders_in(sql: str) -> list[str]:
-    names = PLACEHOLDER_AT.findall(sql) + PLACEHOLDER_BRACE.findall(sql)
+def braces_in_sql(sql: str) -> list[str]:
+    """Names inside {…} only. Bare year / CategoryID are columns, not variables."""
     seen: set[str] = set()
     ordered: list[str] = []
-    for name in names:
+    for name in PLACEHOLDER_BRACE.findall(sql):
         if name in seen:
             continue
         seen.add(name)
@@ -149,29 +150,42 @@ def placeholders_in(sql: str) -> list[str]:
     return ordered
 
 
-def query_templates(catalog: dict) -> list[dict]:
-    """SQL from .mrt sources + placeholders {@Name}/{Name} and their defaults."""
-    defaults_by_name: dict[str, Any] = {}
-    for source in catalog.get("sources") or []:
-        if not isinstance(source, dict):
-            continue
-        for param in source.get("parameters") or []:
-            if not isinstance(param, dict):
-                continue
-            name = param.get("name")
-            value = param.get("expression")
-            if value is None:
-                value = param.get("value")
-            if name and value not in (None, ""):
-                defaults_by_name[str(name)] = value
+def dashboard_variables(catalog: dict) -> list[dict]:
+    """Only Dictionary.Variables. In SQL each is written as {Name}, never as bare Name."""
+    result: list[dict] = []
     for variable in catalog.get("variables") or []:
         if not isinstance(variable, dict):
             continue
         name = variable.get("name")
-        value = variable.get("value")
-        if name and value not in (None, ""):
-            defaults_by_name[str(name)] = value
+        if not name:
+            continue
+        name = str(name)
+        item = {
+            "name": name,
+            "alias": variable.get("alias"),
+            "token": f"{{{name}}}",
+            "default": variable.get("value"),
+            "description": variable.get("description"),
+            "type": variable.get("type"),
+            "from": variable.get("from"),
+            "to": variable.get("to"),
+            "dialog": variable.get("dialog"),
+        }
+        result.append({key: value for key, value in item.items() if value not in (None, "", [])})
+    return result
 
+
+def variable_defaults(catalog: dict) -> dict[str, Any]:
+    return {
+        item["token"]: item.get("default")
+        for item in dashboard_variables(catalog)
+        if item.get("token")
+    }
+
+
+def query_templates(catalog: dict) -> list[dict]:
+    """SQL templates; only {Name} tokens that exist in Dictionary.Variables."""
+    by_name = {item["name"]: item for item in dashboard_variables(catalog)}
     templates: list[dict] = []
     for source in catalog.get("sources") or []:
         if not isinstance(source, dict):
@@ -179,59 +193,47 @@ def query_templates(catalog: dict) -> list[dict]:
         sql = source.get("sql")
         if not isinstance(sql, str) or not sql.strip():
             continue
-        names = placeholders_in(sql)
-        # parameters declared on the source even if not in SQL text yet
-        for param in source.get("parameters") or []:
-            if isinstance(param, dict) and param.get("name"):
-                name = str(param["name"])
-                if name not in names:
-                    names.append(name)
+        linked = []
+        for name in braces_in_sql(sql):
+            meta = by_name.get(name)
+            if not meta:
+                # {foo} in SQL but no Variable — leave as-is, do not invent
+                linked.append({"name": name, "token": f"{{{name}}}", "unknown": True})
+                continue
+            linked.append(
+                {
+                    "name": meta["name"],
+                    "token": meta["token"],
+                    "alias": meta.get("alias"),
+                    "default": meta.get("default"),
+                }
+            )
         templates.append(
             {
                 "source": source.get("name"),
                 "sql": sql.strip(),
-                "placeholders": [
-                    {
-                        "name": name,
-                        "in_sql": [f"@{name}", f"{{{name}}}"],
-                        "default": defaults_by_name.get(name),
-                    }
-                    for name in names
-                ],
+                "variables": linked,
             }
         )
     return templates
 
 
 def default_parameters(catalog: dict) -> list[dict]:
-    defaults: list[dict] = []
-    for template in query_templates(catalog):
-        for item in template.get("placeholders") or []:
-            if item.get("default") in (None, ""):
-                continue
-            defaults.append(
-                {
-                    "source": template.get("source"),
-                    "name": item["name"],
-                    "sql_placeholder": f"@{item['name']}",
-                    "brace_placeholder": f"{{{item['name']}}}",
-                    "value": item["default"],
-                }
-            )
-    return defaults
+    return [
+        {
+            "token": item["token"],
+            "name": item["name"],
+            "alias": item.get("alias"),
+            "value": item.get("default"),
+        }
+        for item in dashboard_variables(catalog)
+        if item.get("default") not in (None, "")
+    ]
 
 
-def known_variables(catalog: dict) -> dict[str, Any]:
-    """name -> default (may be None if declared without default)."""
-    names: dict[str, Any] = {}
-    for template in query_templates(catalog):
-        for item in template.get("placeholders") or []:
-            name = item.get("name")
-            if not name:
-                continue
-            if name not in names or names[name] in (None, ""):
-                names[name] = item.get("default")
-    return names
+def known_variables(catalog: dict) -> dict[str, dict]:
+    """Dictionary Name -> meta. SQL token is always {Name}."""
+    return {item["name"]: item for item in dashboard_variables(catalog) if item.get("name")}
 
 
 def coerce_param_value(raw: str) -> Any:
@@ -243,19 +245,40 @@ def coerce_param_value(raw: str) -> Any:
     return text
 
 
-def extract_from_question(question: str, names: dict[str, Any]) -> dict[str, Any]:
-    """Pull variable values mentioned in the free-text question."""
+def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str, Any]:
+    """Values for Dictionary Variables ({year}, …) from the user question."""
     found: dict[str, Any] = {}
-    for name in names:
-        patterns = [
-            rf"(?i)\b{re.escape(name)}\b\s*[:=]\s*([^\s,;]+)",
-            rf"(?i)\b{re.escape(name)}\b\s+(?:is|равен|равна|=)?\s*([^\s,;]+)",
-            rf"(?i)\b{re.escape(name)}\b\s+(-?\d+(?:[.,]\d+)?)",
+    for name, meta in variables.items():
+        labels = [name]
+        alias = meta.get("alias")
+        if isinstance(alias, str) and alias.strip() and alias.strip().lower() != name.lower():
+            labels.append(alias.strip())
+        patterns: list[str] = [
+            rf"(?i)\{{{re.escape(name)}\}}\s*[:=]?\s*([^\s,;]+)",
         ]
-        # common Russian wording around Category-like params
-        if name.lower() == "category":
-            patterns.append(r"(?i)\bкатегор\w*\s*(?:№|#|id)?\s*[:=]?\s*(-?\d+)")
-            patterns.append(r"(?i)\bcategory\s*(?:id|№|#)?\s*[:=]?\s*(-?\d+)")
+        for label in labels:
+            patterns.extend(
+                [
+                    rf"(?i)\b{re.escape(label)}\b\s*[:=]\s*([^\s,;]+)",
+                    rf"(?i)\b{re.escape(label)}\b\s+(?:is|равен|равна|=)?\s*([^\s,;]+)",
+                    rf"(?i)\b{re.escape(label)}\b\s+(-?\d+(?:[.,]\d+)?)",
+                ]
+            )
+        lower = name.lower()
+        if lower == "year" or (isinstance(alias, str) and alias.lower() in {"год", "year"}):
+            patterns.extend(
+                [
+                    r"(?i)\b(?:за|в|год(?:у)?)\s*[:=]?\s*((?:19|20)\d{2})\b",
+                    r"(?i)\b((?:19|20)\d{2})\s*(?:год(?:у|а)?)?\b",
+                ]
+            )
+        if lower == "category" or (isinstance(alias, str) and "категор" in alias.lower()):
+            patterns.extend(
+                [
+                    r"(?i)\bкатегор\w*\s*(?:№|#|id)?\s*[:=]?\s*(-?\d+)",
+                    r"(?i)\bcategory\s*(?:id|№|#)?\s*[:=]?\s*(-?\d+)",
+                ]
+            )
         for pattern in patterns:
             match = re.search(pattern, question)
             if not match:
@@ -266,16 +289,67 @@ def extract_from_question(question: str, names: dict[str, Any]) -> dict[str, Any
 
 
 def resolve_parameters(question: str, catalog: dict) -> dict[str, Any]:
-    """Only question in /ask: extract params, else catalog defaults."""
-    names = known_variables(catalog)
-    extracted = extract_from_question(question, names)
+    """Resolve each Dictionary Variable; SQL gets {Name} filled, columns stay untouched."""
+    variables = known_variables(catalog)
+    extracted = extract_from_question(question, variables)
     resolved: dict[str, Any] = {}
-    for name, default in names.items():
+    for name, meta in variables.items():
+        token = meta["token"]
+        default = meta.get("default")
         if name in extracted:
-            resolved[name] = {"value": extracted[name], "source": "question"}
+            resolved[name] = {
+                "value": extracted[name],
+                "source": "question",
+                "token": token,
+                "alias": meta.get("alias"),
+            }
         elif default not in (None, ""):
-            resolved[name] = {"value": default, "source": "default"}
+            resolved[name] = {
+                "value": default,
+                "source": "default",
+                "token": token,
+                "alias": meta.get("alias"),
+            }
     return resolved
+
+
+def sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    text = str(value)
+    if re.fullmatch(r"-?\d+", text):
+        return text
+    if re.fullmatch(r"-?\d+[.,]\d+", text):
+        return text.replace(",", ".")
+    return "'" + text.replace("'", "''") + "'"
+
+
+def fill_sql(sql: str, resolved: dict[str, Any]) -> str:
+    """Replace only {Name} tokens. Never touch bare column names like year."""
+    filled = sql
+    for name, meta in resolved.items():
+        token = meta.get("token") or f"{{{name}}}"
+        filled = filled.replace(token, sql_literal(meta["value"]))
+    return filled
+
+
+def filled_queries(catalog: dict, resolved: dict[str, Any]) -> list[dict]:
+    queries = []
+    for template in query_templates(catalog):
+        sql = template.get("sql") or ""
+        queries.append(
+            {
+                "source": template.get("source"),
+                "sql_template": sql,
+                "sql_filled": fill_sql(sql, resolved),
+                "variables": template.get("variables") or [],
+            }
+        )
+    return queries
 
 
 def system_prompt(catalog: dict) -> str:
@@ -284,41 +358,49 @@ def system_prompt(catalog: dict) -> str:
     templates_body = json.dumps(templates, ensure_ascii=False, indent=2)
     defaults_body = json.dumps(defaults, ensure_ascii=False, indent=2)
     catalog_body = json.dumps(catalog, ensure_ascii=False, indent=2)
+    variables_body = json.dumps(dashboard_variables(catalog), ensure_ascii=False, indent=2)
     return (
         "Ты отвечаешь на вопросы по дашборду Stimulsoft.\n"
-        "SQL уже лежит в .mrt / каталоге. Не выдумывай новые таблицы с нуля — "
-        "бери шаблон из «SQL из mrt».\n"
-        "Плейсхолдеры в SQL — переменные @Name и {Name}.\n"
-        "В сообщении пользователя уже есть блок «Параметры»: их вытащили из вопроса, "
-        "а если в вопросе не указаны — поставили дефолты из mrt. "
-        "Подставь эти значения в SQL (и в @Name, и в {Name}). "
-        "Не проси отдельный JSON parameters.\n"
-        "Числа подставляй без кавычек, строки — в одинарных кавычках PostgreSQL.\n"
-        "SQL из каталога может быть MySQL — для execute_sql перепиши под PostgreSQL "
+        "Важно:\n"
+        "- Dictionary.Variables — переменные. В SQL они только в фигурных скобках: {year}, {Category}.\n"
+        "- Голое имя без скобок (year, CategoryID, products.CategoryID) — это поле/колонка БД, "
+        "не переменная. Его нельзя подменять и нельзя путать с {year}.\n"
+        "Хост уже подставил значения Variables в {Name} (из вопроса или default mrt).\n"
+        "В сообщении пользователя есть:\n"
+        "- «Переменные» — итоговые значения по токенам {Name}\n"
+        "- «SQL с подстановкой» — бери sql_filled для execute_sql\n"
+        "Не проси JSON parameters. Не оставляй {Name} в SQL. Колонки не трогай.\n"
+        "Если sql_filled ещё MySQL — слегка поправь под PostgreSQL "
         "(например `order details` → \"order details\").\n"
         "Пайплайн:\n"
-        "1) Выбери подходящий SQL-шаблон из mrt.\n"
-        "2) Подставь параметры из блока «Параметры».\n"
-        "3) Вызови execute_sql с готовым SQL (при необходимости сначала list_schemas / "
-        "list_objects / get_object_details).\n"
-        "4) По строкам примени логику виджетов (Sum/Count, форматы, фильтры шаблона).\n"
-        "5) Ответь на языке вопроса. Не выдумывай числа.\n\n"
-        f"SQL из mrt:\n{templates_body}\n\n"
-        f"Дефолтные параметры:\n{defaults_body}\n\n"
+        "1) Выбери нужный sql_filled.\n"
+        "2) Вызови execute_sql.\n"
+        "3) По строкам примени логику виджетов (Sum/Count, форматы, фильтры).\n"
+        "4) Ответь на языке вопроса. Не выдумывай числа.\n\n"
+        f"Variables из mrt (токен = {{Name}}):\n{variables_body}\n\n"
+        f"SQL-шаблоны:\n{templates_body}\n\n"
+        f"Дефолты Variables:\n{defaults_body}\n\n"
         f"Полный каталог:\n{catalog_body}"
     )
 
 
-def user_message(question: str, resolved: dict[str, Any]) -> str:
-    if not resolved:
+def user_message(question: str, resolved: dict[str, Any], queries: list[dict]) -> str:
+    variables = {
+        meta["token"]: {"value": meta["value"], "from": meta["source"]}
+        for meta in resolved.values()
+    }
+    ready = [
+        {"source": item["source"], "sql_filled": item["sql_filled"]}
+        for item in queries
+    ]
+    if not resolved and not ready:
         return question
-    flat = {name: meta["value"] for name, meta in resolved.items()}
-    origins = {name: meta["source"] for name, meta in resolved.items()}
     return (
         f"{question}\n\n"
-        "Параметры (из вопроса или дефолт mrt):\n"
-        f"{json.dumps(flat, ensure_ascii=False, indent=2)}\n"
-        f"Откуда: {json.dumps(origins, ensure_ascii=False)}"
+        "Переменные (только {Name} из Variables, не колонки БД):\n"
+        f"{json.dumps(variables, ensure_ascii=False, indent=2)}\n\n"
+        "SQL с подстановкой:\n"
+        f"{json.dumps(ready, ensure_ascii=False, indent=2)}"
     )
 
 
@@ -499,20 +581,23 @@ async def answer_question(
     prompt: str,
     question: str,
     resolved: dict[str, Any],
+    queries: list[dict],
 ) -> str:
     known = {tool["function"]["name"] for tool in tools}
     messages: list[dict] = [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": user_message(question, resolved)},
+        {"role": "user", "content": user_message(question, resolved, queries)},
     ]
     used_tools = False
     empty_retries = 0
     log.info(
-        "Вопрос: %s | resolved=%s | tools=%s",
+        "Вопрос: %s | variables=%s | tools=%s",
         preview(question, 200),
-        preview(resolved, 300),
+        preview({meta["token"]: meta["value"] for meta in resolved.values()}, 300),
         sorted(known),
     )
+    for item in queries:
+        log.info("SQL filled %s: %s", item.get("source"), preview(item.get("sql_filled"), 200))
     for round_no in range(1, MAX_TOOL_ROUNDS + 3):
         result = await llm_chat(
             llm,
@@ -620,9 +705,9 @@ async def lifespan(app: FastAPI):
     )
     for item in templates:
         log.info(
-            "SQL template %s placeholders=%s sql=%s",
+            "SQL template %s variables=%s sql=%s",
             item.get("source"),
-            [p["name"] for p in item.get("placeholders") or []],
+            [p["name"] for p in item.get("variables") or []],
             preview(item.get("sql"), 180),
         )
     headers = {}
@@ -683,10 +768,11 @@ async def ask(body: Ask) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="question is empty")
     resolved = resolve_parameters(question, app.state.catalog)
+    queries = filled_queries(app.state.catalog, resolved)
     log.info(
-        "POST /ask question=%s resolved=%s",
+        "POST /ask question=%s variables=%s",
         preview(question, 200),
-        preview(resolved, 300),
+        preview({meta["token"]: meta for meta in resolved.values()}, 400),
     )
     started = time.perf_counter()
     async with app.state.lock:
@@ -699,6 +785,7 @@ async def ask(body: Ask) -> dict:
                 prompt=app.state.prompt,
                 question=question,
                 resolved=resolved,
+                queries=queries,
             )
         except (httpx.HTTPError, RuntimeError) as exc:
             log.exception("Ошибка на /ask: %s", exc)
@@ -709,7 +796,10 @@ async def ask(body: Ask) -> dict:
     log.info("Ответ за %.2fs: %s", time.perf_counter() - started, preview(answer, 300))
     return {
         "answer": answer,
-        "parameters": {name: meta["value"] for name, meta in resolved.items()},
+        "variables": {
+            meta["token"]: {"value": meta["value"], "from": meta["source"]}
+            for meta in resolved.values()
+        },
     }
 
 
