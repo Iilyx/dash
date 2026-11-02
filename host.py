@@ -352,6 +352,31 @@ def filled_queries(catalog: dict, resolved: dict[str, Any]) -> list[dict]:
     return queries
 
 
+def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]) -> Path:
+    """Write executable sql_filled to txt right before the LLM call."""
+    path = resolve_path(os.environ.get("SQL_DUMP_PATH", "sql_filled.txt"))
+    blocks: list[str] = [
+        f"-- question: {question}",
+        "-- variables: "
+        + json.dumps(
+            {meta["token"]: meta["value"] for meta in resolved.values()},
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    for item in queries:
+        source = item.get("source") or "query"
+        sql = (item.get("sql_filled") or "").strip()
+        if not sql:
+            continue
+        blocks.append(f"-- source: {source}")
+        blocks.append(sql if sql.endswith(";") else sql + ";")
+        blocks.append("")
+    path.write_text("\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+    log.info("Исполняемый SQL → %s (%s queries)", path, len(queries))
+    return path
+
+
 def system_prompt(catalog: dict) -> str:
     templates = query_templates(catalog)
     defaults = default_parameters(catalog)
@@ -769,10 +794,12 @@ async def ask(body: Ask) -> dict:
         raise HTTPException(status_code=400, detail="question is empty")
     resolved = resolve_parameters(question, app.state.catalog)
     queries = filled_queries(app.state.catalog, resolved)
+    dump_path = dump_filled_sql(queries, question, resolved)
     log.info(
-        "POST /ask question=%s variables=%s",
+        "POST /ask question=%s variables=%s sql_dump=%s",
         preview(question, 200),
         preview({meta["token"]: meta for meta in resolved.values()}, 400),
+        dump_path,
     )
     started = time.perf_counter()
     async with app.state.lock:
