@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Ask pipeline: .mrt catalog → LLM → local Postgres MCP → answer.
+"""Ask pipeline: .mrt catalog → LLM → Postgres MCP Pro → answer.
 
-Postgres and MCP live in docker compose. This host and the LLM run on the machine.
+Like the Habr / Claude Desktop setup:
+  docker compose up -d postgres
+  docker run -i --rm -e DATABASE_URI=... crystaldba/postgres-mcp --access-mode=restricted
 
-  docker compose up -d db
-  .venv/bin/python host.py   # spawns: docker compose run --rm -i mcp
+The host spawns that docker run over stdio. LLM stays on the machine.
 """
 
 from __future__ import annotations
@@ -146,15 +147,16 @@ def system_prompt(catalog: dict) -> str:
         "2) Подставь параметры: если пользователь не задал другое значение, "
         "используй дефолты из раздела «Дефолтные параметры». "
         "Плейсхолдеры вида @Name замени на эти значения в PostgreSQL SQL.\n"
-        "3) Вызови инструмент query с одним SQL-запросом для PostgreSQL. "
+        "3) Для данных вызови инструмент execute_sql с одним SQL для PostgreSQL. "
+        "При необходимости сначала list_schemas / list_objects / get_object_details. "
         "SQL из каталога может быть MySQL — перепиши под PostgreSQL. "
-        "Сервер выполняет query только в read-only транзакции.\n"
-        "4) После строк из query примени логику дашборда из каталога: "
+        "MCP в режиме restricted: только чтение.\n"
+        "4) После строк из execute_sql примени логику дашборда из каталога: "
         "выражения виджетов (Sum, Count и т.д.), фильтры шаблона, "
         "форматы чисел (decimals, currency, percentage, abbreviation). "
         "Это отображаемая логика, не обязательно SQL ROUND.\n"
         "5) Верни итоговый ответ на языке вопроса. Не выдумывай числа. "
-        "Если query упал — скажи об ошибке.\n\n"
+        "Если SQL упал — скажи об ошибке.\n\n"
         f"Дефолтные параметры:\n{defaults_body}\n\n"
         f"Каталог:\n{body}"
     )
@@ -300,18 +302,34 @@ async def answer_question(
             else:
                 text = await run_tool(session, name, arguments, known)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
-    return "Модель не закончила ответ: слишком много вызовов query."
+    return "Модель не закончила ответ: слишком много вызовов MCP."
+
+
+def mcp_database_uri() -> str:
+    """From the MCP container, localhost is remapped; use host.docker.internal."""
+    url = database_url()
+    for host in ("127.0.0.1", "localhost"):
+        url = url.replace(f"@{host}:", "@host.docker.internal:")
+        url = url.replace(f"//{host}:", "//host.docker.internal:")
+    return url
 
 
 def postgres_mcp() -> StdioServerParameters:
-    """Local MCP from compose: same network as db, stdio to this host."""
+    """Same as the article / Claude Desktop config."""
     docker = shutil.which("docker")
     if docker is None:
-        raise RuntimeError("Нужен Docker: Postgres MCP поднимается из docker-compose")
+        raise RuntimeError("Нужен Docker для crystaldba/postgres-mcp")
     return StdioServerParameters(
         command=docker,
-        args=["compose", "run", "--rm", "-i", "mcp"],
-        cwd=str(ROOT),
+        args=[
+            "run",
+            "-i",
+            "--rm",
+            "-e",
+            f"DATABASE_URI={mcp_database_uri()}",
+            "crystaldba/postgres-mcp",
+            "--access-mode=restricted",
+        ],
     )
 
 
@@ -321,7 +339,7 @@ async def lifespan(app: FastAPI):
     if not model:
         raise RuntimeError("Нужна LLM_MODEL")
     if not database_url():
-        raise RuntimeError("Нужны POSTGRES_* в .env (для справки/health; MCP ходит в db из compose)")
+        raise RuntimeError("Нужны DATABASE_URL или POSTGRES_USER/PASSWORD/DB")
     catalog = ensure_catalog()
     prompt = system_prompt(catalog)
     headers = {}
@@ -363,7 +381,7 @@ async def health() -> dict:
         "tools": [tool["function"]["name"] for tool in app.state.tools],
         "defaults": app.state.defaults,
         "llm": llm_base_url(),
-        "mcp": "docker compose run mcp",
+        "mcp": "docker run -i --rm crystaldba/postgres-mcp --access-mode=restricted",
     }
 
 
@@ -402,7 +420,7 @@ def main() -> None:
     if missing:
         raise SystemExit(f"Задай {', '.join(missing)}")
     if shutil.which("docker") is None:
-        raise SystemExit("Нужен Docker для сервисов db и mcp")
+        raise SystemExit("Нужен Docker для Postgres и crystaldba/postgres-mcp")
     uvicorn.run(
         "host:app",
         host=os.environ.get("HOST", "127.0.0.1"),

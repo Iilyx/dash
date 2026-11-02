@@ -1,37 +1,42 @@
 # dash
 
-Пайплайн вопросов по Stimulsoft `.mrt`:
+Пайплайн вопросов по Stimulsoft `.mrt` + **Postgres MCP Pro**, как в [статье на Хабре](https://habr.com/ru/articles/947818/):
 
 1. `extract_mrt` → `catalog.json`
-2. каталог и дефолтные параметры → системный промпт
-3. локальная LLM находит SQL
-4. локальный Postgres MCP (`query`, read-only) → строки
+2. каталог → системный промпт
+3. локальная LLM → SQL
+4. `crystaldba/postgres-mcp` (`execute_sql`, `--access-mode=restricted`)
 5. логика дашборда → ответ
 
-## Инфраструктура (compose)
+## Compose
 
-Пока в compose только **БД** и **MCP**:
-
-```bash
-docker compose up -d db
-docker pull mcp/postgres
-```
-
-MCP — сервис `mcp` (образ `mcp/postgres`), в одной сети с `db`.  
-Хост поднимает его локально по stdio:
+Только Postgres:
 
 ```bash
-docker compose run --rm -i mcp
+docker compose up -d
+docker pull crystaldba/postgres-mcp
 ```
 
-## Хост и модель — на машине
+## MCP (как в Claude Desktop / статье)
+
+```bash
+docker run -i --rm \
+  -e DATABASE_URI=postgresql://admin:admin123@host.docker.internal:5432/app \
+  crystaldba/postgres-mcp \
+  --access-mode=restricted
+```
+
+Это поднимает сам `host.py` по stdio. SSE нет.
+
+## Хост
 
 ```bash
 uv venv --python 3.12
 uv pip install -r requirements.txt
 cp .env.example .env
 # задай LLM_MODEL
-docker compose up -d db
+
+docker compose up -d
 .venv/bin/python host.py
 ```
 
@@ -43,10 +48,4 @@ docker compose up -d db
 curl -s http://127.0.0.1:8090/ask \
   -H 'Content-Type: application/json' \
   -d '{"question":"сколько на складе"}'
-```
-
-## Каталог
-
-```bash
-.venv/bin/python extract_mrt.py SalesOfProducts.mrt -o catalog.json
 ```
