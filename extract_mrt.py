@@ -1,8 +1,28 @@
 #!/usr/bin/env python3
 """Turn any Stimulsoft JSON .mrt into a compact catalog for an LLM.
 
-The walk follows the dictionary and page tree, not a fixed dashboard.
-Layout, images, scripts, and connection strings are left out.
+Entities follow Stimulsoft class reference / dashboard docs
+(https://admin.stimulsoft.com/documentation/classreference-js/,
+https://www.stimulsoft.com/en/documentation/dashboard-elements):
+
+Dictionary: Databases, DataSources (SqlCommand/Parameters/Columns), Relations,
+Variables (+ DialogInfo), BusinessObjects, Resources, UserFunctions.
+
+Pages: StiDashboard / StiPage → Components (IStiElement family):
+  viz — Chart, Table, PivotTable, Indicator, Gauge, Progress, Cards,
+        RegionMap, OnlineMap, Text, Image, Shape, WebContent, Button, Panel
+  filters — ComboBox, ListBox, TreeView, TreeViewBox, DatePicker, NumberBox
+
+Per element (valuable fields only):
+  meters (Arguments/Values/Series/KeyMeters/Columns/Rows/Summaries/Target/…),
+  DataFilters (StiDataFilterRule: Path, Condition, Value, IsExpression, …),
+  DashboardInteraction (OnClick/OnHover/Hyperlink/DrillDownPageKey/
+  DrillDownParameters Name+Expression), TopN (Mode/Count/ShowOthers/…),
+  DataTransformation + TransformActions/Filters/Sorts, UserFilters/UserSorts,
+  ParentKey, Group, CrossFiltering, SelectionMode, ShowAllValue, InitialValue,
+  conditions (table/pivot/indicator — value side only).
+
+Layout brushes/rects, images blobs, scripts, connection strings are left out.
 """
 
 from __future__ import annotations
@@ -18,7 +38,105 @@ TAG = re.compile(r"<[^>]+>")
 BREAK = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
 
 QUERY_KEYS = ("SqlCommand", "Query", "SqlQuery", "Command")
-FORMAT_KEYS = ("TextFormat", "ValueFormat", "TargetFormat", "TitleFormat", "AxisFormat")
+FORMAT_KEYS = (
+    "TextFormat",
+    "ValueFormat",
+    "TargetFormat",
+    "TitleFormat",
+    "AxisFormat",
+    "ArgumentFormat",
+    "SeriesFormat",
+)
+# IStiMeter collections / single meters across Chart/Table/Pivot/Indicator/…
+METER_KEYS = {
+    "Value",
+    "Values",
+    "ValueMeters",
+    "Argument",
+    "Arguments",
+    "ArgumentMeters",
+    "Series",
+    "SeriesMeters",
+    "SeriesValues",
+    "KeyMeters",
+    "KeyMeter",
+    "NameMeter",
+    "ValueMeter",
+    "RowMeters",
+    "ColumnMeters",
+    "Rows",
+    "Columns",
+    "Summaries",
+    "Summary",
+    "Target",
+    "Targets",
+    "TargetMeters",
+    "Weight",
+    "Weights",
+    "X",
+    "Y",
+    "XMeters",
+    "YMeters",
+    "Latitude",
+    "Longitude",
+    "Location",
+    "Color",
+    "Colors",
+    "Size",
+    "MaxValue",
+    "MinValue",
+    "EndValue",
+    "EndValues",
+    "CloseValue",
+    "OpenValue",
+    "HighValue",
+    "LowValue",
+    "Indicator",
+    "Meters",
+}
+FILTER_ELEMENT_IDENTS = {
+    "StiComboBoxElement",
+    "StiListBoxElement",
+    "StiTreeViewElement",
+    "StiTreeViewBoxElement",
+    "StiDatePickerElement",
+    "StiNumberBoxElement",
+}
+VIZ_ELEMENT_IDENTS = {
+    "StiChartElement",
+    "StiTableElement",
+    "StiPivotTableElement",
+    "StiIndicatorElement",
+    "StiGaugeElement",
+    "StiProgressElement",
+    "StiCardsElement",
+    "StiRegionMapElement",
+    "StiOnlineMapElement",
+    "StiTextElement",
+    "StiImageElement",
+    "StiShapeElement",
+    "StiWebContentElement",
+    "StiButtonElement",
+    "StiPanelElement",
+}
+SKIP_DEEP = {
+    "ManuallyEnteredData",
+    "Brush",
+    "TextBrush",
+    "Border",
+    "Shadow",
+    "Font",
+    "Image",
+    "ReportImage",
+    "ClientRectangle",
+    "AltClientRectangle",
+    "CornerRadius",
+    "Style",
+    "Watermark",
+    "PageWatermark",
+    "HeaderFont",
+    "FooterFont",
+}
 
 
 def numbered(node) -> list:
@@ -99,7 +217,7 @@ def expressions(node, found: list[str] | None = None) -> list[str]:
     found = [] if found is None else found
     if isinstance(node, dict):
         for key, value in node.items():
-            if key in {"ManuallyEnteredData", "Brush", "TextBrush", "Border", "Shadow", "Font", "Image", "ReportImage"}:
+            if key in SKIP_DEEP or key == "Components":
                 continue
             if key == "Expression" or key.endswith("Expression"):
                 item = text(value)
@@ -111,6 +229,180 @@ def expressions(node, found: list[str] | None = None) -> list[str]:
         for value in node:
             expressions(value, found)
     return found
+
+
+def meter_of(node: dict) -> dict | None:
+    """One IStiMeter / Dimension|Measure column (Expression, Label, Function, …)."""
+    if not isinstance(node, dict):
+        return None
+    item = {
+        "type": node.get("Ident"),
+        "key": text(node.get("Key")),
+        "expression": text(node.get("Expression")),
+        "label": text(node.get("Label") or node.get("Alias") or node.get("Name")),
+        "function": text(node.get("Function")),
+        "mode": text(node.get("Mode")),
+        "column": text(node.get("Column") or node.get("Path")),
+        "display": text(node.get("DisplayValue") or node.get("DisplaySource")),
+    }
+    cleaned = {key: value for key, value in item.items() if value not in (None, "")}
+    return cleaned or None
+
+
+def meters_bucket(value) -> list[dict]:
+    result = []
+    if isinstance(value, dict) and value.get("Ident") and (
+        "Meter" in str(value.get("Ident")) or value.get("Expression") is not None
+    ):
+        parsed = meter_of(value)
+        if parsed:
+            result.append(parsed)
+        return result
+    for item in numbered(value):
+        if isinstance(item, dict):
+            parsed = meter_of(item)
+            if parsed:
+                result.append(parsed)
+    return result
+
+
+def meters_of(node: dict) -> dict[str, list[dict]]:
+    """Collect all Value / Arguments / Series / *Meters bindings on a component."""
+    result: dict[str, list[dict]] = {}
+    for key, value in node.items():
+        if key in SKIP_DEEP:
+            continue
+        is_meter_key = key in METER_KEYS or key.endswith("Meters") or key.endswith("Meter")
+        if not is_meter_key:
+            continue
+        bucket = meters_bucket(value)
+        if bucket:
+            result[key] = bucket
+    return result
+
+
+def drill_down_parameters(node) -> list[dict]:
+    """StiDashboardDrillDownParameter: Name + Expression."""
+    result = []
+    for item in numbered(node):
+        if not isinstance(item, dict):
+            continue
+        parsed = {
+            "name": text(item.get("Name") or item.get("ParamName")),
+            "expression": text(item.get("Expression") or item.get("Value")),
+        }
+        cleaned = {key: value for key, value in parsed.items() if value}
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def top_n_of(node) -> dict | None:
+    """StiDataTopN / series TopN: Mode, Count, ShowOthers, OthersText, MeasureField."""
+    value = node.get("TopN")
+    if not isinstance(value, dict):
+        return None
+    mode = text(value.get("Mode"))
+    parsed = {
+        "mode": mode,
+        "count": value.get("Count"),
+        "show_others": value.get("ShowOthers"),
+        "others_text": text(value.get("OthersText")),
+        "measure_field": text(value.get("MeasureField")),
+    }
+    if parsed.get("mode") in (None, "None"):
+        return None
+    if parsed.get("show_others") not in (True, False):
+        parsed.pop("show_others", None)
+    if parsed.get("count") in (None, ""):
+        parsed.pop("count", None)
+    return {key: item for key, item in parsed.items() if item not in (None, "")} or None
+
+
+def sorts_of(node) -> list[dict]:
+    result = []
+    for item in numbered(node):
+        if not isinstance(item, dict):
+            continue
+        sort = {
+            "column": text(item.get("Column") or item.get("Path") or item.get("Field")),
+            "direction": text(item.get("Direction") or item.get("SortDirection")),
+            "expression": text(item.get("Expression")),
+        }
+        cleaned = {key: value for key, value in sort.items() if value}
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def conditions_of(node: dict) -> list[dict]:
+    """Table / Pivot / Indicator conditions — keep value side, drop colors/fonts."""
+    result = []
+    for key in (
+        "TableConditions",
+        "PivotTableConditions",
+        "IndicatorConditions",
+        "ChartConditions",
+        "Conditions",
+    ):
+        for item in numbered(node.get(key)):
+            if not isinstance(item, dict):
+                continue
+            cond = {
+                "condition": text(item.get("Condition")),
+                "data_type": text(item.get("DataType")),
+                "value": text(item.get("Value") or item.get("Value1")),
+                "value2": text(item.get("Value2")),
+                "field": text(item.get("Field") or item.get("Path")),
+                "meters": string_list(item.get("KeyDataFieldMeters")),
+                "destination_meters": string_list(item.get("KeyDestinationMeters")),
+            }
+            if item.get("IsExpression") is True:
+                cond["is_expression"] = True
+            cleaned = {name: value for name, value in cond.items() if value not in (None, "", [])}
+            if cleaned:
+                result.append(cleaned)
+    return result
+
+
+def data_transformation(node: dict | None) -> dict | None:
+    if not isinstance(node, dict):
+        return None
+    parsed = {
+        "actions": [],
+        "filters": filters_of(node) if ("Filters" in node or "DataFilters" in node) else [],
+        "sorts": sorts_of(node.get("TransformSorts") or node.get("Sorts")),
+    }
+    for item in numbered(node.get("TransformActions") or node.get("Actions")):
+        if not isinstance(item, dict):
+            continue
+        action = {
+            "type": text(item.get("Ident") or item.get("Type") or item.get("Action")),
+            "expression": text(item.get("Expression")),
+            "column": text(item.get("Column") or item.get("Path")),
+        }
+        cleaned = {key: value for key, value in action.items() if value}
+        if cleaned:
+            parsed["actions"].append(cleaned)
+    for item in numbered(node.get("TransformFilters")):
+        if isinstance(item, dict):
+            filt = data_filter(item)
+            if filt:
+                parsed["filters"].append(filt)
+    cleaned = {key: value for key, value in parsed.items() if value}
+    return cleaned or None
+
+
+def element_role(ident: str | None) -> str | None:
+    if not ident:
+        return None
+    if ident in FILTER_ELEMENT_IDENTS:
+        return "filter"
+    if ident in VIZ_ELEMENT_IDENTS:
+        return "viz"
+    if ident and ident.endswith("Element"):
+        return "element"
+    return None
 
 
 def format_of(node: dict) -> dict:
@@ -138,6 +430,7 @@ def formats(node: dict) -> list[dict]:
 
 
 def data_filter(node: dict) -> dict:
+    """StiDataFilterRule: Path, Condition, Value/Value2, IsExpression, FilterGroupKey, …"""
     if "Path" in node or "FilterGroupKey" in node:
         item = {
             "path": text(node.get("Path")),
@@ -151,7 +444,7 @@ def data_filter(node: dict) -> dict:
         if node.get("IsEnabled") is False:
             item["enabled"] = False
         if node.get("IsExpression") is True:
-            item["expression"] = True
+            item["is_expression"] = True
         return {key: value for key, value in item.items() if value not in (None, "")}
     item = {
         "column": text(node.get("Column")),
@@ -162,6 +455,8 @@ def data_filter(node: dict) -> dict:
         "value2": text(node.get("Value2")),
         "expression": text(node.get("Expression")),
     }
+    if node.get("IsExpression") is True:
+        item["is_expression"] = True
     return {key: value for key, value in item.items() if value not in (None, "")}
 
 
@@ -433,45 +728,109 @@ def title_of(node: dict) -> str | None:
 
 
 def interaction(node: dict) -> dict | None:
-    value = node.get("DashboardInteraction")
+    value = node.get("DashboardInteraction") or node.get("Interaction")
     if not isinstance(value, dict):
         return None
     parsed = {
+        "type": text(value.get("Ident")),
         "on_click": text(value.get("OnClick")),
         "on_hover": text(value.get("OnHover")),
         "drill_down": text(value.get("DrillDownMode") or value.get("OnDrillDown")),
+        "drill_down_page": text(value.get("DrillDownPageKey") or value.get("DrillDownPage")),
+        "hyperlink": text(value.get("Hyperlink")),
+        "hyperlink_destination": text(value.get("HyperlinkDestination")),
+        "tooltip": text(value.get("ToolTip")),
+        "allow_user_drill_down": value.get("AllowUserDrillDown"),
+        "drill_down_parameters": drill_down_parameters(
+            value.get("DrillDownParameters") or node.get("DrillDownParameters")
+        ),
     }
     if parsed.get("on_click") in (None, "None"):
         parsed.pop("on_click", None)
-    if parsed.get("on_hover") in (None, "None", "ShowToolTip"):
+    if parsed.get("on_hover") in (None, "None"):
         parsed.pop("on_hover", None)
-    cleaned = {key: item for key, item in parsed.items() if item}
+    if parsed.get("allow_user_drill_down") not in (True, False):
+        parsed.pop("allow_user_drill_down", None)
+    cleaned = {key: item for key, item in parsed.items() if item not in (None, "", [])}
     return cleaned or None
 
 
+def collect_filter_rules(node) -> list[dict]:
+    result = []
+    for item in numbered(node):
+        if isinstance(item, dict):
+            filt = data_filter(item)
+            if filt:
+                result.append(filt)
+        elif isinstance(item, list):
+            result.extend(collect_filter_rules(item))
+    return result
+
+
 def element(node: dict) -> dict:
+    ident = node.get("Ident")
     shown = visible_text(node.get("Text")) if isinstance(node.get("Text"), str) else None
     title = title_of(node)
+    meters = meters_of(node)
     exprs = expressions(node)
     for item in brace_expressions(shown) + brace_expressions(title):
         if item not in exprs:
             exprs.append(item)
+    for bucket in meters.values():
+        for meter in bucket:
+            expr = meter.get("expression")
+            if expr and expr not in exprs:
+                exprs.append(expr)
+
+    dd_filters = collect_filter_rules(node.get("DrillDownFilters"))
+    dd_filters.extend(collect_filter_rules(node.get("DrillDownFiltersList")))
+
+    user_filters = collect_filter_rules(node.get("UserFilters"))
+    transform_filters = collect_filter_rules(node.get("TransformFilters"))
+    user_sorts = sorts_of(node.get("UserSorts"))
+    transform_sorts = sorts_of(node.get("TransformSorts"))
+
     parsed = {
         "name": node.get("Name"),
         "alias": text(node.get("Alias")),
-        "type": node.get("Ident"),
+        "type": ident,
+        "role": element_role(ident if isinstance(ident, str) else None),
+        "key": text(node.get("Key") or node.get("Guid")),
         "title": title,
         "text": shown,
+        "meters": meters,
         "expressions": exprs,
         "formats": formats(node),
         "filters": filters_of(node),
+        "user_filters": user_filters,
+        "transform_filters": transform_filters,
+        "user_sorts": user_sorts,
+        "transform_sorts": transform_sorts,
+        "top_n": top_n_of(node),
+        "conditions": conditions_of(node),
         "interaction": interaction(node),
-        "data_source": text(node.get("DataSourceName") or node.get("DataSource")),
+        "drill_down_parameters": drill_down_parameters(node.get("DrillDownParameters")),
+        "drill_down_filters": dd_filters,
+        "data_transformation": data_transformation(node.get("DataTransformation")),
+        "data_source": text(
+            node.get("DataSourceName") or node.get("DataSource") or node.get("NameInSource")
+        ),
+        "data_mode": text(node.get("DataMode")),
         "group": text(node.get("Group")),
-        "parent": text(node.get("ParentKey")),
+        "parent": text(node.get("ParentKey") or node.get("MasterComponent")),
+        "cross_filtering": node.get("CrossFiltering"),
+        "selection_mode": text(node.get("SelectionMode")),
+        "initial_value": text(node.get("InitialValue")),
+        "summary_direction": text(node.get("SummaryDirection")),
     }
     if node.get("FilterOn") is False:
         parsed["filter_on"] = False
+    if node.get("ShowAllValue") is True:
+        parsed["show_all_value"] = True
+    if node.get("ShowBlanks") is True:
+        parsed["show_blanks"] = True
+    if parsed.get("cross_filtering") not in (True, False):
+        parsed.pop("cross_filtering", None)
     children = elements(node.get("Components"))
     if children:
         parsed["elements"] = children
@@ -479,7 +838,11 @@ def element(node: dict) -> dict:
 
 
 def elements(node) -> list[dict]:
-    return [element(item) for item in numbered(node) if isinstance(item, dict) and (item.get("Name") or item.get("Ident"))]
+    return [
+        element(item)
+        for item in numbered(node)
+        if isinstance(item, dict) and (item.get("Name") or item.get("Ident"))
+    ]
 
 
 def pages(node) -> list[dict]:
@@ -487,13 +850,18 @@ def pages(node) -> list[dict]:
     for page in numbered(node):
         if not isinstance(page, dict):
             continue
+        ident = page.get("Ident")
         parsed = {
             "name": page.get("Name"),
             "alias": text(page.get("Alias")),
-            "type": page.get("Ident"),
+            "type": ident,
+            "guid": text(page.get("Guid") or page.get("Key")),
+            "is_dashboard": ident == "StiDashboard" or bool(page.get("IsDashboard")),
             "filters": filters_of(page),
             "elements": elements(page.get("Components")),
         }
+        if parsed.get("is_dashboard") is False:
+            parsed.pop("is_dashboard", None)
         result.append({key: value for key, value in parsed.items() if value not in (None, "", [])})
     return result
 

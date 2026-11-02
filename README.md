@@ -2,11 +2,13 @@
 
 Пайплайн вопросов по Stimulsoft `.mrt`:
 
-1. `extract_mrt` → `catalog.json`
-2. `Dictionary.Variables` → в SQL только как `{Name}` (например `{year}`)
-3. голое `year` / `CategoryID` в SQL — колонка БД, не переменная
-4. из вопроса заполняем Variables; иначе дефолт из mrt; подставляем только `{Name}`
-5. **Postgres MCP Pro** (`execute_sql`, restricted) → строки → ответ
+1. `extract_mrt` → `catalog.json` по сущностям Stimulsoft docs:
+   Dictionary (sources/variables/relations/…) + pages/StiDashboard components
+   (viz + filter elements: meters, DataFilters, TopN, DashboardInteraction,
+   drill-down params, transforms, ParentKey/cross-filtering, …)
+2. в SQL/`filters` всё в `{Name}` — переменные; default — в `variables`
+3. из вопроса заполняем `{Name}`; если не указано — default
+4. хост пишет `sql_filled.txt` и отдаёт LLM + **Postgres MCP Pro** (`execute_sql`)
 
 ## Compose
 
