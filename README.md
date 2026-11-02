@@ -1,12 +1,12 @@
 # dash
 
-Пайплайн вопросов по Stimulsoft `.mrt` + **Postgres MCP Pro**, как в [статье на Хабре](https://habr.com/ru/articles/947818/):
+Пайплайн вопросов по Stimulsoft `.mrt`:
 
 1. `extract_mrt` → `catalog.json`
-2. каталог → системный промпт
-3. локальная LLM → SQL
-4. `crystaldba/postgres-mcp` (`execute_sql`, `--access-mode=restricted`)
-5. логика дашборда → ответ
+2. SQL из `.mrt` — шаблоны; `@Name` / `{Name}` — переменные
+3. значение из вопроса / `parameters`, иначе дефолт из mrt
+4. **Postgres MCP Pro** (`crystaldba/postgres-mcp`, `execute_sql`, restricted)
+5. логика виджетов → ответ
 
 ## Compose
 
@@ -17,7 +17,7 @@ docker compose up -d
 docker pull crystaldba/postgres-mcp
 ```
 
-## MCP (как в Claude Desktop / статье)
+## MCP (как в статье / Claude Desktop)
 
 ```bash
 docker run -i --rm \
@@ -26,9 +26,9 @@ docker run -i --rm \
   --access-mode=restricted
 ```
 
-Это поднимает сам `host.py` по stdio. SSE нет.
+Это поднимает сам `host.py` по stdio.
 
-## Хост
+## Запуск
 
 ```bash
 uv venv --python 3.12
@@ -44,8 +44,20 @@ docker compose up -d
 - LLM: `http://127.0.0.1:8080/v1`
 - Postgres: `127.0.0.1:5432`
 
+В `/ask` только вопрос. Параметры вытаскиваются из текста; если не указаны — дефолты из `.mrt`.
+
 ```bash
 curl -s http://127.0.0.1:8090/ask \
   -H 'Content-Type: application/json' \
   -d '{"question":"сколько на складе"}'
+
+curl -s http://127.0.0.1:8090/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"сколько на складе в категории 3"}'
+```
+
+## Каталог
+
+```bash
+.venv/bin/python extract_mrt.py SalesOfProducts.mrt -o catalog.json
 ```
