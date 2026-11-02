@@ -2,13 +2,10 @@
 
 Пайплайн вопросов по Stimulsoft `.mrt`:
 
-1. `extract_mrt` → `catalog.json` по сущностям Stimulsoft docs:
-   Dictionary (sources/variables/relations/…) + pages/StiDashboard components
-   (viz + filter elements: meters, DataFilters, TopN, DashboardInteraction,
-   drill-down params, transforms, ParentKey/cross-filtering, …)
-2. в SQL/`filters` всё в `{Name}` — переменные; default — в `variables`
-3. из вопроса заполняем `{Name}`; если не указано — default
-4. хост пишет `sql_filled.txt` и отдаёт LLM + **Postgres MCP Pro** (`execute_sql`)
+1. готовый `.mrt` → `extract_mrt` → `catalog.json`
+2. `/ask` с вопросом пользователя + подгрузка `catalog.json`
+3. фильтры `{Name}` из вопроса; если нет — default из `variables`
+4. LLM вызывает **Postgres MCP** (`execute_sql`) с подставленным SQL → ответ
 
 ## Compose
 

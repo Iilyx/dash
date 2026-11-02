@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Ask pipeline: .mrt catalog → Postgres MCP Pro → answer.
+"""Ask pipeline:
 
-Schema: queries in sources + variables.
-Anything in {…} in SQL is a variable; meta/defaults live in variables.
-Fill from the user question, else variable default.
-MCP: crystaldba/postgres-mcp via docker run -i --rm (restricted).
+1) extract_mrt → catalog.json (from .mrt)
+2) /ask: load catalog + user question
+3) {Name} from question, else default from variables
+4) LLM + Postgres MCP (execute_sql) → answer
 """
 
 from __future__ import annotations
@@ -352,7 +352,7 @@ def filled_queries(catalog: dict, resolved: dict[str, Any]) -> list[dict]:
 
 
 def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]) -> Path:
-    """Write executable sql_filled to txt right before the LLM call."""
+    """Write sql_filled to txt for debugging."""
     path = resolve_path(os.environ.get("SQL_DUMP_PATH", "sql_filled.txt"))
     blocks: list[str] = [
         f"-- question: {question}",
@@ -372,62 +372,43 @@ def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]
         blocks.append(sql if sql.endswith(";") else sql + ";")
         blocks.append("")
     path.write_text("\n".join(blocks).rstrip() + "\n", encoding="utf-8")
-    log.info("Исполняемый SQL → %s (%s queries)", path, len(queries))
+    log.info("SQL dump → %s (%s queries)", path, len(queries))
     return path
 
 
 def system_prompt(catalog: dict) -> str:
-    templates = query_templates(catalog)
-    variables = list(variables_by_name(catalog).values())
-    pages = catalog.get("pages") or []
-    templates_body = json.dumps(templates, ensure_ascii=False, indent=2)
-    variables_body = json.dumps(variables, ensure_ascii=False, indent=2)
-    pages_body = json.dumps(pages, ensure_ascii=False, indent=2)
+    """catalog.json + rules for LLM; filters come from the user message."""
     catalog_body = json.dumps(catalog, ensure_ascii=False, indent=2)
     return (
         "Ты отвечаешь на вопросы по Stimulsoft-дашборду/отчёту.\n"
-        "Каталог собран по сущностям из документации Stimulsoft — используй всё нужное:\n"
-        "Dictionary: sources (SqlCommand + Parameters + Columns), relations, "
-        "variables (Value/DialogInfo; в SQL/фильтрах ссылка {Name}), "
-        "business_objects, functions.\n"
-        "pages (StiDashboard/StiPage) → elements:\n"
-        "- role=viz: Chart/Table/Pivot/Indicator/Gauge/Progress/Cards/Map/Text/…\n"
-        "- role=filter: ComboBox/ListBox/TreeView/TreeViewBox/DatePicker/NumberBox\n"
-        "У element смотри: meters (Arguments/Values/Series/KeyMeters/Columns/Rows/"
-        "Summaries/Target), filters (DataFilters: Path+Condition+Value, is_expression "
-        "для {Variable}), top_n (Mode/Count/ShowOthers), interaction "
-        "(OnClick: ApplyFilter|OpenHyperlink|DrillDown, DrillDownPageKey, "
-        "drill_down_parameters Name+Expression), user_filters/sorts, "
-        "transform_*, parent/group/cross_filtering, selection_mode, "
-        "show_all_value, conditions, formats, expressions.\n"
-        "Хост уже подставил {Name} из вопроса; иначе default из variables.\n"
-        "Бери sql_filled → execute_sql. Примени логику виджета "
-        "(meters/агрегации, фильтры, TopN, drill-down). "
-        "MySQL→PostgreSQL при необходимости (`order details` → \"order details\").\n"
-        "Ответь на языке вопроса. Не выдумывай числа.\n\n"
-        f"variables:\n{variables_body}\n\n"
-        f"queries:\n{templates_body}\n\n"
-        f"pages / dashboard components:\n{pages_body}\n\n"
-        f"полный каталог:\n{catalog_body}"
+        "Тебе дан catalog.json (из .mrt): sources/SQL, variables, pages/elements "
+        "(meters, filters, TopN, interaction, drill-down, role=viz|filter).\n"
+        "В сообщении пользователя уже есть фильтры {Name}: из вопроса, "
+        "если чего-то нет — default из variables. SQL с подстановкой — в sql_filled.\n"
+        "Пайплайн:\n"
+        "1) Выбери нужный sql_filled (или поправь MySQL→PostgreSQL: "
+        "`order details` → \"order details\").\n"
+        "2) Вызови MCP execute_sql.\n"
+        "3) По строкам и логике виджета сформулируй ответ.\n"
+        "Не выдумывай числа. Ответь на языке вопроса.\n\n"
+        f"catalog.json:\n{catalog_body}"
     )
 
 
 def user_message(question: str, resolved: dict[str, Any], queries: list[dict]) -> str:
-    variables = {
+    filters = {
         meta["token"]: {"value": meta["value"], "from": meta["source"]}
         for meta in resolved.values()
     }
     ready = [
-        {"source": item["source"], "sql_filled": item["sql_filled"]}
+        {"source": item.get("source"), "sql_filled": item.get("sql_filled")}
         for item in queries
     ]
-    if not resolved and not ready:
-        return question
     return (
         f"{question}\n\n"
-        "Параметры (из вопроса или default variables):\n"
-        f"{json.dumps(variables, ensure_ascii=False, indent=2)}\n\n"
-        "SQL с подстановкой:\n"
+        "Фильтры (из вопроса пользователя или default variables):\n"
+        f"{json.dumps(filters, ensure_ascii=False, indent=2)}\n\n"
+        "SQL с подстановкой (для execute_sql):\n"
         f"{json.dumps(ready, ensure_ascii=False, indent=2)}"
     )
 
