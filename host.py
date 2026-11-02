@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -32,11 +35,40 @@ from extract_mrt import catalog_from_report, load_mrt
 ROOT = Path(__file__).resolve().parent
 MAX_TOOL_ROUNDS = 4
 MAX_TOOL_CHARS = 24_000
+LOG_PREVIEW = 400
+
+log = logging.getLogger("host")
 
 
 class Ask(BaseModel):
     question: str = Field(min_length=1)
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+def setup_logging() -> None:
+    level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+
+
+def preview(value: Any, limit: int = LOG_PREVIEW) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def redact_url(url: str) -> str:
+    return re.sub(r":([^:@/]+)@", r":***@", url)
 
 
 def load_env() -> None:
@@ -87,14 +119,23 @@ def ensure_catalog() -> dict:
     if mrt_raw:
         mrt_path = resolve_path(mrt_raw)
         if mrt_path.is_file():
+            log.info("Собираю каталог из %s", mrt_path)
             catalog = catalog_from_report(load_mrt(mrt_path))
             catalog_path.write_text(
                 json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+            log.info(
+                "Каталог готов → %s (sources=%s, pages=%s, bytes=%s)",
+                catalog_path,
+                len(catalog.get("sources") or []),
+                len(catalog.get("pages") or []),
+                catalog_path.stat().st_size,
+            )
             return catalog
     if not catalog_path.is_file():
         raise RuntimeError("Нужен MRT_PATH или существующий CATALOG_PATH")
+    log.info("Читаю готовый каталог %s", catalog_path)
     return json.loads(catalog_path.read_text(encoding="utf-8"))
 
 
@@ -247,12 +288,24 @@ def render_tool_result(result) -> str:
 
 async def run_tool(session: ClientSession, name: str, arguments: dict, known: set[str]) -> str:
     if name not in known:
+        log.warning("Неизвестный tool: %s", name)
         return f"Unknown tool: {name}"
+    log.info("MCP tool %s args=%s", name, preview(arguments))
+    started = time.perf_counter()
     try:
         result = await session.call_tool(name, arguments)
     except Exception as exc:
+        log.exception("MCP tool %s упал: %s", name, exc)
         return f"SQL error: {exc}"
-    return render_tool_result(result)
+    body = render_tool_result(result)
+    log.info(
+        "MCP tool %s готово за %.2fs error=%s result=%s",
+        name,
+        time.perf_counter() - started,
+        getattr(result, "is_error", False),
+        preview(body),
+    )
+    return body
 
 
 def message_text(message: dict) -> str:
@@ -279,7 +332,15 @@ async def answer_question(
         {"role": "system", "content": prompt},
         {"role": "user", "content": user_message(question, parameters)},
     ]
-    for _ in range(MAX_TOOL_ROUNDS + 1):
+    log.info(
+        "Вопрос: %s | overrides=%s | tools=%s",
+        preview(question, 200),
+        preview(parameters or {}, 200),
+        sorted(known),
+    )
+    for round_no in range(1, MAX_TOOL_ROUNDS + 2):
+        log.info("LLM round %s → %s model=%s messages=%s", round_no, llm_base_url(), model, len(messages))
+        started = time.perf_counter()
         response = await llm.post(
             "chat/completions",
             json={"model": model, "messages": messages, "tools": tools, "stream": False},
@@ -291,6 +352,13 @@ async def answer_question(
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("LLM response has no choices") from exc
         assistant, pending = pending_tool_calls(message)
+        log.info(
+            "LLM round %s за %.2fs tool_calls=%s answer=%s",
+            round_no,
+            time.perf_counter() - started,
+            [name for _, name, _ in pending] or None,
+            preview(message_text(message), 200) or None,
+        )
         if not pending:
             return message_text(message)
         messages.append(assistant)
@@ -298,10 +366,12 @@ async def answer_question(
             try:
                 arguments = parse_arguments(raw_arguments)
             except (ValueError, json.JSONDecodeError) as exc:
+                log.warning("Плохие args для %s: %s", name, exc)
                 text = f"Bad tool arguments: {exc}"
             else:
                 text = await run_tool(session, name, arguments, known)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
+    log.error("Слишком много раундов MCP для вопроса: %s", preview(question, 200))
     return "Модель не закончила ответ: слишком много вызовов MCP."
 
 
@@ -319,6 +389,8 @@ def postgres_mcp() -> StdioServerParameters:
     docker = shutil.which("docker")
     if docker is None:
         raise RuntimeError("Нужен Docker для crystaldba/postgres-mcp")
+    uri = mcp_database_uri()
+    log.info("MCP: docker run crystaldba/postgres-mcp restricted uri=%s", redact_url(uri))
     return StdioServerParameters(
         command=docker,
         args=[
@@ -326,7 +398,7 @@ def postgres_mcp() -> StdioServerParameters:
             "-i",
             "--rm",
             "-e",
-            f"DATABASE_URI={mcp_database_uri()}",
+            f"DATABASE_URI={uri}",
             "crystaldba/postgres-mcp",
             "--access-mode=restricted",
         ],
@@ -340,30 +412,44 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Нужна LLM_MODEL")
     if not database_url():
         raise RuntimeError("Нужны DATABASE_URL или POSTGRES_USER/PASSWORD/DB")
+    log.info("Старт host: llm=%s model=%s db=%s", llm_base_url(), model, redact_url(database_url()))
     catalog = ensure_catalog()
+    defaults = default_parameters(catalog)
     prompt = system_prompt(catalog)
+    log.info(
+        "Промпт: report=%s defaults=%s prompt_chars=%s",
+        (catalog.get("report") or {}).get("name"),
+        defaults,
+        len(prompt),
+    )
     headers = {}
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     params = postgres_mcp()
+    log.info("Поднимаю Postgres MCP Pro…")
     async with httpx.AsyncClient(base_url=llm_base_url(), headers=headers, timeout=180) as llm:
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
+                tools = chat_tools(listed.tools)
+                log.info("MCP готов, tools=%s", [tool["function"]["name"] for tool in tools])
                 app.state.session = session
                 app.state.llm = llm
                 app.state.model = model
-                app.state.tools = chat_tools(listed.tools)
+                app.state.tools = tools
                 app.state.prompt = prompt
-                app.state.defaults = default_parameters(catalog)
+                app.state.defaults = defaults
                 app.state.report = (catalog.get("report") or {}).get("name")
                 app.state.lock = asyncio.Lock()
+                log.info("Host готов принимать /ask")
                 yield
+                log.info("Host останавливается, MCP закроется")
 
 
 load_env()
+setup_logging()
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -390,6 +476,8 @@ async def ask(body: Ask) -> dict:
     question = body.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is empty")
+    log.info("POST /ask question=%s parameters=%s", preview(question, 200), preview(body.parameters or {}, 200))
+    started = time.perf_counter()
     async with app.state.lock:
         try:
             answer = await answer_question(
@@ -402,14 +490,18 @@ async def ask(body: Ask) -> dict:
                 parameters=body.parameters,
             )
         except (httpx.HTTPError, RuntimeError) as exc:
+            log.exception("Ошибка на /ask: %s", exc)
             raise HTTPException(status_code=502, detail=f"LLM: {exc}") from exc
     if not answer:
+        log.error("Пустой ответ модели")
         raise HTTPException(status_code=502, detail="model returned an empty answer")
+    log.info("Ответ за %.2fs: %s", time.perf_counter() - started, preview(answer, 300))
     return {"answer": answer}
 
 
 def main() -> None:
     load_env()
+    setup_logging()
     missing = []
     if not database_url():
         missing.append("POSTGRES_USER/PASSWORD/DB")
@@ -421,10 +513,13 @@ def main() -> None:
         raise SystemExit(f"Задай {', '.join(missing)}")
     if shutil.which("docker") is None:
         raise SystemExit("Нужен Docker для Postgres и crystaldba/postgres-mcp")
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8090"))
+    log.info("Слушаю http://%s:%s", host, port)
     uvicorn.run(
         "host:app",
-        host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "8090")),
+        host=host,
+        port=port,
     )
 
 
