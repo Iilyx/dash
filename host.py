@@ -309,12 +309,77 @@ async def run_tool(session: ClientSession, name: str, arguments: dict, known: se
 
 
 def message_text(message: dict) -> str:
+    """Pull visible text from OpenAI-style and local-server quirks."""
+    parts: list[str] = []
     content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if content is None:
-        return ""
-    return str(content).strip()
+    if isinstance(content, str) and content.strip():
+        parts.append(content.strip())
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+    for key in ("reasoning_content", "reasoning", "refusal"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip() and key != "reasoning_content":
+            parts.append(value.strip())
+    return "\n".join(parts).strip()
+
+
+async def llm_chat(
+    llm: httpx.AsyncClient,
+    *,
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None,
+    round_no: int | str,
+    allow_tools: bool,
+) -> dict:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if allow_tools and tools:
+        payload["tools"] = tools
+    else:
+        # After SQL results local models often return empty content if tools stay enabled.
+        payload["tool_choice"] = "none"
+    log.info(
+        "LLM round %s → %s model=%s messages=%s tools=%s",
+        round_no,
+        llm_base_url(),
+        model,
+        len(messages),
+        allow_tools,
+    )
+    started = time.perf_counter()
+    response = await llm.post("chat/completions", json=payload)
+    response.raise_for_status()
+    body = response.json()
+    try:
+        choice = body["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        log.error("LLM raw payload без choices: %s", preview(body, 800))
+        raise RuntimeError("LLM response has no choices") from exc
+    finish = choice.get("finish_reason")
+    assistant, pending = pending_tool_calls(message)
+    text = message_text(message)
+    log.info(
+        "LLM round %s за %.2fs finish=%s tool_calls=%s answer=%s",
+        round_no,
+        time.perf_counter() - started,
+        finish,
+        [name for _, name, _ in pending] or None,
+        preview(text, 200) or None,
+    )
+    if not pending and not text:
+        log.warning("Пустой message от LLM: %s", preview(message, 800))
+    return {"assistant": assistant, "pending": pending, "text": text, "raw": message}
 
 
 async def answer_question(
@@ -332,45 +397,66 @@ async def answer_question(
         {"role": "system", "content": prompt},
         {"role": "user", "content": user_message(question, parameters)},
     ]
+    used_tools = False
+    empty_retries = 0
     log.info(
         "Вопрос: %s | overrides=%s | tools=%s",
         preview(question, 200),
         preview(parameters or {}, 200),
         sorted(known),
     )
-    for round_no in range(1, MAX_TOOL_ROUNDS + 2):
-        log.info("LLM round %s → %s model=%s messages=%s", round_no, llm_base_url(), model, len(messages))
-        started = time.perf_counter()
-        response = await llm.post(
-            "chat/completions",
-            json={"model": model, "messages": messages, "tools": tools, "stream": False},
+    for round_no in range(1, MAX_TOOL_ROUNDS + 3):
+        result = await llm_chat(
+            llm,
+            model=model,
+            messages=messages,
+            tools=tools,
+            round_no=round_no,
+            allow_tools=True,
         )
-        response.raise_for_status()
-        payload = response.json()
-        try:
-            message = payload["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("LLM response has no choices") from exc
-        assistant, pending = pending_tool_calls(message)
-        log.info(
-            "LLM round %s за %.2fs tool_calls=%s answer=%s",
-            round_no,
-            time.perf_counter() - started,
-            [name for _, name, _ in pending] or None,
-            preview(message_text(message), 200) or None,
-        )
+        pending = result["pending"]
+        text = result["text"]
         if not pending:
-            return message_text(message)
-        messages.append(assistant)
+            if text:
+                return text
+            if used_tools and empty_retries < 1:
+                empty_retries += 1
+                log.warning("После MCP модель молчит — прошу ответить по результату SQL")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Инструменты уже отработали. По их результату ответь на исходный вопрос "
+                            "кратко и по делу. Не вызывай инструменты. Не оставляй ответ пустым."
+                        ),
+                    }
+                )
+                forced = await llm_chat(
+                    llm,
+                    model=model,
+                    messages=messages,
+                    tools=None,
+                    round_no=f"{round_no}-final",
+                    allow_tools=False,
+                )
+                if forced["text"]:
+                    return forced["text"]
+                for item in reversed(messages):
+                    if item.get("role") == "tool" and item.get("content"):
+                        log.warning("Отдаю сырой результат MCP как ответ")
+                        return f"Модель не сформулировала ответ. Данные из MCP:\n{item['content']}"
+            raise RuntimeError("model returned an empty answer")
+        used_tools = True
+        messages.append(result["assistant"])
         for call_id, name, raw_arguments in pending:
             try:
                 arguments = parse_arguments(raw_arguments)
             except (ValueError, json.JSONDecodeError) as exc:
                 log.warning("Плохие args для %s: %s", name, exc)
-                text = f"Bad tool arguments: {exc}"
+                tool_text = f"Bad tool arguments: {exc}"
             else:
-                text = await run_tool(session, name, arguments, known)
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
+                tool_text = await run_tool(session, name, arguments, known)
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": tool_text})
     log.error("Слишком много раундов MCP для вопроса: %s", preview(question, 200))
     return "Модель не закончила ответ: слишком много вызовов MCP."
 
