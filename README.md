@@ -1,45 +1,28 @@
 # dash
 
-Сейчас хост делает один шаг: вопрос → LLM выбирает pages → пишет `page.txt`.
+Преобразование Stimulsoft JSON `.mrt` → компактный catalog для LLM.
 
 ## Запуск
-
-```bash
-cp .env.example .env
-# задай LLM_MODEL
-
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python host.py
-```
-
-Нужны: `LLM_BASE_URL` (по умолчанию `http://127.0.0.1:8080/v1`) и `LLM_MODEL`.  
-Таймаут LLM: `LLM_TIMEOUT` (секунды, по умолчанию 300).
-
-```bash
-curl -s http://127.0.0.1:8090/health | jq .
-
-curl -s http://127.0.0.1:8090/ask \
-  -H 'Content-Type: application/json' \
-  -d '{"question":"сколько единиц на складе"}'
-# {"pages":[0]}
-```
-
-Выбранные pages пишутся в `page.txt` (на диск), в HTTP только `{"pages":[...]}`.
-
-## Catalog
-
-При старте host сам:
-
-```text
-MRT → catalog.json + catalog_pages/
-```
-
-Вручную:
 
 ```bash
 python extract_mrt.py SalesOfProducts.mrt
 ```
 
-## Postgres
+Пишет:
 
-`docker-compose.yml` — Postgres на потом (SQL/MCP пока отключены в host).
+- `catalog.json` — полный catalog
+- `catalog_pages/index.json` — карточки всех pages
+- `catalog_pages/dictionary.json` — sources/variables/relations без тел pages
+- `catalog_pages/0.json`, `1.json`, … — pack одной страницы
+
+Опции: `-o path`, `--pages-dir dir`, `--no-pages`.
+
+Зависимости: только стандартная библиотека Python 3.
+
+## Что попадает в catalog
+
+- `report`
+- `databases`, `sources` (SQL), `relations`, `variables`, `business_objects`, `resources`, `functions`
+- `pages` / dashboard components: meters, DataFilters, TopN, drill-down, transforms, role=viz|filter, …
+
+Вёрстка, brushes/fonts, картинки и connection strings не тащатся.
