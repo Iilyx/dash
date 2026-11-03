@@ -3,5 +3,11 @@ __pycache__/
 *.pyc
 .env
 
-# postgres local
+# generated / local
+catalog.json
+catalog_pages/
+ask_trace.txt
+sql_filled.txt
 data/
+init/
+*.error.txt

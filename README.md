@@ -1,57 +1,21 @@
 # dash
 
-Пайплайн вопросов по Stimulsoft `.mrt`:
-
-1. `.mrt` → `catalog.json` + `catalog_pages/`
-2. из запроса извлечь параметры, чего нет — default
-3. найти pages
-4. выбрать какой SQL выполнить
-5. выполнить (MCP `execute_sql`)
-6. ответ: логика дашборда + фильтры + вывод
-
-## Compose
-
-Только Postgres:
-
-```bash
-docker compose up -d
-docker pull crystaldba/postgres-mcp
-```
-
-## MCP (как в статье / Claude Desktop)
-
-```bash
-docker run -i --rm \
-  -e DATABASE_URI=postgresql://admin:admin123@host.docker.internal:5432/app \
-  crystaldba/postgres-mcp \
-  --access-mode=restricted
-```
-
-Это поднимает сам `host.py` по stdio.
+Преобразование Stimulsoft JSON `.mrt` → компактный `catalog.json` для LLM.
 
 ## Запуск
 
 ```bash
-uv venv --python 3.12
-uv pip install -r requirements.txt
-cp .env.example .env
-# задай LLM_MODEL; MRT_PATH уже = SalesOfProducts.mrt
-
-docker compose up -d
-.venv/bin/python host.py
-# при старте сам: .mrt → catalog.json → MCP
+python extract_mrt.py SalesOfProducts.mrt -o catalog.json
 ```
 
-- API: `http://127.0.0.1:8090`
-- LLM: `http://127.0.0.1:8080/v1`
-- Postgres: `127.0.0.1:5432`
+Без `-o` печатает JSON в stdout.
 
-В `/ask` только вопрос. Параметры из текста; иначе дефолты из `.mrt`.
+Зависимости: только стандартная библиотека Python 3.
 
-```bash
-curl -s http://127.0.0.1:8090/ask \
-  -H 'Content-Type: application/json' \
-  -d '{"question":"сколько на складе"}'
-```
+## Что попадает в catalog
 
-`extract_mrt.py` нужен только если хочешь каталог вручную, без host.
+- `report`
+- `databases`, `sources` (SQL), `relations`, `variables`, `business_objects`, `resources`, `functions`
+- `pages` / dashboard `components`: meters, DataFilters, TopN, DashboardInteraction, drill-down, transforms, role=viz|filter, …
+
+Вёрстка, brushes/fonts, картинки и connection strings не тащатся.
