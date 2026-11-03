@@ -146,20 +146,35 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
         return None
 
 
-def message_text(message: dict) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for item in content:
+def _as_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
             if isinstance(item, str) and item.strip():
                 parts.append(item.strip())
             elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
+                text = item.get("text") or item.get("content") or item.get("value")
                 if isinstance(text, str) and text.strip():
                     parts.append(text.strip())
         return "\n".join(parts).strip()
+    return ""
+
+
+def message_text(message: dict) -> str:
+    """Достаём текст из content и fallback-полей локальных серверов."""
+    for key in (
+        "content",
+        "text",
+        "reasoning_content",
+        "reasoning",
+        "output_text",
+        "refusal",
+    ):
+        text = _as_text(message.get(key))
+        if text:
+            return text
     return ""
 
 
@@ -183,12 +198,13 @@ def resolve_page_ref(catalog: dict, ref: Any) -> dict:
 
 
 async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) -> str:
+    # Без stop: у llama.cpp stop="\n\n" часто даёт пустой content.
+    # Без отдельного system: часть шаблонов его глотает → empty.
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0,
         "stream": False,
-        "stop": ["\n\n", "```"],
     }
     log.info(
         "LLM → %s model=%s chars=%s",
@@ -201,20 +217,29 @@ async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) 
     response.raise_for_status()
     body = response.json()
     try:
-        message = body["choices"][0]["message"]
+        choice = body["choices"][0]
+        message = choice["message"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"bad LLM response: {body!r}"[:500]) from exc
-    text = message_text(message)
+        raise RuntimeError(f"bad LLM response: {body!r}"[:800]) from exc
+    text = message_text(message if isinstance(message, dict) else {})
+    # иногда текст лежит на choice, не в message
+    if not text and isinstance(choice, dict):
+        text = _as_text(choice.get("text"))
     usage = body.get("usage") or {}
     elapsed = time.perf_counter() - started
     log.info(
-        "LLM ← %.2fs usage=%s answer=%s",
+        "LLM ← %.2fs finish=%s usage=%s answer=%s",
         elapsed,
+        choice.get("finish_reason") if isinstance(choice, dict) else None,
         usage,
         (text[:200] + "…") if len(text) > 200 else text,
     )
     if not text:
-        raise RuntimeError("LLM empty content")
+        log.error("LLM empty raw choice=%s", json.dumps(choice, ensure_ascii=False)[:1000])
+        raise RuntimeError(
+            "LLM empty content; raw="
+            + json.dumps(choice, ensure_ascii=False)[:500]
+        )
     return text
 
 
@@ -239,22 +264,17 @@ async def select_page_via_llm(
         }
 
     pages = slim_pages(catalog)
-    system = (
+    # один user-message — стабильнее на llama.cpp, чем system+user
+    prompt = (
         "Pick one dashboard page for the user question. "
-        'Reply ONLY JSON: {"page":"<page name or index>"}. '
-        "Use the page field from the list when possible. Low reasoning."
-    )
-    user = (
-        f"Q: {question}\n"
+        'Reply ONLY with JSON: {"page":"<page name or index>"}.\n'
+        f"Question: {question}\n"
         f"Pages: {json.dumps(pages, ensure_ascii=False, separators=(',', ':'))}"
     )
     raw = await llm_chat(
         llm,
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "user", "content": prompt}],
     )
     parsed = extract_json_object(raw) or {}
     ref = parsed.get("page", parsed.get("pages"))
