@@ -2,12 +2,11 @@
 """Ask pipeline (staged):
 
 1) start: MRT → catalog.json + catalog_pages/
-2) resolve {Name} from question / defaults
+2) resolve {Name}: from question, else default — log both
 3) router LLM: which pages (from full index)
-4) host loads those packs
-5) planner LLM: which SQL to run
-6) host execute_sql via MCP
-7) answerer LLM: final answer from rows
+4) host loads those packs; SQL = sources from selected pages with params filled
+5) host execute_sql via MCP
+6) answerer LLM: final answer from rows + widget logic
 """
 
 from __future__ import annotations
@@ -461,6 +460,46 @@ def needed_variables(catalog: dict) -> dict[str, dict]:
     return needed
 
 
+MONTH_ALIASES: dict[str, int] = {
+    "январ": 1,
+    "january": 1,
+    "jan": 1,
+    "феврал": 2,
+    "february": 2,
+    "feb": 2,
+    "март": 3,
+    "march": 3,
+    "mar": 3,
+    "апрел": 4,
+    "april": 4,
+    "apr": 4,
+    "ма": 5,  # май/мая — handled carefully below
+    "may": 5,
+    "июн": 6,
+    "june": 6,
+    "jun": 6,
+    "июл": 7,
+    "july": 7,
+    "jul": 7,
+    "август": 8,
+    "august": 8,
+    "aug": 8,
+    "сентябр": 9,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "октябр": 10,
+    "october": 10,
+    "oct": 10,
+    "ноябр": 11,
+    "november": 11,
+    "nov": 11,
+    "декабр": 12,
+    "december": 12,
+    "dec": 12,
+}
+
+
 def coerce_param_value(raw: str) -> Any:
     text = raw.strip().strip("\"'`")
     if re.fullmatch(r"-?\d+", text):
@@ -468,6 +507,51 @@ def coerce_param_value(raw: str) -> Any:
     if re.fullmatch(r"-?\d+[.,]\d+", text):
         return float(text.replace(",", "."))
     return text
+
+
+def looks_like_month_var(name: str, alias: Any) -> bool:
+    labels = [name.lower()]
+    if isinstance(alias, str) and alias.strip():
+        labels.append(alias.strip().lower())
+    return any(
+        key in label
+        for label in labels
+        for key in ("month", "месяц", "period", "период")
+    )
+
+
+def parse_month_from_question(question: str) -> int | None:
+    """'за февраль' / 'February' / 'месяц 2' / '02.2025' → month number."""
+    text = question.lower()
+    # numeric: месяц=2, month: 02, за 2 месяц
+    numeric = re.search(
+        r"(?i)\b(?:месяц(?:у|е|а)?|month)\b\s*[:=]?\s*(\d{1,2})\b",
+        text,
+    )
+    if numeric:
+        value = int(numeric.group(1))
+        if 1 <= value <= 12:
+            return value
+    # date-like 02.2025 or 2025-02
+    dated = re.search(r"(?<!\d)(\d{1,2})[./]((?:19|20)\d{2})(?!\d)", text)
+    if dated:
+        value = int(dated.group(1))
+        if 1 <= value <= 12:
+            return value
+    dated_iso = re.search(r"(?<!\d)((?:19|20)\d{2})-(\d{1,2})(?!\d)", text)
+    if dated_iso:
+        value = int(dated_iso.group(2))
+        if 1 <= value <= 12:
+            return value
+    # named months (ru/en stems)
+    for stem, number in MONTH_ALIASES.items():
+        if stem == "ма":
+            if re.search(r"(?i)\bма[йяюе]\b", text):
+                return 5
+            continue
+        if stem in text:
+            return number
+    return None
 
 
 def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str, Any]:
@@ -504,6 +588,11 @@ def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str
                     r"(?i)\bcategory\s*(?:id|№|#)?\s*[:=]?\s*(-?\d+)",
                 ]
             )
+        if looks_like_month_var(name, alias):
+            month = parse_month_from_question(question)
+            if month is not None:
+                found[name] = month
+                continue
         for pattern in patterns:
             match = re.search(pattern, question)
             if not match:
@@ -527,6 +616,7 @@ def resolve_parameters(question: str, catalog: dict) -> dict[str, Any]:
                 "source": "question",
                 "token": token,
                 "alias": meta.get("alias"),
+                "default": default,
             }
         elif default not in (None, ""):
             resolved[name] = {
@@ -534,8 +624,120 @@ def resolve_parameters(question: str, catalog: dict) -> dict[str, Any]:
                 "source": "default",
                 "token": token,
                 "alias": meta.get("alias"),
+                "default": default,
+            }
+        else:
+            # declared but neither question nor default — still surface for debugging
+            resolved[name] = {
+                "value": None,
+                "source": "missing",
+                "token": token,
+                "alias": meta.get("alias"),
+                "default": None,
             }
     return resolved
+
+
+def params_breakdown(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Split params for logs/API: defaults vs taken from the question vs final used."""
+    defaults: dict[str, Any] = {}
+    from_question: dict[str, Any] = {}
+    used: dict[str, Any] = {}
+    missing: list[str] = []
+    for meta in resolved.values():
+        token = meta.get("token") or ""
+        alias = meta.get("alias")
+        entry = {
+            "value": meta.get("value"),
+            "alias": alias,
+            "default": meta.get("default"),
+            "from": meta.get("source"),
+        }
+        if meta.get("default") not in (None, ""):
+            defaults[token] = {
+                "value": meta.get("default"),
+                "alias": alias,
+            }
+        if meta.get("source") == "question":
+            from_question[token] = {
+                "value": meta.get("value"),
+                "alias": alias,
+                "overrode_default": meta.get("default"),
+            }
+        if meta.get("source") == "missing":
+            missing.append(token)
+        elif meta.get("value") is not None:
+            used[token] = entry
+    return {
+        "defaults": defaults,
+        "from_question": from_question,
+        "used": used,
+        "missing": missing,
+    }
+
+
+def log_parameters(question: str, resolved: dict[str, Any]) -> dict[str, Any]:
+    breakdown = params_breakdown(resolved)
+    log.info("PARAMS question=%s", preview(question, 200))
+    log.info("PARAMS defaults=%s", preview(breakdown["defaults"], 500))
+    log.info("PARAMS from_question=%s", preview(breakdown["from_question"], 500))
+    log.info("PARAMS used=%s", preview(breakdown["used"], 500))
+    if breakdown["missing"]:
+        log.warning("PARAMS missing (no value, placeholder kept)=%s", breakdown["missing"])
+    return breakdown
+
+
+def queries_from_packs(packs: list[dict]) -> list[dict]:
+    """SQL from selected page packs only — already filled with resolved params."""
+    planned: list[dict] = []
+    seen: set[str] = set()
+    for pack in packs:
+        page_i = pack.get("index")
+        page_name = (pack.get("index_entry") or {}).get("name") or (pack.get("page") or {}).get("name")
+        for source in pack.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            sql = source.get("sql_filled") or source.get("sql")
+            name = str(source.get("name") or "query")
+            if not isinstance(sql, str) or not sql.strip():
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            planned.append(
+                {
+                    "source": name,
+                    "page": page_i,
+                    "page_name": page_name,
+                    "sql": to_postgres_sql(sql.strip()),
+                    "sql_template": source.get("sql"),
+                }
+            )
+    return planned
+
+
+def pages_detail(catalog: dict, indexes: list[int] | None) -> list[dict]:
+    """Human-readable selected pages for /ask and ask_trace."""
+    index = build_page_index(catalog)
+    by_i = {int(entry["index"]): entry for entry in index if "index" in entry}
+    details: list[dict] = []
+    for item in indexes or []:
+        try:
+            i = int(item)
+        except (TypeError, ValueError):
+            continue
+        entry = by_i.get(i) or {"index": i}
+        details.append(
+            {
+                "index": i,
+                "name": entry.get("name"),
+                "alias": entry.get("alias"),
+                "titles": entry.get("titles"),
+                "element_count": entry.get("element_count"),
+            }
+        )
+    return details
 
 
 def sql_literal(value: Any) -> str:
@@ -557,6 +759,8 @@ def fill_sql(sql: str, resolved: dict[str, Any]) -> str:
     """Substitute {Name} with resolved values. Leave the rest of SQL as-is."""
     filled = sql
     for name, meta in resolved.items():
+        if meta.get("source") == "missing" or meta.get("value") is None:
+            continue
         token = meta.get("token") or f"{{{name}}}"
         filled = filled.replace(token, sql_literal(meta["value"]))
     return filled
@@ -604,7 +808,11 @@ def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]
 
 def filters_payload(resolved: dict[str, Any]) -> dict:
     return {
-        meta["token"]: {"value": meta["value"], "from": meta["source"]}
+        meta["token"]: {
+            "value": meta["value"],
+            "from": meta["source"],
+            "alias": meta.get("alias"),
+        }
         for meta in resolved.values()
     }
 
@@ -621,22 +829,32 @@ def dump_ask_trace(
 ) -> Path:
     """Write full ask cycle: request → params → pages → sql → rows → answer."""
     path = resolve_path(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))
+    breakdown = params_breakdown(resolved)
     lines = [
         "=== ASK ===",
         f"question: {question}",
         "",
-        "=== PARAMS ===",
-        json.dumps(filters_payload(resolved), ensure_ascii=False, indent=2),
+        "=== PARAMS defaults (из .mrt) ===",
+        json.dumps(breakdown["defaults"], ensure_ascii=False, indent=2),
+        "",
+        "=== PARAMS from_question (подставленные из текста) ===",
+        json.dumps(breakdown["from_question"], ensure_ascii=False, indent=2),
+        "",
+        "=== PARAMS used (что ушло в SQL) ===",
+        json.dumps(breakdown["used"], ensure_ascii=False, indent=2),
         "",
         "=== PAGES ===",
         json.dumps(pages or [], ensure_ascii=False, indent=2),
         "",
-        "=== SQL ===",
+        "=== SQL (с выбранных pages, уже с параметрами) ===",
     ]
     for item in queries or []:
         source = item.get("source") or "query"
+        page = item.get("page_name") or item.get("page")
         sql = (item.get("sql") or item.get("sql_filled") or "").strip()
-        lines.append(f"-- source: {source}")
+        lines.append(f"-- source: {source} page: {page}")
+        if item.get("sql_template"):
+            lines.append(f"-- template: {item['sql_template']}")
         if sql:
             lines.append(sql if sql.endswith(";") else sql + ";")
         lines.append("")
@@ -1121,37 +1339,52 @@ async def answer_question(
     resolved: dict[str, Any],
     catalog: dict,
 ) -> dict[str, Any]:
-    """Decomposed ask: route → load packs → plan SQL → execute → answer."""
+    """route pages → SQL from those pages (params filled) → MCP → answer."""
+    breakdown = log_parameters(question, resolved)
     log.info(
-        "Pipeline start question=%s variables=%s pages_total=%s",
-        preview(question, 200),
-        preview(filters_payload(resolved), 300),
+        "Pipeline start pages_total=%s",
         len(catalog.get("pages") or []),
     )
 
     page_indexes = await route_pages(
         llm, model=model, catalog=catalog, question=question, resolved=resolved
     )
-    packs = [build_page_pack(catalog, index, resolved=resolved) for index in page_indexes]
-    log.info(
-        "Loaded packs=%s sources=%s",
-        page_indexes,
-        [src.get("name") for pack in packs for src in (pack.get("sources") or [])],
-    )
+    selected = pages_detail(catalog, page_indexes)
+    log.info("Selected pages=%s", preview(selected, 400))
 
-    planned = await plan_queries(
-        llm, model=model, question=question, resolved=resolved, packs=packs
+    packs = [build_page_pack(catalog, index, resolved=resolved) for index in page_indexes]
+    planned = queries_from_packs(packs)
+    log.info(
+        "SQL from pages: %s",
+        preview(
+            [
+                {
+                    "source": item.get("source"),
+                    "page": item.get("page_name") or item.get("page"),
+                    "sql": item.get("sql"),
+                }
+                for item in planned
+            ],
+            800,
+        ),
     )
     if not planned:
-        raise RuntimeError("нет SQL для выполнения")
+        raise RuntimeError("нет SQL на выбранных pages")
 
     results: list[dict] = []
     for item in planned:
-        log.info("Execute %s: %s", item.get("source"), preview(item.get("sql"), 200))
+        log.info(
+            "Execute page=%s source=%s: %s",
+            item.get("page_name") or item.get("page"),
+            item.get("source"),
+            preview(item.get("sql"), 200),
+        )
         executed = await mcp_execute_sql(session, item["sql"])
         results.append(
             {
                 "source": item.get("source"),
+                "page": item.get("page"),
+                "page_name": item.get("page_name"),
                 "sql": item.get("sql"),
                 "ok": executed.get("ok"),
                 "result": executed.get("result"),
@@ -1169,6 +1402,8 @@ async def answer_question(
     return {
         "answer": answer,
         "pages": page_indexes,
+        "pages_detail": selected,
+        "params": breakdown,
         "queries": planned,
         "sql_results": results,
     }
@@ -1254,7 +1489,7 @@ async def lifespan(app: FastAPI):
                 app.state.page_index = page_index
                 app.state.report = (catalog.get("report") or {}).get("name")
                 app.state.lock = asyncio.Lock()
-                log.info("Host готов принимать /ask (route→plan→sql→answer)")
+                log.info("Host готов принимать /ask (params→route pages→SQL from pages→MCP→answer)")
                 yield
                 log.info("Host останавливается, MCP закроется")
 
@@ -1316,24 +1551,44 @@ async def ask(body: Ask) -> dict:
         log.error("Пустой ответ модели")
         raise HTTPException(status_code=502, detail="model returned an empty answer")
     elapsed = time.perf_counter() - started
+    selected_pages = result.get("pages_detail") or pages_detail(app.state.catalog, result.get("pages"))
+    params = result.get("params") or params_breakdown(resolved)
     dump_ask_trace(
         question=question,
         resolved=resolved,
-        pages=result.get("pages"),
+        pages=selected_pages,
         queries=result.get("queries"),
         sql_results=result.get("sql_results"),
         answer=answer,
         elapsed_s=elapsed,
     )
-    log.info("Ответ за %.2fs: %s", elapsed, preview(answer, 300))
+    log.info(
+        "Ответ за %.2fs pages=%s from_question=%s defaults=%s: %s",
+        elapsed,
+        preview(selected_pages, 200),
+        preview(params.get("from_question"), 200),
+        preview(params.get("defaults"), 200),
+        preview(answer, 300),
+    )
     return {
         "answer": answer,
-        "variables": filters_payload(resolved),
+        "params": params,
         "pages": result.get("pages"),
-        "queries": result.get("queries"),
+        "pages_detail": selected_pages,
+        "queries": [
+            {
+                "source": item.get("source"),
+                "page": item.get("page"),
+                "page_name": item.get("page_name"),
+                "sql": item.get("sql"),
+                "sql_template": item.get("sql_template"),
+            }
+            for item in (result.get("queries") or [])
+        ],
         "sql_results": [
             {
                 "source": item.get("source"),
+                "page_name": item.get("page_name"),
                 "ok": item.get("ok"),
                 "sql": item.get("sql"),
                 "preview": preview(item.get("result"), 500),
