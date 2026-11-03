@@ -1,28 +1,25 @@
 # dash
 
-Преобразование Stimulsoft JSON `.mrt` → компактный catalog для LLM.
+1. `.mrt` → `catalog_pages/` (разбивка по pages)
+2. FastAPI `/ask` → LLM API выбирает page → `{"page":"..."}`
+
+Reasoning low: короткий index pages в промпт.
 
 ## Запуск
 
 ```bash
-python extract_mrt.py SalesOfProducts.mrt
+cp .env.example .env
+# задай LLM_MODEL (и LLM_BASE_URL если не :8080)
+
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python host.py
 ```
 
-Пишет:
+```bash
+curl -s http://127.0.0.1:8090/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"сколько единиц на складе"}'
+# {"page":"Products"}
+```
 
-- `catalog.json` — полный catalog
-- `catalog_pages/index.json` — карточки всех pages
-- `catalog_pages/dictionary.json` — sources/variables/relations без тел pages
-- `catalog_pages/0.json`, `1.json`, … — pack одной страницы
-
-Опции: `-o path`, `--pages-dir dir`, `--no-pages`.
-
-Зависимости: только стандартная библиотека Python 3.
-
-## Что попадает в catalog
-
-- `report`
-- `databases`, `sources` (SQL), `relations`, `variables`, `business_objects`, `resources`, `functions`
-- `pages` / dashboard components: meters, DataFilters, TopN, drill-down, transforms, role=viz|filter, …
-
-Вёрстка, brushes/fonts, картинки и connection strings не тащатся.
+1 page в отчёте — LLM не зовётся. Несколько — `POST {LLM_BASE_URL}/chat/completions`.
