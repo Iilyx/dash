@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Ask pipeline:
 
-1) extract_mrt → catalog.json (from .mrt)
-2) /ask: load catalog + user question
-3) {Name} from question, else default from variables
-4) LLM + Postgres MCP (execute_sql) → answer
+1) on start: MRT_PATH → catalog.json + catalog_pages/ (pack per page)
+2) /ask: LLM sees index of ALL pages; load_page pulls packs when needed
+3) {Name} from question, else default; MCP execute_sql → answer
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ MAX_TOOL_CHARS = 24_000
 LOG_PREVIEW = 400
 # Only {Name} is a Stimulsoft variable. Bare Name is a column.
 PLACEHOLDER_BRACE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+LOCAL_PAGE_TOOLS = {"list_pages", "load_page"}
 
 log = logging.getLogger("host")
 
@@ -113,6 +113,10 @@ def llm_base_url() -> str:
     return raw
 
 
+def pages_dir() -> Path:
+    return resolve_path(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
+
+
 def ensure_catalog() -> dict:
     catalog_path = resolve_path(os.environ.get("CATALOG_PATH", "catalog.json"))
     mrt_raw = os.environ.get("MRT_PATH", "").strip()
@@ -125,6 +129,7 @@ def ensure_catalog() -> dict:
                 json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+            write_page_packs(catalog)
             log.info(
                 "Каталог готов → %s (sources=%s, pages=%s, bytes=%s)",
                 catalog_path,
@@ -136,7 +141,224 @@ def ensure_catalog() -> dict:
     if not catalog_path.is_file():
         raise RuntimeError("Нужен MRT_PATH или существующий CATALOG_PATH")
     log.info("Читаю готовый каталог %s", catalog_path)
-    return json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    write_page_packs(catalog)
+    return catalog
+
+
+def _walk_strings(node: Any, out: list[str]) -> None:
+    if isinstance(node, str):
+        if node.strip():
+            out.append(node.strip())
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            if key in {"key", "guid", "Guid", "Key"}:
+                continue
+            _walk_strings(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_strings(item, out)
+
+
+def page_index_entry(index: int, page: dict) -> dict:
+    titles: list[str] = []
+    element_names: list[str] = []
+    for element in page.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        if element.get("name"):
+            element_names.append(str(element["name"]))
+        if element.get("title"):
+            titles.append(str(element["title"]))
+        if element.get("text"):
+            titles.append(str(element["text"]))
+    return {
+        "index": index,
+        "name": page.get("name"),
+        "alias": page.get("alias"),
+        "type": page.get("type"),
+        "is_dashboard": page.get("is_dashboard"),
+        "element_count": len(page.get("elements") or []),
+        "element_names": element_names[:40],
+        "titles": titles[:40],
+    }
+
+
+def build_page_index(catalog: dict) -> list[dict]:
+    return [
+        page_index_entry(index, page)
+        for index, page in enumerate(catalog.get("pages") or [])
+        if isinstance(page, dict)
+    ]
+
+
+def source_names_in_page(page: dict) -> set[str]:
+    names: set[str] = set()
+    blobs: list[str] = []
+    _walk_strings(page, blobs)
+    for blob in blobs:
+        data_source = re.search(r"\bdata_source\b", blob, re.I)
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]", blob):
+            names.add(match.group(1).lower())
+        for match in re.finditer(
+            r"(?:Sum|Count|Avg|Min|Max)\(\s*([A-Za-z_][A-Za-z0-9_]*)\.",
+            blob,
+            re.I,
+        ):
+            names.add(match.group(1).lower())
+        if data_source:
+            pass
+    for element in page.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        ds = element.get("data_source")
+        if isinstance(ds, str) and ds.strip():
+            names.add(ds.strip().lower())
+    return names
+
+
+def variable_names_in_node(node: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(node, str):
+        found.update(PLACEHOLDER_BRACE.findall(node))
+    elif isinstance(node, dict):
+        for value in node.values():
+            found.update(variable_names_in_node(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.update(variable_names_in_node(item))
+    return found
+
+
+def build_page_pack(catalog: dict, index: int, resolved: dict[str, Any] | None = None) -> dict:
+    pages = [page for page in (catalog.get("pages") or []) if isinstance(page, dict)]
+    if index < 0 or index >= len(pages):
+        raise KeyError(f"page index out of range: {index}")
+    page = pages[index]
+    wanted_sources = source_names_in_page(page)
+    sources = []
+    for source in catalog.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        name = str(source.get("name") or "")
+        if wanted_sources and name.lower() not in wanted_sources:
+            continue
+        item = {
+            "name": name,
+            "alias": source.get("alias"),
+            "sql": source.get("sql"),
+            "columns": source.get("columns"),
+            "parameters": source.get("parameters"),
+        }
+        if resolved and source.get("sql"):
+            item["sql_filled"] = fill_sql(str(source["sql"]), resolved)
+        sources.append({key: value for key, value in item.items() if value not in (None, "", [])})
+    if not sources:
+        # page didn't name sources clearly — attach all sources so LLM can still query
+        for source in catalog.get("sources") or []:
+            if not isinstance(source, dict) or not source.get("sql"):
+                continue
+            item = {
+                "name": source.get("name"),
+                "alias": source.get("alias"),
+                "sql": source.get("sql"),
+            }
+            if resolved:
+                item["sql_filled"] = fill_sql(str(source["sql"]), resolved)
+            sources.append(item)
+
+    needed_vars = variable_names_in_node(page)
+    for source in sources:
+        needed_vars.update(braces_in_sql(str(source.get("sql") or "")))
+        needed_vars.update(braces_in_sql(str(source.get("sql_filled") or "")))
+    meta = variables_by_name(catalog)
+    variables = [meta[name] for name in needed_vars if name in meta]
+    # always include defaults for declared variables if page pack has none
+    if not variables:
+        variables = list(meta.values())
+
+    return {
+        "index": index,
+        "page": page,
+        "sources": sources,
+        "variables": variables,
+        "index_entry": page_index_entry(index, page),
+    }
+
+
+def resolve_page_ref(catalog: dict, ref: Any) -> int:
+    pages = [page for page in (catalog.get("pages") or []) if isinstance(page, dict)]
+    if isinstance(ref, bool):
+        raise KeyError(f"bad page ref: {ref}")
+    if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+        index = int(ref)
+        if 0 <= index < len(pages):
+            return index
+        raise KeyError(f"page index out of range: {ref}")
+    text_ref = str(ref or "").strip().lower()
+    if not text_ref:
+        raise KeyError("empty page ref")
+    for index, page in enumerate(pages):
+        for key in ("name", "alias"):
+            value = page.get(key)
+            if isinstance(value, str) and value.strip().lower() == text_ref:
+                return index
+    raise KeyError(f"page not found: {ref}")
+
+
+def write_page_packs(catalog: dict) -> Path:
+    target = pages_dir()
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    index = build_page_index(catalog)
+    (target / "index.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    for entry in index:
+        pack = build_page_pack(catalog, int(entry["index"]))
+        path = target / f"{entry['index']}.json"
+        path.write_text(json.dumps(pack, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    log.info("Page packs → %s (%s pages)", target, len(index))
+    return target
+
+
+def page_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_pages",
+                "description": (
+                    "Индекс всех pages/dashboard из .mrt. "
+                    "Сначала пройдись по списку, потом load_page для нужных "
+                    "(можно несколько или все — top-K нет, ничего не отбрасываем заранее)."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "load_page",
+                "description": (
+                    "Тянет полный pack страницы: elements/meters/filters/interaction "
+                    "+ связанные sources и sql_filled. Вызывай для каждой нужной page."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "page": {
+                            "type": ["string", "integer"],
+                            "description": "index (0,1,2…) или Name/Alias страницы",
+                        }
+                    },
+                    "required": ["page"],
+                },
+            },
+        },
+    ]
 
 
 def braces_in_sql(sql: str) -> list[str]:
@@ -377,39 +599,39 @@ def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]
 
 
 def system_prompt(catalog: dict) -> str:
-    """catalog.json + rules for LLM; filters come from the user message."""
-    catalog_body = json.dumps(catalog, ensure_ascii=False, indent=2)
+    """Compact prompt: full page index only. Page bodies loaded via load_page."""
+    index = build_page_index(catalog)
+    variables = list(variables_by_name(catalog).values())
+    report = catalog.get("report") or {}
     return (
         "Ты отвечаешь на вопросы по Stimulsoft-дашборду/отчёту.\n"
-        "Тебе дан catalog.json (из .mrt): sources/SQL, variables, pages/elements "
-        "(meters, filters, TopN, interaction, drill-down, role=viz|filter).\n"
-        "В сообщении пользователя уже есть фильтры {Name}: из вопроса, "
-        "если чего-то нет — default из variables. SQL с подстановкой — в sql_filled.\n"
-        "Пайплайн:\n"
-        "1) Выбери нужный sql_filled (или поправь MySQL→PostgreSQL: "
-        "`order details` → \"order details\").\n"
-        "2) Вызови MCP execute_sql.\n"
-        "3) По строкам и логике виджета сформулируй ответ.\n"
+        "Полный catalog в контекст не помещается. Поэтому:\n"
+        "- ниже INDEX всех pages (ничего не отфильтровано заранее);\n"
+        "- list_pages — ещё раз получить индекс;\n"
+        "- load_page — тянуть полный pack нужной страницы "
+        "(elements/meters/filters/TopN/interaction + sources/sql_filled). "
+        "Можно грузить несколько pages или все подряд, если не уверен;\n"
+        "- затем execute_sql по sql_filled из загруженных packs "
+        "(MySQL→PostgreSQL: `order details` → \"order details\").\n"
+        "Фильтры {Name} уже в сообщении пользователя (вопрос или default).\n"
         "Не выдумывай числа. Ответь на языке вопроса.\n\n"
-        f"catalog.json:\n{catalog_body}"
+        f"report: {json.dumps(report, ensure_ascii=False)}\n\n"
+        f"variables (defaults): {json.dumps(variables, ensure_ascii=False)}\n\n"
+        f"pages index (все):\n{json.dumps(index, ensure_ascii=False, indent=2)}"
     )
 
 
-def user_message(question: str, resolved: dict[str, Any], queries: list[dict]) -> str:
+def user_message(question: str, resolved: dict[str, Any]) -> str:
     filters = {
         meta["token"]: {"value": meta["value"], "from": meta["source"]}
         for meta in resolved.values()
     }
-    ready = [
-        {"source": item.get("source"), "sql_filled": item.get("sql_filled")}
-        for item in queries
-    ]
     return (
         f"{question}\n\n"
         "Фильтры (из вопроса пользователя или default variables):\n"
         f"{json.dumps(filters, ensure_ascii=False, indent=2)}\n\n"
-        "SQL с подстановкой (для execute_sql):\n"
-        f"{json.dumps(ready, ensure_ascii=False, indent=2)}"
+        "Сначала list_pages / просмотри index, затем load_page для нужных pages "
+        "(сколько надо — хоть все), потом execute_sql."
     )
 
 
@@ -485,7 +707,50 @@ def render_tool_result(result) -> str:
     return body
 
 
-async def run_tool(session: ClientSession, name: str, arguments: dict, known: set[str]) -> str:
+def run_page_tool(
+    name: str,
+    arguments: dict,
+    *,
+    catalog: dict,
+    resolved: dict[str, Any],
+) -> str:
+    if name == "list_pages":
+        payload = {"pages": build_page_index(catalog)}
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        log.info("local tool list_pages → %s pages", len(payload["pages"]))
+        return body
+    if name == "load_page":
+        ref = arguments.get("page", arguments.get("index", arguments.get("name")))
+        try:
+            index = resolve_page_ref(catalog, ref)
+            pack = build_page_pack(catalog, index, resolved=resolved)
+        except KeyError as exc:
+            return f"Page error: {exc}"
+        body = json.dumps(pack, ensure_ascii=False, indent=2)
+        if len(body) > MAX_TOOL_CHARS:
+            body = body[:MAX_TOOL_CHARS] + "\n...truncated"
+        log.info(
+            "local tool load_page ref=%s → index=%s sources=%s chars=%s",
+            ref,
+            index,
+            len(pack.get("sources") or []),
+            len(body),
+        )
+        return body
+    return f"Unknown local tool: {name}"
+
+
+async def run_tool(
+    session: ClientSession,
+    name: str,
+    arguments: dict,
+    known: set[str],
+    *,
+    catalog: dict | None = None,
+    resolved: dict[str, Any] | None = None,
+) -> str:
+    if name in LOCAL_PAGE_TOOLS:
+        return run_page_tool(name, arguments, catalog=catalog or {}, resolved=resolved or {})
     if name not in known:
         log.warning("Неизвестный tool: %s", name)
         return f"Unknown tool: {name}"
@@ -590,24 +855,24 @@ async def answer_question(
     prompt: str,
     question: str,
     resolved: dict[str, Any],
-    queries: list[dict],
+    catalog: dict,
 ) -> str:
     known = {tool["function"]["name"] for tool in tools}
     messages: list[dict] = [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": user_message(question, resolved, queries)},
+        {"role": "user", "content": user_message(question, resolved)},
     ]
     used_tools = False
     empty_retries = 0
     log.info(
-        "Вопрос: %s | variables=%s | tools=%s",
+        "Вопрос: %s | variables=%s | pages=%s | tools=%s",
         preview(question, 200),
         preview({meta["token"]: meta["value"] for meta in resolved.values()}, 300),
+        len(catalog.get("pages") or []),
         sorted(known),
     )
-    for item in queries:
-        log.info("SQL filled %s: %s", item.get("source"), preview(item.get("sql_filled"), 200))
-    for round_no in range(1, MAX_TOOL_ROUNDS + 3):
+    # more rounds: list_pages + several load_page + execute_sql
+    for round_no in range(1, MAX_TOOL_ROUNDS + 8):
         result = await llm_chat(
             llm,
             model=model,
@@ -623,7 +888,7 @@ async def answer_question(
                 return text
             if used_tools and empty_retries < 1:
                 empty_retries += 1
-                log.warning("После MCP модель молчит — прошу ответить по результату SQL")
+                log.warning("После инструментов модель молчит — прошу ответить")
                 messages.append(
                     {
                         "role": "user",
@@ -645,8 +910,8 @@ async def answer_question(
                     return forced["text"]
                 for item in reversed(messages):
                     if item.get("role") == "tool" and item.get("content"):
-                        log.warning("Отдаю сырой результат MCP как ответ")
-                        return f"Модель не сформулировала ответ. Данные из MCP:\n{item['content']}"
+                        log.warning("Отдаю сырой результат tool как ответ")
+                        return f"Модель не сформулировала ответ. Данные:\n{item['content']}"
             raise RuntimeError("model returned an empty answer")
         used_tools = True
         messages.append(result["assistant"])
@@ -657,10 +922,17 @@ async def answer_question(
                 log.warning("Плохие args для %s: %s", name, exc)
                 tool_text = f"Bad tool arguments: {exc}"
             else:
-                tool_text = await run_tool(session, name, arguments, known)
+                tool_text = await run_tool(
+                    session,
+                    name,
+                    arguments,
+                    known,
+                    catalog=catalog,
+                    resolved=resolved,
+                )
             messages.append({"role": "tool", "tool_call_id": call_id, "content": tool_text})
-    log.error("Слишком много раундов MCP для вопроса: %s", preview(question, 200))
-    return "Модель не закончила ответ: слишком много вызовов MCP."
+    log.error("Слишком много раундов для вопроса: %s", preview(question, 200))
+    return "Модель не закончила ответ: слишком много вызовов инструментов."
 
 
 def mcp_database_uri() -> str:
@@ -704,20 +976,23 @@ async def lifespan(app: FastAPI):
     catalog = ensure_catalog()
     templates = query_templates(catalog)
     defaults = default_parameters(catalog)
+    page_index = build_page_index(catalog)
     prompt = system_prompt(catalog)
     log.info(
-        "Промпт: report=%s queries=%s defaults=%s prompt_chars=%s",
+        "Промпт: report=%s pages=%s sources=%s defaults=%s prompt_chars=%s",
         (catalog.get("report") or {}).get("name"),
-        [item.get("source") for item in templates],
+        len(page_index),
+        len(templates),
         defaults,
         len(prompt),
     )
-    for item in templates:
+    for entry in page_index:
         log.info(
-            "SQL template %s variables=%s sql=%s",
-            item.get("source"),
-            [p["name"] for p in item.get("variables") or []],
-            preview(item.get("sql"), 180),
+            "page[%s] %s alias=%s elements=%s",
+            entry.get("index"),
+            entry.get("name"),
+            entry.get("alias"),
+            entry.get("element_count"),
         )
     headers = {}
     api_key = os.environ.get("LLM_API_KEY", "").strip()
@@ -730,7 +1005,7 @@ async def lifespan(app: FastAPI):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
-                tools = chat_tools(listed.tools)
+                tools = page_tools() + chat_tools(listed.tools)
                 log.info("MCP готов, tools=%s", [tool["function"]["name"] for tool in tools])
                 app.state.session = session
                 app.state.llm = llm
@@ -740,6 +1015,7 @@ async def lifespan(app: FastAPI):
                 app.state.catalog = catalog
                 app.state.defaults = defaults
                 app.state.queries = templates
+                app.state.page_index = page_index
                 app.state.report = (catalog.get("report") or {}).get("name")
                 app.state.lock = asyncio.Lock()
                 log.info("Host готов принимать /ask")
@@ -765,7 +1041,8 @@ async def health() -> dict:
         "report": app.state.report,
         "tools": [tool["function"]["name"] for tool in app.state.tools],
         "defaults": app.state.defaults,
-        "queries": app.state.queries,
+        "pages": app.state.page_index,
+        "queries": [item.get("source") for item in app.state.queries],
         "llm": llm_base_url(),
         "mcp": "docker run -i --rm crystaldba/postgres-mcp --access-mode=restricted",
     }
@@ -777,12 +1054,14 @@ async def ask(body: Ask) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="question is empty")
     resolved = resolve_parameters(question, app.state.catalog)
+    # debug dump of all filled SQL; LLM still loads pages on demand
     queries = filled_queries(app.state.catalog, resolved)
     dump_path = dump_filled_sql(queries, question, resolved)
     log.info(
-        "POST /ask question=%s variables=%s sql_dump=%s",
+        "POST /ask question=%s variables=%s pages=%s sql_dump=%s",
         preview(question, 200),
         preview({meta["token"]: meta for meta in resolved.values()}, 400),
+        len(app.state.page_index or []),
         dump_path,
     )
     started = time.perf_counter()
@@ -796,7 +1075,7 @@ async def ask(body: Ask) -> dict:
                 prompt=app.state.prompt,
                 question=question,
                 resolved=resolved,
-                queries=queries,
+                catalog=app.state.catalog,
             )
         except (httpx.HTTPError, RuntimeError) as exc:
             log.exception("Ошибка на /ask: %s", exc)
@@ -811,6 +1090,7 @@ async def ask(body: Ask) -> dict:
             meta["token"]: {"value": meta["value"], "from": meta["source"]}
             for meta in resolved.values()
         },
+        "pages_indexed": len(app.state.page_index or []),
     }
 
 

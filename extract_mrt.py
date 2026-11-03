@@ -93,6 +93,7 @@ METER_KEYS = {
     "LowValue",
     "Indicator",
     "Meters",
+    "ManuallyEnteredChartMeter",
 }
 FILTER_ELEMENT_IDENTS = {
     "StiComboBoxElement",
@@ -348,14 +349,23 @@ def conditions_of(node: dict) -> list[dict]:
         for item in numbered(node.get(key)):
             if not isinstance(item, dict):
                 continue
+            meters = string_list(item.get("KeyDataFieldMeters"))
+            key_meter = text(item.get("KeyValueMeter"))
+            if key_meter and key_meter not in meters:
+                meters.append(key_meter)
+            destinations = string_list(item.get("KeyDestinationMeters"))
+            dest_meter = text(item.get("DestinationValueMeter"))
+            if dest_meter and dest_meter not in destinations:
+                destinations.append(dest_meter)
             cond = {
+                "type": text(item.get("Ident")),
                 "condition": text(item.get("Condition")),
                 "data_type": text(item.get("DataType")),
                 "value": text(item.get("Value") or item.get("Value1")),
                 "value2": text(item.get("Value2")),
                 "field": text(item.get("Field") or item.get("Path")),
-                "meters": string_list(item.get("KeyDataFieldMeters")),
-                "destination_meters": string_list(item.get("KeyDestinationMeters")),
+                "meters": meters,
+                "destination_meters": destinations,
             }
             if item.get("IsExpression") is True:
                 cond["is_expression"] = True
@@ -790,6 +800,22 @@ def element(node: dict) -> dict:
     user_sorts = sorts_of(node.get("UserSorts"))
     transform_sorts = sorts_of(node.get("TransformSorts"))
 
+    # Named Expressions collection: {0: {Name, Expression}, …}
+    named_expressions = []
+    for item in numbered(node.get("Expressions")):
+        if not isinstance(item, dict):
+            continue
+        named = {
+            "name": text(item.get("Name")),
+            "expression": text(item.get("Expression")),
+        }
+        cleaned = {key: value for key, value in named.items() if value}
+        if cleaned:
+            named_expressions.append(cleaned)
+            expr = cleaned.get("expression")
+            if expr and expr not in exprs:
+                exprs.append(expr)
+
     parsed = {
         "name": node.get("Name"),
         "alias": text(node.get("Alias")),
@@ -800,6 +826,7 @@ def element(node: dict) -> dict:
         "text": shown,
         "meters": meters,
         "expressions": exprs,
+        "named_expressions": named_expressions,
         "formats": formats(node),
         "filters": filters_of(node),
         "user_filters": user_filters,
@@ -822,6 +849,7 @@ def element(node: dict) -> dict:
         "selection_mode": text(node.get("SelectionMode")),
         "initial_value": text(node.get("InitialValue")),
         "summary_direction": text(node.get("SummaryDirection")),
+        "visibility_expression": text(node.get("VisibilityExpression")),
     }
     if node.get("FilterOn") is False:
         parsed["filter_on"] = False
