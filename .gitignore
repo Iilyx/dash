@@ -7,6 +7,7 @@ __pycache__/
 catalog_pages/
 ask_trace.txt
 sql_filled.txt
+page.txt
 data/
 init/
 *.error.txt
