@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Ask pipeline:
+"""Ask pipeline (staged):
 
-1) on start: MRT_PATH → catalog.json + catalog_pages/ (pack per page)
-2) /ask: LLM sees index of ALL pages; load_page pulls packs when needed
-3) {Name} from question, else default; MCP execute_sql → answer
+1) start: MRT → catalog.json + catalog_pages/
+2) resolve {Name} from question / defaults
+3) router LLM: which pages (from full index)
+4) host loads those packs
+5) planner LLM: which SQL to run
+6) host execute_sql via MCP
+7) answerer LLM: final answer from rows
 """
 
 from __future__ import annotations
@@ -598,41 +602,75 @@ def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]
     return path
 
 
-def system_prompt(catalog: dict) -> str:
-    """Compact prompt: full page index only. Page bodies loaded via load_page."""
-    index = build_page_index(catalog)
-    variables = list(variables_by_name(catalog).values())
-    report = catalog.get("report") or {}
-    return (
-        "Ты отвечаешь на вопросы по Stimulsoft-дашборду/отчёту.\n"
-        "Полный catalog в контекст не помещается. Поэтому:\n"
-        "- ниже INDEX всех pages (ничего не отфильтровано заранее);\n"
-        "- list_pages — ещё раз получить индекс;\n"
-        "- load_page — тянуть полный pack нужной страницы "
-        "(elements/meters/filters/TopN/interaction + sources/sql_filled). "
-        "Можно грузить несколько pages или все подряд, если не уверен;\n"
-        "- затем execute_sql по sql_filled из загруженных packs "
-        "(MySQL→PostgreSQL: `order details` → \"order details\").\n"
-        "Фильтры {Name} уже в сообщении пользователя (вопрос или default).\n"
-        "Не выдумывай числа. Ответь на языке вопроса.\n\n"
-        f"report: {json.dumps(report, ensure_ascii=False)}\n\n"
-        f"variables (defaults): {json.dumps(variables, ensure_ascii=False)}\n\n"
-        f"pages index (все):\n{json.dumps(index, ensure_ascii=False, indent=2)}"
-    )
-
-
-def user_message(question: str, resolved: dict[str, Any]) -> str:
-    filters = {
+def filters_payload(resolved: dict[str, Any]) -> dict:
+    return {
         meta["token"]: {"value": meta["value"], "from": meta["source"]}
         for meta in resolved.values()
     }
-    return (
-        f"{question}\n\n"
-        "Фильтры (из вопроса пользователя или default variables):\n"
-        f"{json.dumps(filters, ensure_ascii=False, indent=2)}\n\n"
-        "Сначала list_pages / просмотри index, затем load_page для нужных pages "
-        "(сколько надо — хоть все), потом execute_sql."
-    )
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def to_postgres_sql(sql: str) -> str:
+    return re.sub(r"`([^`]+)`", r'"\1"', sql)
+
+
+def compact_pack_for_planner(pack: dict) -> dict:
+    """Shrink pack for planner context: keep widgets + sql_filled."""
+    page = pack.get("page") or {}
+    elements = []
+    for element in page.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        elements.append(
+            {
+                "name": element.get("name"),
+                "type": element.get("type"),
+                "role": element.get("role"),
+                "title": element.get("title"),
+                "text": element.get("text"),
+                "meters": element.get("meters"),
+                "filters": element.get("filters"),
+                "top_n": element.get("top_n"),
+                "expressions": element.get("expressions"),
+                "interaction": element.get("interaction"),
+            }
+        )
+    sources = []
+    for source in pack.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        sources.append(
+            {
+                "name": source.get("name"),
+                "sql_filled": source.get("sql_filled") or source.get("sql"),
+            }
+        )
+    return {
+        "index": pack.get("index"),
+        "name": page.get("name"),
+        "alias": page.get("alias"),
+        "elements": elements,
+        "sources": sources,
+        "variables": pack.get("variables"),
+    }
 
 
 def chat_tools(tools) -> list[dict]:
@@ -846,93 +884,249 @@ async def llm_chat(
     return {"assistant": assistant, "pending": pending, "text": text, "raw": message}
 
 
+async def llm_text(
+    llm: httpx.AsyncClient,
+    *,
+    model: str,
+    system: str,
+    user: str,
+    round_no: str,
+) -> str:
+    result = await llm_chat(
+        llm,
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        tools=None,
+        round_no=round_no,
+        allow_tools=False,
+    )
+    return result["text"]
+
+
+async def route_pages(
+    llm: httpx.AsyncClient,
+    *,
+    model: str,
+    catalog: dict,
+    question: str,
+    resolved: dict[str, Any],
+) -> list[int]:
+    """Stage 1: pick pages from the full index. Fallback = all pages."""
+    pages = [page for page in (catalog.get("pages") or []) if isinstance(page, dict)]
+    if not pages:
+        return []
+    if len(pages) == 1:
+        return [0]
+    index = build_page_index(catalog)
+    system = (
+        "Ты роутер Stimulsoft-дашборда. По вопросу выбери какие pages нужны.\n"
+        "Верни ТОЛЬКО JSON вида {\"pages\":[0,2]} — индексы из списка.\n"
+        "Если не уверен — верни все индексы. Никакого текста кроме JSON."
+    )
+    user = (
+        f"Вопрос: {question}\n"
+        f"Фильтры: {json.dumps(filters_payload(resolved), ensure_ascii=False)}\n"
+        f"Pages index:\n{json.dumps(index, ensure_ascii=False, indent=2)}"
+    )
+    raw = await llm_text(llm, model=model, system=system, user=user, round_no="route")
+    parsed = extract_json_object(raw) or {}
+    selected: list[int] = []
+    for item in parsed.get("pages") or []:
+        try:
+            selected.append(resolve_page_ref(catalog, item))
+        except KeyError:
+            continue
+    # unique preserve order
+    ordered: list[int] = []
+    for index in selected:
+        if index not in ordered:
+            ordered.append(index)
+    if not ordered:
+        log.warning("Router не выбрал pages — беру все %s", len(pages))
+        return list(range(len(pages)))
+    log.info("Router pages=%s", ordered)
+    return ordered
+
+
+async def plan_queries(
+    llm: httpx.AsyncClient,
+    *,
+    model: str,
+    question: str,
+    resolved: dict[str, Any],
+    packs: list[dict],
+) -> list[dict]:
+    """Stage 2: choose SQL from loaded packs. Fallback = all sql_filled."""
+    compact = [compact_pack_for_planner(pack) for pack in packs]
+    system = (
+        "Ты планировщик SQL по Stimulsoft page packs.\n"
+        "Выбери 1..N запросов для ответа. Верни ТОЛЬКО JSON:\n"
+        '{"queries":[{"source":"name","sql":"SELECT ..."}]}\n'
+        "Бери sql_filled из packs; при необходимости слегка поправь под PostgreSQL "
+        "(`order details` → \"order details\"). Не выдумывай таблицы."
+    )
+    user = (
+        f"Вопрос: {question}\n"
+        f"Фильтры: {json.dumps(filters_payload(resolved), ensure_ascii=False)}\n"
+        f"Packs:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+    raw = await llm_text(llm, model=model, system=system, user=user, round_no="plan")
+    parsed = extract_json_object(raw) or {}
+    planned: list[dict] = []
+    for item in parsed.get("queries") or []:
+        if not isinstance(item, dict):
+            continue
+        sql = item.get("sql") or item.get("sql_filled")
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        planned.append(
+            {
+                "source": item.get("source") or item.get("name") or "query",
+                "sql": to_postgres_sql(sql.strip()),
+            }
+        )
+    if planned:
+        log.info("Planner queries=%s", [item["source"] for item in planned])
+        return planned
+
+    fallback: list[dict] = []
+    seen: set[str] = set()
+    for pack in packs:
+        for source in pack.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            sql = source.get("sql_filled") or source.get("sql")
+            name = str(source.get("name") or "query")
+            if not isinstance(sql, str) or not sql.strip():
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            fallback.append({"source": name, "sql": to_postgres_sql(sql.strip())})
+    log.warning("Planner пуст — fallback %s sources", len(fallback))
+    return fallback
+
+
+async def mcp_execute_sql(session: ClientSession, sql: str) -> dict:
+    """Stage 3: host runs SQL via Postgres MCP."""
+    last_error = ""
+    for key in ("sql", "query"):
+        try:
+            result = await session.call_tool("execute_sql", {key: sql})
+            body = render_tool_result(result)
+            ok = not getattr(result, "is_error", False) and not body.startswith("SQL error:")
+            return {"ok": ok, "sql": sql, "result": body, "arg": key}
+        except Exception as exc:
+            last_error = str(exc)
+            log.warning("execute_sql arg=%s failed: %s", key, exc)
+    return {"ok": False, "sql": sql, "result": f"SQL error: {last_error}", "arg": None}
+
+
+async def answer_from_rows(
+    llm: httpx.AsyncClient,
+    *,
+    model: str,
+    question: str,
+    resolved: dict[str, Any],
+    packs: list[dict],
+    results: list[dict],
+) -> str:
+    """Stage 4: final natural-language answer from SQL rows + widget hints."""
+    widgets = []
+    for pack in packs:
+        compact = compact_pack_for_planner(pack)
+        widgets.append(
+            {
+                "page": compact.get("name") or compact.get("alias"),
+                "elements": compact.get("elements"),
+            }
+        )
+    system = (
+        "Ты аналитик Stimulsoft-дашборда. Хост уже выполнил SQL.\n"
+        "По строкам результата и логике виджетов (meters/агрегации/фильтры/TopN) "
+        "ответь на вопрос. Не вызывай инструменты. Не выдумывай числа. "
+        "Ответь на языке вопроса."
+    )
+    user = (
+        f"Вопрос: {question}\n"
+        f"Фильтры: {json.dumps(filters_payload(resolved), ensure_ascii=False)}\n"
+        f"Виджеты:\n{json.dumps(widgets, ensure_ascii=False, indent=2)}\n"
+        f"Результат SQL:\n{json.dumps(results, ensure_ascii=False, indent=2)}"
+    )
+    text = await llm_text(llm, model=model, system=system, user=user, round_no="answer")
+    if text:
+        return text
+    # last resort: dump SQL results
+    chunks = [item.get("result") for item in results if item.get("result")]
+    if chunks:
+        return "Модель не сформулировала ответ. Данные SQL:\n" + "\n\n".join(chunks)
+    raise RuntimeError("model returned an empty answer")
+
+
 async def answer_question(
     *,
     session: ClientSession,
     llm: httpx.AsyncClient,
     model: str,
-    tools: list[dict],
-    prompt: str,
     question: str,
     resolved: dict[str, Any],
     catalog: dict,
-) -> str:
-    known = {tool["function"]["name"] for tool in tools}
-    messages: list[dict] = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": user_message(question, resolved)},
-    ]
-    used_tools = False
-    empty_retries = 0
+) -> dict[str, Any]:
+    """Decomposed ask: route → load packs → plan SQL → execute → answer."""
     log.info(
-        "Вопрос: %s | variables=%s | pages=%s | tools=%s",
+        "Pipeline start question=%s variables=%s pages_total=%s",
         preview(question, 200),
-        preview({meta["token"]: meta["value"] for meta in resolved.values()}, 300),
+        preview(filters_payload(resolved), 300),
         len(catalog.get("pages") or []),
-        sorted(known),
     )
-    # more rounds: list_pages + several load_page + execute_sql
-    for round_no in range(1, MAX_TOOL_ROUNDS + 8):
-        result = await llm_chat(
-            llm,
-            model=model,
-            messages=messages,
-            tools=tools,
-            round_no=round_no,
-            allow_tools=True,
+
+    page_indexes = await route_pages(
+        llm, model=model, catalog=catalog, question=question, resolved=resolved
+    )
+    packs = [build_page_pack(catalog, index, resolved=resolved) for index in page_indexes]
+    log.info(
+        "Loaded packs=%s sources=%s",
+        page_indexes,
+        [src.get("name") for pack in packs for src in (pack.get("sources") or [])],
+    )
+
+    planned = await plan_queries(
+        llm, model=model, question=question, resolved=resolved, packs=packs
+    )
+    if not planned:
+        raise RuntimeError("нет SQL для выполнения")
+
+    results: list[dict] = []
+    for item in planned:
+        log.info("Execute %s: %s", item.get("source"), preview(item.get("sql"), 200))
+        executed = await mcp_execute_sql(session, item["sql"])
+        results.append(
+            {
+                "source": item.get("source"),
+                "sql": item.get("sql"),
+                "ok": executed.get("ok"),
+                "result": executed.get("result"),
+            }
         )
-        pending = result["pending"]
-        text = result["text"]
-        if not pending:
-            if text:
-                return text
-            if used_tools and empty_retries < 1:
-                empty_retries += 1
-                log.warning("После инструментов модель молчит — прошу ответить")
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Инструменты уже отработали. По их результату ответь на исходный вопрос "
-                            "кратко и по делу. Не вызывай инструменты. Не оставляй ответ пустым."
-                        ),
-                    }
-                )
-                forced = await llm_chat(
-                    llm,
-                    model=model,
-                    messages=messages,
-                    tools=None,
-                    round_no=f"{round_no}-final",
-                    allow_tools=False,
-                )
-                if forced["text"]:
-                    return forced["text"]
-                for item in reversed(messages):
-                    if item.get("role") == "tool" and item.get("content"):
-                        log.warning("Отдаю сырой результат tool как ответ")
-                        return f"Модель не сформулировала ответ. Данные:\n{item['content']}"
-            raise RuntimeError("model returned an empty answer")
-        used_tools = True
-        messages.append(result["assistant"])
-        for call_id, name, raw_arguments in pending:
-            try:
-                arguments = parse_arguments(raw_arguments)
-            except (ValueError, json.JSONDecodeError) as exc:
-                log.warning("Плохие args для %s: %s", name, exc)
-                tool_text = f"Bad tool arguments: {exc}"
-            else:
-                tool_text = await run_tool(
-                    session,
-                    name,
-                    arguments,
-                    known,
-                    catalog=catalog,
-                    resolved=resolved,
-                )
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": tool_text})
-    log.error("Слишком много раундов для вопроса: %s", preview(question, 200))
-    return "Модель не закончила ответ: слишком много вызовов инструментов."
+
+    answer = await answer_from_rows(
+        llm,
+        model=model,
+        question=question,
+        resolved=resolved,
+        packs=packs,
+        results=results,
+    )
+    return {
+        "answer": answer,
+        "pages": page_indexes,
+        "queries": planned,
+        "sql_results": results,
+    }
 
 
 def mcp_database_uri() -> str:
@@ -977,14 +1171,12 @@ async def lifespan(app: FastAPI):
     templates = query_templates(catalog)
     defaults = default_parameters(catalog)
     page_index = build_page_index(catalog)
-    prompt = system_prompt(catalog)
     log.info(
-        "Промпт: report=%s pages=%s sources=%s defaults=%s prompt_chars=%s",
+        "Каталог: report=%s pages=%s sources=%s defaults=%s",
         (catalog.get("report") or {}).get("name"),
         len(page_index),
         len(templates),
         defaults,
-        len(prompt),
     )
     for entry in page_index:
         log.info(
@@ -1005,20 +1197,19 @@ async def lifespan(app: FastAPI):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
-                tools = page_tools() + chat_tools(listed.tools)
+                tools = chat_tools(listed.tools)
                 log.info("MCP готов, tools=%s", [tool["function"]["name"] for tool in tools])
                 app.state.session = session
                 app.state.llm = llm
                 app.state.model = model
                 app.state.tools = tools
-                app.state.prompt = prompt
                 app.state.catalog = catalog
                 app.state.defaults = defaults
                 app.state.queries = templates
                 app.state.page_index = page_index
                 app.state.report = (catalog.get("report") or {}).get("name")
                 app.state.lock = asyncio.Lock()
-                log.info("Host готов принимать /ask")
+                log.info("Host готов принимать /ask (route→plan→sql→answer)")
                 yield
                 log.info("Host останавливается, MCP закроется")
 
@@ -1054,43 +1245,46 @@ async def ask(body: Ask) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="question is empty")
     resolved = resolve_parameters(question, app.state.catalog)
-    # debug dump of all filled SQL; LLM still loads pages on demand
-    queries = filled_queries(app.state.catalog, resolved)
-    dump_path = dump_filled_sql(queries, question, resolved)
+    dump_filled_sql(filled_queries(app.state.catalog, resolved), question, resolved)
     log.info(
-        "POST /ask question=%s variables=%s pages=%s sql_dump=%s",
+        "POST /ask question=%s variables=%s pages_total=%s",
         preview(question, 200),
-        preview({meta["token"]: meta for meta in resolved.values()}, 400),
+        preview(filters_payload(resolved), 400),
         len(app.state.page_index or []),
-        dump_path,
     )
     started = time.perf_counter()
     async with app.state.lock:
         try:
-            answer = await answer_question(
+            result = await answer_question(
                 session=app.state.session,
                 llm=app.state.llm,
                 model=app.state.model,
-                tools=app.state.tools,
-                prompt=app.state.prompt,
                 question=question,
                 resolved=resolved,
                 catalog=app.state.catalog,
             )
         except (httpx.HTTPError, RuntimeError) as exc:
             log.exception("Ошибка на /ask: %s", exc)
-            raise HTTPException(status_code=502, detail=f"LLM: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"ask failed: {exc}") from exc
+    answer = result.get("answer") or ""
     if not answer:
         log.error("Пустой ответ модели")
         raise HTTPException(status_code=502, detail="model returned an empty answer")
     log.info("Ответ за %.2fs: %s", time.perf_counter() - started, preview(answer, 300))
     return {
         "answer": answer,
-        "variables": {
-            meta["token"]: {"value": meta["value"], "from": meta["source"]}
-            for meta in resolved.values()
-        },
-        "pages_indexed": len(app.state.page_index or []),
+        "variables": filters_payload(resolved),
+        "pages": result.get("pages"),
+        "queries": result.get("queries"),
+        "sql_results": [
+            {
+                "source": item.get("source"),
+                "ok": item.get("ok"),
+                "sql": item.get("sql"),
+                "preview": preview(item.get("result"), 500),
+            }
+            for item in (result.get("sql_results") or [])
+        ],
     }
 
 

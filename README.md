@@ -2,10 +2,13 @@
 
 Пайплайн вопросов по Stimulsoft `.mrt`:
 
-1. `.mrt` (`MRT_PATH`) → при старте `catalog.json` + `catalog_pages/` (pack на каждую page)
-2. `/ask`: в LLM только **index всех pages**; нужные тянет через `load_page` (можно несколько/все)
-3. фильтры `{Name}` из вопроса; иначе default из `variables`
-4. LLM → **Postgres MCP** (`execute_sql`) → ответ
+1. `.mrt` → `catalog.json` + `catalog_pages/` (pack на page)
+2. фильтры `{Name}` из вопроса / default
+3. **router** LLM: какие pages (по полному index)
+4. host грузит packs этих pages
+5. **planner** LLM: какой SQL
+6. host → MCP `execute_sql`
+7. **answerer** LLM: ответ по строкам + виджеты
 
 ## Compose
 
