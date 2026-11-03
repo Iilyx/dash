@@ -139,41 +139,67 @@ def message_text(message: dict) -> str:
     return ""
 
 
+def _delta_text(delta: dict) -> str:
+    for key in ("content", "text", "reasoning_content", "reasoning"):
+        value = delta.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) -> str:
+    """Stream tokens to console, return full text for /ask JSON."""
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0,
-        "stream": False,
+        "stream": True,
     }
     log.info(
-        "LLM → %s model=%s chars=%s",
+        "LLM → %s model=%s chars=%s stream=true",
         llm_base_url(),
         model,
         sum(len(str(m.get("content") or "")) for m in messages),
     )
     started = time.perf_counter()
-    response = await llm.post("chat/completions", json=payload)
-    response.raise_for_status()
-    body = response.json()
-    try:
-        choice = body["choices"][0]
-        message = choice["message"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"bad LLM response: {body!r}"[:800]) from exc
-    text = message_text(message if isinstance(message, dict) else {})
-    if not text and isinstance(choice, dict):
-        text = _as_text(choice.get("text"))
-    log.info(
-        "LLM ← %.2fs finish=%s usage=%s answer=%s",
-        time.perf_counter() - started,
-        choice.get("finish_reason") if isinstance(choice, dict) else None,
-        body.get("usage"),
-        (text[:300] + "…") if len(text) > 300 else text,
-    )
+    parts: list[str] = []
+    print("\n=== LLM stream ===", flush=True)
+    async with llm.stream("POST", "chat/completions", json=payload) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            if line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0] or {}
+            delta = choice.get("delta") or {}
+            piece = _delta_text(delta if isinstance(delta, dict) else {})
+            if not piece:
+                # некоторые серверы шлют целиком message на чанк
+                msg = choice.get("message") or {}
+                piece = message_text(msg if isinstance(msg, dict) else {})
+            if not piece:
+                piece = _as_text(choice.get("text"))
+            if piece:
+                parts.append(piece)
+                print(piece, end="", flush=True)
+    print("\n=== end stream ===\n", flush=True)
+    text = "".join(parts).strip()
+    log.info("LLM ← %.2fs chars=%s", time.perf_counter() - started, len(text))
     if not text:
-        log.error("LLM empty raw choice=%s", json.dumps(choice, ensure_ascii=False)[:1000])
-        raise RuntimeError("LLM empty content; raw=" + json.dumps(choice, ensure_ascii=False)[:500])
+        raise RuntimeError("LLM empty content (stream)")
     return text
 
 
