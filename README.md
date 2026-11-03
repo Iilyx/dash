@@ -1,9 +1,7 @@
 # dash
 
-1. `.mrt` → `catalog_pages/` (разбивка по pages)
+1. `.mrt` → `catalog.json` + `catalog_pages/N.json` (тот же catalog, но `pages` = одна page)
 2. FastAPI `/ask` → LLM API выбирает page → `{"page":"..."}`
-
-Reasoning low: короткий index pages в промпт.
 
 ## Запуск
 

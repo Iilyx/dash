@@ -927,20 +927,6 @@ def load_mrt(path: Path) -> dict:
     return report
 
 
-def _walk_strings(node, out: list[str]) -> None:
-    if isinstance(node, str):
-        if node.strip():
-            out.append(node.strip())
-    elif isinstance(node, dict):
-        for key, value in node.items():
-            if key in {"key", "guid", "Guid", "Key"}:
-                continue
-            _walk_strings(value, out)
-    elif isinstance(node, list):
-        for item in node:
-            _walk_strings(item, out)
-
-
 def page_index_entry(index: int, page: dict) -> dict:
     """Compact card for the LLM: enough to pick a page, not the full body."""
     titles: list[str] = []
@@ -985,203 +971,26 @@ def build_page_index(catalog: dict) -> list[dict]:
     ]
 
 
-def source_names_in_page(page: dict) -> set[str]:
-    names: set[str] = set()
-    blobs: list[str] = []
-    _walk_strings(page, blobs)
-    for blob in blobs:
-        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_]", blob):
-            names.add(match.group(1).lower())
-        for match in re.finditer(
-            r"(?:Sum|Count|Avg|Min|Max)\(\s*([A-Za-z_][A-Za-z0-9_]*)\.",
-            blob,
-            re.I,
-        ):
-            names.add(match.group(1).lower())
-    for item in page.get("elements") or []:
-        if not isinstance(item, dict):
-            continue
-        data_source = item.get("data_source")
-        if isinstance(data_source, str) and data_source.strip():
-            names.add(data_source.strip().lower())
-    return names
-
-
-def braces_in_text(value: str) -> set[str]:
-    return {item for item in brace_expressions(value) if item and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", item)}
-
-
-def variable_names_in_node(node) -> set[str]:
-    found: set[str] = set()
-    if isinstance(node, str):
-        found.update(braces_in_text(node))
-    elif isinstance(node, dict):
-        for value in node.values():
-            found.update(variable_names_in_node(value))
-    elif isinstance(node, list):
-        for item in node:
-            found.update(variable_names_in_node(item))
-    return found
-
-
-def variables_by_name(catalog: dict) -> dict[str, dict]:
-    result: dict[str, dict] = {}
-    for item in catalog.get("variables") or []:
-        if isinstance(item, dict) and item.get("name"):
-            result[str(item["name"])] = item
-    return result
-
-
-def build_page_pack(catalog: dict, index: int) -> dict:
+def catalog_for_page(catalog: dict, index: int) -> dict:
+    """Same shape as catalog.json, but pages[] contains only one page."""
     pages_list = [page for page in (catalog.get("pages") or []) if isinstance(page, dict)]
     if index < 0 or index >= len(pages_list):
         raise KeyError(f"page index out of range: {index}")
-    page = pages_list[index]
-    wanted = source_names_in_page(page)
-    sources_out = []
-    for source in catalog.get("sources") or []:
-        if not isinstance(source, dict):
-            continue
-        name = str(source.get("name") or "")
-        if wanted and name.lower() not in wanted:
-            continue
-        item = {
-            "name": name,
-            "alias": source.get("alias"),
-            "type": source.get("type"),
-            "database": source.get("database"),
-            "sql": source.get("sql"),
-            "columns": source.get("columns"),
-            "parameters": source.get("parameters"),
-            "filters": source.get("filters"),
-        }
-        sources_out.append({key: value for key, value in item.items() if value not in (None, "", [])})
-    if not sources_out:
-        # page didn't name sources clearly — attach SQL sources so the asker can still query
-        for source in catalog.get("sources") or []:
-            if not isinstance(source, dict) or not source.get("sql"):
-                continue
-            sources_out.append(
-                {
-                    key: value
-                    for key, value in {
-                        "name": source.get("name"),
-                        "alias": source.get("alias"),
-                        "sql": source.get("sql"),
-                        "columns": source.get("columns"),
-                    }.items()
-                    if value not in (None, "", [])
-                }
-            )
-
-    needed_vars = variable_names_in_node(page)
-    for source in sources_out:
-        needed_vars.update(braces_in_text(str(source.get("sql") or "")))
-    meta = variables_by_name(catalog)
-    variables_out = [meta[name] for name in needed_vars if name in meta]
-    if not variables_out:
-        variables_out = list(meta.values())
-
-    relations_out = []
-    source_names = {str(item.get("name") or "").lower() for item in sources_out}
-    for relation in catalog.get("relations") or []:
-        if not isinstance(relation, dict):
-            continue
-        parent = str(relation.get("parent") or "").lower()
-        child = str(relation.get("child") or "").lower()
-        if source_names and parent not in source_names and child not in source_names:
-            continue
-        relations_out.append(relation)
-
-    pack = {
-        "index": index,
-        "index_entry": page_index_entry(index, page),
-        "page": page,
-        "sources": sources_out,
-        "relations": relations_out,
-        "variables": variables_out,
-    }
-    return {
-        key: value
-        for key, value in pack.items()
-        if value is not None and value != "" and value != []
-    }
-
-
-def shared_dictionary(catalog: dict) -> dict:
-    """Sources/vars/relations without page bodies — still may be large; prefer page packs."""
-    shared = {
-        "report": catalog.get("report"),
-        "databases": catalog.get("databases"),
-        "sources": [
-            {
-                key: value
-                for key, value in {
-                    "name": source.get("name"),
-                    "alias": source.get("alias"),
-                    "type": source.get("type"),
-                    "database": source.get("database"),
-                    "sql": source.get("sql"),
-                    "columns": [
-                        {
-                            key: column.get(key)
-                            for key in ("name", "alias", "type")
-                            if column.get(key)
-                        }
-                        for column in (source.get("columns") or [])
-                        if isinstance(column, dict)
-                    ]
-                    or None,
-                }.items()
-                if value not in (None, "", [])
-            }
-            for source in (catalog.get("sources") or [])
-            if isinstance(source, dict)
-        ],
-        "relations": catalog.get("relations"),
-        "variables": catalog.get("variables"),
-        "functions": catalog.get("functions"),
-    }
-    return {key: value for key, value in shared.items() if value not in (None, "", [])}
+    out = {key: value for key, value in catalog.items() if key != "pages"}
+    out["pages"] = [pages_list[index]]
+    return out
 
 
 def write_page_packs(catalog: dict, target: Path) -> Path:
+    """catalog_pages/0.json, 1.json, … — полный catalog на каждую page."""
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
-    index = build_page_index(catalog)
-    shared = shared_dictionary(catalog)
-    (target / "index.json").write_text(
-        json.dumps(
-            {
-                "report": catalog.get("report") or {},
-                "page_count": len(index),
-                "pages": index,
-                "variable_names": [
-                    item.get("name")
-                    for item in (catalog.get("variables") or [])
-                    if isinstance(item, dict) and item.get("name")
-                ],
-                "source_names": [
-                    item.get("name")
-                    for item in (catalog.get("sources") or [])
-                    if isinstance(item, dict) and item.get("name")
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (target / "dictionary.json").write_text(
-        json.dumps(shared, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    for entry in index:
-        pack = build_page_pack(catalog, int(entry["index"]))
-        (target / f"{entry['index']}.json").write_text(
-            json.dumps(pack, ensure_ascii=False, indent=2) + "\n",
+    pages_list = [page for page in (catalog.get("pages") or []) if isinstance(page, dict)]
+    for index in range(len(pages_list)):
+        payload = catalog_for_page(catalog, index)
+        (target / f"{index}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     return target
@@ -1190,8 +999,7 @@ def write_page_packs(catalog: dict, target: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract a compact catalog from a JSON .mrt file. "
-        "Writes catalog.json and catalog_pages/ (index + per-page packs) so the "
-        "LLM never needs the full catalog in one prompt."
+        "Writes catalog.json and catalog_pages/N.json (one catalog per page)."
     )
     parser.add_argument("mrt", type=Path)
     parser.add_argument("-o", "--output", type=Path, help="Full catalog JSON path (default: catalog.json)")
@@ -1199,12 +1007,12 @@ def main() -> None:
         "--pages-dir",
         type=Path,
         default=Path("catalog_pages"),
-        help="Directory for index.json + N.json page packs (default: catalog_pages)",
+        help="Directory for per-page catalog JSON files (default: catalog_pages)",
     )
     parser.add_argument(
         "--no-pages",
         action="store_true",
-        help="Do not write catalog_pages/ packs",
+        help="Do not write catalog_pages/",
     )
     args = parser.parse_args()
     catalog = catalog_from_report(load_mrt(args.mrt))
@@ -1213,10 +1021,10 @@ def main() -> None:
     output.write_text(payload + "\n", encoding="utf-8")
     if not args.no_pages:
         pages_path = write_page_packs(catalog, args.pages_dir)
-        index = build_page_index(catalog)
+        page_count = len([p for p in (catalog.get("pages") or []) if isinstance(p, dict)])
         print(
             f"wrote {output} ({len(payload)} bytes), "
-            f"{pages_path}/ ({len(index)} pages)",
+            f"{pages_path}/0..{page_count - 1}.json ({page_count} pages)",
             file=sys.stderr,
         )
     else:
