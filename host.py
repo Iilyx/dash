@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Ask pipeline (staged):
+"""Ask pipeline:
 
-1) start: MRT → catalog.json + catalog_pages/
-2) resolve {Name} from question / defaults
-3) router LLM: which pages (from full index)
-4) host loads those packs
-5) planner LLM: which SQL to run
-6) host execute_sql via MCP
-7) answerer LLM: final answer from rows
+запрос
+ → извлечь параметры / подставить default
+ → найти pages
+ → выбрать SQL
+ → выполнить (MCP)
+ → ответ: логика дашборда + фильтры + вывод
 """
 
 from __future__ import annotations
@@ -602,6 +601,57 @@ def dump_filled_sql(queries: list[dict], question: str, resolved: dict[str, Any]
     return path
 
 
+def dump_ask_trace(
+    *,
+    question: str,
+    resolved: dict[str, Any],
+    pages: list[Any] | None,
+    queries: list[dict] | None,
+    sql_results: list[dict] | None,
+    answer: str,
+    elapsed_s: float | None = None,
+) -> Path:
+    """Write full ask cycle: request → params → pages → sql → rows → answer."""
+    path = resolve_path(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))
+    lines = [
+        "=== ASK ===",
+        f"question: {question}",
+        "",
+        "=== PARAMS ===",
+        json.dumps(filters_payload(resolved), ensure_ascii=False, indent=2),
+        "",
+        "=== PAGES ===",
+        json.dumps(pages or [], ensure_ascii=False, indent=2),
+        "",
+        "=== SQL ===",
+    ]
+    for item in queries or []:
+        source = item.get("source") or "query"
+        sql = (item.get("sql") or item.get("sql_filled") or "").strip()
+        lines.append(f"-- source: {source}")
+        if sql:
+            lines.append(sql if sql.endswith(";") else sql + ";")
+        lines.append("")
+    lines.append("=== SQL RESULTS ===")
+    for item in sql_results or []:
+        lines.append(f"-- source: {item.get('source')} ok={item.get('ok')}")
+        lines.append(str(item.get("result") or ""))
+        lines.append("")
+    lines.extend(
+        [
+            "=== ANSWER ===",
+            answer or "",
+            "",
+        ]
+    )
+    if elapsed_s is not None:
+        lines.append(f"=== elapsed_s: {elapsed_s:.2f} ===")
+        lines.append("")
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    log.info("Ask trace → %s", path)
+    return path
+
+
 def filters_payload(resolved: dict[str, Any]) -> dict:
     return {
         meta["token"]: {"value": meta["value"], "from": meta["source"]}
@@ -1046,15 +1096,17 @@ async def answer_from_rows(
             }
         )
     system = (
-        "Ты аналитик Stimulsoft-дашборда. Хост уже выполнил SQL.\n"
-        "По строкам результата и логике виджетов (meters/агрегации/фильтры/TopN) "
-        "ответь на вопрос. Не вызывай инструменты. Не выдумывай числа. "
+        "Ты финальный шаг пайплайна Stimulsoft-дашборда.\n"
+        "Уже есть: параметры/фильтры, выбранные pages, выполненный SQL.\n"
+        "Собери ответ так, как на дашборде: учти meters (Sum/Count/…), "
+        "filters/DataFilters, TopN, interaction/drill-down и переданные фильтры {Name}.\n"
+        "Только вывод пользователю. Не вызывай инструменты. Не выдумывай числа. "
         "Ответь на языке вопроса."
     )
     user = (
         f"Вопрос: {question}\n"
-        f"Фильтры: {json.dumps(filters_payload(resolved), ensure_ascii=False)}\n"
-        f"Виджеты:\n{json.dumps(widgets, ensure_ascii=False, indent=2)}\n"
+        f"Параметры/фильтры:\n{json.dumps(filters_payload(resolved), ensure_ascii=False, indent=2)}\n"
+        f"Логика дашборда (виджеты pages):\n{json.dumps(widgets, ensure_ascii=False, indent=2)}\n"
         f"Результат SQL:\n{json.dumps(results, ensure_ascii=False, indent=2)}"
     )
     text = await llm_text(llm, model=model, system=system, user=user, round_no="answer")
@@ -1076,33 +1128,36 @@ async def answer_question(
     resolved: dict[str, Any],
     catalog: dict,
 ) -> dict[str, Any]:
-    """Decomposed ask: route → load packs → plan SQL → execute → answer."""
+    """запрос → params → pages → SQL → execute → ответ (логика дашборда + фильтры)."""
     log.info(
-        "Pipeline start question=%s variables=%s pages_total=%s",
+        "1/5 params question=%s variables=%s",
         preview(question, 200),
         preview(filters_payload(resolved), 300),
-        len(catalog.get("pages") or []),
     )
 
+    # 2) найти pages
     page_indexes = await route_pages(
         llm, model=model, catalog=catalog, question=question, resolved=resolved
     )
     packs = [build_page_pack(catalog, index, resolved=resolved) for index in page_indexes]
     log.info(
-        "Loaded packs=%s sources=%s",
+        "2/5 pages=%s sources=%s",
         page_indexes,
         [src.get("name") for pack in packs for src in (pack.get("sources") or [])],
     )
 
+    # 3) какой SQL выполнить
     planned = await plan_queries(
         llm, model=model, question=question, resolved=resolved, packs=packs
     )
     if not planned:
         raise RuntimeError("нет SQL для выполнения")
+    log.info("3/5 sql=%s", [item.get("source") for item in planned])
 
+    # 4) выполнить
     results: list[dict] = []
     for item in planned:
-        log.info("Execute %s: %s", item.get("source"), preview(item.get("sql"), 200))
+        log.info("4/5 execute %s: %s", item.get("source"), preview(item.get("sql"), 200))
         executed = await mcp_execute_sql(session, item["sql"])
         results.append(
             {
@@ -1113,6 +1168,8 @@ async def answer_question(
             }
         )
 
+    # 5) ответ: логика дашборда + фильтры + вывод
+    log.info("5/5 answer from rows")
     answer = await answer_from_rows(
         llm,
         model=model,
@@ -1267,10 +1324,20 @@ async def ask(body: Ask) -> dict:
             log.exception("Ошибка на /ask: %s", exc)
             raise HTTPException(status_code=502, detail=f"ask failed: {exc}") from exc
     answer = result.get("answer") or ""
+    elapsed = time.perf_counter() - started
+    dump_ask_trace(
+        question=question,
+        resolved=resolved,
+        pages=result.get("pages"),
+        queries=result.get("queries"),
+        sql_results=result.get("sql_results"),
+        answer=answer,
+        elapsed_s=elapsed,
+    )
     if not answer:
         log.error("Пустой ответ модели")
         raise HTTPException(status_code=502, detail="model returned an empty answer")
-    log.info("Ответ за %.2fs: %s", time.perf_counter() - started, preview(answer, 300))
+    log.info("Ответ за %.2fs: %s", elapsed, preview(answer, 300))
     return {
         "answer": answer,
         "variables": filters_payload(resolved),
@@ -1285,6 +1352,7 @@ async def ask(body: Ask) -> dict:
             }
             for item in (result.get("sql_results") or [])
         ],
+        "trace": str(resolve_path(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))),
     }
 
 

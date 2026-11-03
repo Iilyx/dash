@@ -2,13 +2,12 @@
 
 Пайплайн вопросов по Stimulsoft `.mrt`:
 
-1. `.mrt` → `catalog.json` + `catalog_pages/` (pack на page)
-2. фильтры `{Name}` из вопроса / default
-3. **router** LLM: какие pages (по полному index)
-4. host грузит packs этих pages
-5. **planner** LLM: какой SQL
-6. host → MCP `execute_sql`
-7. **answerer** LLM: ответ по строкам + виджеты
+1. `.mrt` → `catalog.json` + `catalog_pages/`
+2. из запроса извлечь параметры, чего нет — default
+3. найти pages
+4. выбрать какой SQL выполнить
+5. выполнить (MCP `execute_sql`)
+6. ответ: логика дашборда + фильтры + вывод
 
 ## Compose
 
