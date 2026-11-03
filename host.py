@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""FastAPI ask (просто):
+"""FastAPI ask:
 
-1) MRT → catalog + catalog_pages/
-2) берём первый page (catalog_pages/0.json)
-3) POST /ask → LLM, в ответе то что модель вернула
+1) MRT → catalog_pages/N.json
+2) по каждому page вытащить человекочитаемый/русский текст
+3) LLM: какие pages подходят под вопрос → стрим в консоль + answer
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,7 @@ from pydantic import BaseModel, Field
 from extract_mrt import catalog_from_report, load_mrt, write_page_packs
 
 ROOT = Path(__file__).resolve().parent
+CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 log = logging.getLogger("host")
 
 
@@ -72,7 +74,7 @@ def llm_timeout() -> float:
     return float(os.environ.get("LLM_TIMEOUT", "120").strip() or "120")
 
 
-def ensure_catalog() -> dict:
+def ensure_catalog() -> None:
     catalog_path = resolve_path(os.environ.get("CATALOG_PATH", "catalog.json"))
     pages_path = resolve_path(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
     mrt_raw = os.environ.get("MRT_PATH", "SalesOfProducts.mrt").strip()
@@ -85,34 +87,104 @@ def ensure_catalog() -> dict:
             encoding="utf-8",
         )
         write_page_packs(catalog, pages_path)
-        return catalog
+        return
     if catalog_path.is_file():
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
         write_page_packs(catalog, pages_path)
-        return catalog
+        return
     raise RuntimeError("Нужен MRT_PATH или catalog.json")
 
 
-def load_first_page_catalog() -> tuple[dict, Path]:
-    pages_dir = resolve_path(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
-    path = pages_dir / "0.json"
-    if not path.is_file():
-        raise RuntimeError(f"нет {path}")
-    return json.loads(path.read_text(encoding="utf-8")), path
+def _add_text(bucket: list[str], value: Any) -> None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text and text not in bucket:
+            bucket.append(text)
 
 
-def page_name(catalog: dict) -> str:
-    pages = catalog.get("pages") or []
-    if not pages or not isinstance(pages[0], dict):
-        return "page_0"
-    page = pages[0]
+def collect_texts(node: Any, bucket: list[str]) -> None:
+    """Человекочитаемые подписи из page: title/text/alias/label/expression…"""
+    if isinstance(node, dict):
+        for key in (
+            "alias",
+            "title",
+            "text",
+            "label",
+            "name",
+            "description",
+            "expression",
+        ):
+            if key in node:
+                _add_text(bucket, node.get(key))
+        for value in node.values():
+            collect_texts(value, bucket)
+    elif isinstance(node, list):
+        for item in node:
+            collect_texts(item, bucket)
+
+
+def page_label(page: dict, index: int) -> str:
     alias = page.get("alias")
     name = page.get("name")
     if isinstance(alias, str) and alias.strip():
         return alias.strip()
     if isinstance(name, str) and name.strip():
         return name.strip()
-    return "page_0"
+    return f"page_{index}"
+
+
+def load_page_cards() -> list[dict[str, Any]]:
+    """По каждому catalog_pages/N.json — карточка с русским/видимым текстом."""
+    pages_dir = resolve_path(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
+    cards: list[dict[str, Any]] = []
+    paths = sorted(
+        pages_dir.glob("*.json"),
+        key=lambda p: int(p.stem) if p.stem.isdigit() else p.stem,
+    )
+    for path in paths:
+        if not path.stem.isdigit():
+            continue
+        index = int(path.stem)
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        pages = catalog.get("pages") or []
+        page = pages[0] if pages and isinstance(pages[0], dict) else {}
+        texts: list[str] = []
+        collect_texts(page, texts)
+        # приоритет: строки с кириллицей, потом остальные подписи
+        ru = [t for t in texts if CYRILLIC.search(t)]
+        other = [t for t in texts if t not in ru]
+        visible = ru + other
+        # убрать технические Ident-имена виджетов вроде Text1 если есть нормальные titles
+        cards.append(
+            {
+                "index": index,
+                "page": page_label(page, index),
+                "name": page.get("name"),
+                "alias": page.get("alias"),
+                "catalog": str(path),
+                "ru_text": visible[:40],
+            }
+        )
+    if not cards:
+        raise RuntimeError(f"нет page-файлов в {pages_dir}")
+    return cards
+
+
+SYSTEM_PROMPT = """Ты помогаешь выбрать страницы Stimulsoft-дашборда под вопрос пользователя.
+
+Тебе дан список pages. У каждой есть:
+- index — номер файла catalog_pages/{index}.json
+- page — название
+- ru_text — человекочитаемый текст со страницы (заголовки, подписи, русский текст и другие видимые строки)
+
+Задача:
+1) Пройдись по КАЖДОЙ page из списка.
+2) Смотри в первую очередь на русский и понятный текст в ru_text.
+3) Для каждой page коротко скажи: подходит под вопрос или нет (да подходит / не подходит) и почему в одном предложении.
+4) В конце перечисли только подходящие: их page и index.
+
+Отвечай по-русски, коротко.
+"""
 
 
 def _as_text(value: Any) -> str:
@@ -148,7 +220,6 @@ def _delta_text(delta: dict) -> str:
 
 
 async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) -> str:
-    """Stream tokens to console, return full text for /ask JSON."""
     payload = {
         "model": model,
         "messages": messages,
@@ -167,11 +238,7 @@ async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) 
     async with llm.stream("POST", "chat/completions", json=payload) as response:
         response.raise_for_status()
         async for line in response.aiter_lines():
-            if not line:
-                continue
-            if line.startswith(":"):
-                continue
-            if not line.startswith("data:"):
+            if not line or line.startswith(":") or not line.startswith("data:"):
                 continue
             data = line[5:].strip()
             if not data or data == "[DONE]":
@@ -187,7 +254,6 @@ async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) 
             delta = choice.get("delta") or {}
             piece = _delta_text(delta if isinstance(delta, dict) else {})
             if not piece:
-                # некоторые серверы шлют целиком message на чанк
                 msg = choice.get("message") or {}
                 piece = message_text(msg if isinstance(msg, dict) else {})
             if not piece:
@@ -209,7 +275,7 @@ async def lifespan(app: FastAPI):
     if not model:
         raise RuntimeError("Нужна LLM_MODEL в .env")
     ensure_catalog()
-    page_catalog, page_path = load_first_page_catalog()
+    cards = load_page_cards()
     headers = {}
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if api_key:
@@ -221,10 +287,13 @@ async def lifespan(app: FastAPI):
     ) as llm:
         app.state.llm = llm
         app.state.model = model
-        app.state.page_catalog = page_catalog
-        app.state.page_path = str(page_path)
-        app.state.page = page_name(page_catalog)
-        log.info("Ready llm=%s model=%s page=%s file=%s", llm_base_url(), model, app.state.page, page_path)
+        app.state.page_cards = cards
+        log.info(
+            "Ready llm=%s model=%s pages=%s",
+            llm_base_url(),
+            model,
+            [(c["index"], c["page"]) for c in cards],
+        )
         yield
 
 
@@ -245,8 +314,10 @@ async def health() -> dict:
         "ok": True,
         "llm": llm_base_url(),
         "model": app.state.model,
-        "page": app.state.page,
-        "catalog": app.state.page_path,
+        "pages": [
+            {"index": c["index"], "page": c["page"], "catalog": c["catalog"]}
+            for c in app.state.page_cards
+        ],
     }
 
 
@@ -256,18 +327,21 @@ async def ask(body: Ask) -> dict:
     if not question:
         raise HTTPException(status_code=400, detail="question is empty")
 
-    prompt = (
-        "You are looking at one Stimulsoft dashboard page catalog (JSON).\n"
-        "Answer the user question using only this catalog. Be concise.\n\n"
-        f"Page catalog:\n{json.dumps(app.state.page_catalog, ensure_ascii=False)}\n\n"
-        f"Question: {question}"
+    cards = app.state.page_cards
+    user = (
+        f"Вопрос пользователя:\n{question}\n\n"
+        f"Список pages (пройдись по каждой):\n"
+        f"{json.dumps(cards, ensure_ascii=False, indent=2)}"
     )
     started = time.perf_counter()
     try:
         answer = await llm_chat(
             app.state.llm,
             model=app.state.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
         )
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail=f"LLM timeout after {llm_timeout()}s") from exc
@@ -275,10 +349,9 @@ async def ask(body: Ask) -> dict:
         log.exception("ask failed")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    log.info("ask %.2fs page=%s", time.perf_counter() - started, app.state.page)
+    log.info("ask %.2fs pages_checked=%s", time.perf_counter() - started, len(cards))
     return {
-        "page": app.state.page,
-        "catalog": app.state.page_path,
+        "pages_checked": len(cards),
         "answer": answer,
     }
 

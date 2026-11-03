@@ -1,9 +1,7 @@
 # dash
 
-Простой пайплайн:
-
-1. `.mrt` → `catalog.json` + `catalog_pages/N.json`
-2. `/ask` берёт **первый** page (`catalog_pages/0.json`), шлёт в LLM, возвращает ответ модели
+1. `.mrt` → `catalog_pages/N.json` (по одной page)
+2. `/ask` — LLM проходит **каждую** page, смотрит русский/видимый текст (`ru_text`), говорит подходит или нет
 
 ## Запуск
 
@@ -18,13 +16,7 @@ cp .env.example .env
 ```bash
 curl -s http://127.0.0.1:8090/ask \
   -H 'Content-Type: application/json' \
-  -d '{"question":"что на этом дашборде?"}'
+  -d '{"question":"сколько единиц на складе"}'
 ```
 
-```json
-{
-  "page": "Products",
-  "catalog": "catalog_pages/0.json",
-  "answer": "..."
-}
-```
+В консоли host — стрим ответа модели. В JSON: `{"pages_checked": N, "answer": "..."}`.
