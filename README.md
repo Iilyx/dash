@@ -20,10 +20,11 @@ curl -s http://127.0.0.1:8090/health | jq .
 
 curl -s http://127.0.0.1:8090/ask \
   -H 'Content-Type: application/json' \
-  -d '{"question":"сколько единиц на складе"}' | jq .
+  -d '{"question":"сколько единиц на складе"}'
+# {"pages":[0]}
 ```
 
-Результат выбора pages — в ответе и в `page.txt`.
+Выбранные pages пишутся в `page.txt` (на диск), в HTTP только `{"pages":[...]}`.
 
 ## Catalog
 

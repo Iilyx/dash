@@ -200,20 +200,13 @@ def pages_detail(catalog: dict, indexes: list[int]) -> list[dict]:
     return details
 
 
-def write_page_txt(question: str, details: list[dict], raw_llm: str) -> Path:
+def write_page_txt(details: list[dict]) -> Path:
     path = page_dump_path()
     lines = [
-        "=== QUESTION ===",
-        question,
-        "",
-        "=== PAGES ===",
-        json.dumps(details, ensure_ascii=False, indent=2),
-        "",
-        "=== LLM RAW ===",
-        raw_llm.strip(),
-        "",
+        f"{item.get('index')}\t{item.get('name') or ''}\t{item.get('alias') or ''}"
+        for item in details
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     log.info("page.txt → %s (%s pages)", path, len(details))
     return path
 
@@ -355,7 +348,6 @@ async def health() -> dict:
         "pages": app.state.page_index,
         "llm": llm_base_url(),
         "model": app.state.model,
-        "page_txt": str(page_dump_path()),
     }
 
 
@@ -366,7 +358,7 @@ async def ask(body: Ask) -> dict:
         raise HTTPException(status_code=400, detail="question is empty")
     started = time.perf_counter()
     try:
-        details, raw = await select_pages(
+        details, _raw = await select_pages(
             app.state.llm,
             model=app.state.model,
             catalog=app.state.catalog,
@@ -376,23 +368,16 @@ async def ask(body: Ask) -> dict:
         log.exception("LLM timeout")
         raise HTTPException(
             status_code=504,
-            detail=f"LLM timeout after {llm_timeout()}s — увеличь LLM_TIMEOUT или ускорь модель",
+            detail=f"LLM timeout after {llm_timeout()}s",
         ) from exc
     except (httpx.HTTPError, RuntimeError) as exc:
         log.exception("Ошибка /ask: %s", exc)
         raise HTTPException(status_code=502, detail=f"ask failed: {exc}") from exc
 
-    path = write_page_txt(question, details, raw)
-    elapsed = time.perf_counter() - started
-    log.info("Ask done in %.2fs pages=%s", elapsed, preview(details, 300))
-    return {
-        "question": question,
-        "pages": [item.get("index") for item in details],
-        "pages_detail": details,
-        "page_txt": str(path),
-        "elapsed_s": round(elapsed, 2),
-        "llm_raw": raw,
-    }
+    write_page_txt(details)
+    pages = [item.get("index") for item in details]
+    log.info("Ask done in %.2fs pages=%s", time.perf_counter() - started, pages)
+    return {"pages": pages}
 
 
 def main() -> None:
