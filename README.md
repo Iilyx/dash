@@ -1,37 +1,61 @@
 # dash
 
-Преобразование Stimulsoft JSON `.mrt` → компактный catalog для LLM.
+FastAPI-хост: вопрос по Stimulsoft `.mrt` → параметры → SQL через Postgres MCP → ответ с логикой дашборда.
 
-Полный `catalog.json` в промпт не кладётся: рядом пишется `catalog_pages/` —
-лёгкий индекс всех страниц + pack на каждую (page + нужные sources/variables).
+## Пайплайн `/ask`
+
+1. `.mrt` → `extract_mrt` → `catalog.json` + `catalog_pages/`
+2. Из вопроса достать `{Name}`; если нет — дефолт из `variables`
+3. Router LLM выбирает pages (index), host грузит packs
+4. Planner LLM выбирает SQL (`sql_filled`)
+5. Host выполняет `execute_sql` через **Postgres MCP**
+6. Answerer LLM применяет логику виджетов (meters / фильтры / TopN) к rows
+
+Трасса цикла: `ask_trace.txt`.
 
 ## Запуск
+
+```bash
+cp .env.example .env
+# задай LLM_MODEL (и LLM_BASE_URL если не :8080)
+
+uv venv --python 3.12   # или уже есть .venv
+.venv/bin/pip install -r requirements.txt
+
+docker compose up -d
+docker pull crystaldba/postgres-mcp
+
+.venv/bin/python host.py
+# или: .venv/bin/uvicorn host:app --host 127.0.0.1 --port 8090
+```
+
+- API: `http://127.0.0.1:8090`
+- LLM: `http://127.0.0.1:8080/v1` (OpenAI-compatible)
+- Postgres: `127.0.0.1:5432` (`admin` / `admin123` / `app`)
+
+```bash
+curl -s http://127.0.0.1:8090/health | jq .
+
+curl -s http://127.0.0.1:8090/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"сколько единиц на складе"}'
+```
+
+## Только catalog
 
 ```bash
 python extract_mrt.py SalesOfProducts.mrt
 ```
 
-Пишет:
+Пишет `catalog.json` и `catalog_pages/` (index + pack на page). Полный catalog в промпт не кладётся.
 
-- `catalog.json` — полный catalog
-- `catalog_pages/index.json` — карточки всех pages (для выбора)
-- `catalog_pages/dictionary.json` — sources/variables/relations без тел pages
-- `catalog_pages/0.json`, `1.json`, … — pack одной страницы
+## Compose
 
-Опции: `-o path`, `--pages-dir dir`, `--no-pages`.
+Только Postgres. MCP поднимает сам `host.py` через:
 
-Зависимости: только стандартная библиотека Python 3.
-
-## Что попадает в catalog
-
-- `report`
-- `databases`, `sources` (SQL), `relations`, `variables`, `business_objects`, `resources`, `functions`
-- `pages` / dashboard `components`: meters, DataFilters, TopN, DashboardInteraction, drill-down, transforms, role=viz|filter, …
-
-Вёрстка, brushes/fonts, картинки и connection strings не тащатся.
-
-## Как кормить LLM
-
-1. В системный промпт — `catalog_pages/index.json` (+ дефолты variables при необходимости).
-2. По вопросу — выбрать page(s) из индекса (можно несколько / все, без top-K отсечения).
-3. Подгрузить `catalog_pages/N.json` и уже по нему строить SQL / ответ.
+```bash
+docker run -i --rm \
+  -e DATABASE_URI=postgresql://admin:admin123@host.docker.internal:5432/app \
+  crystaldba/postgres-mcp \
+  --access-mode=restricted
+```
