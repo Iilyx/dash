@@ -15,4 +15,4 @@ curl -s http://127.0.0.1:8090/ask \
 Ответ: `page_index`, `page_name`, `page`, `route`, `trace`.
 
 `ask_trace.txt` — по шагам логики:
-1. QUESTION → 2. PAGES/PROMPT → 3. LLM ROUTE → 4. PAGE SELECTED → 5. PAGE JSON → 6. CATALOG JSON
+1. QUESTION → 2. PAGES/PROMPT → 3. LLM ROUTE → 4. PAGE SELECTED → 5. PAGE JSON → 6. CATALOG JSON → 7. RESULT

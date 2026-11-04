@@ -256,6 +256,16 @@ async def ask(body: Ask):
     )
     trace_step("5. PAGE JSON", page)
     trace_step("6. CATALOG JSON", catalog)
+    trace_step(
+        "7. RESULT",
+        {
+            "page_index": idx,
+            "page_name": name,
+            "page": page,
+            "route": raw,
+            "trace": str(trace),
+        },
+    )
 
     log.info("ask page=%s index=%s trace=%s", name, idx, trace)
     return {
