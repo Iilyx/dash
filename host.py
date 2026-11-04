@@ -74,6 +74,41 @@ def llm_timeout() -> float:
     return float(os.environ.get("LLM_TIMEOUT", "120").strip() or "120")
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def llm_thinking_options() -> dict[str, Any]:
+    """Параметры thinking для Qwen 3.5 (и совместимых серверов)."""
+    effort = os.environ.get("LLM_REASONING_EFFORT", "low").strip().lower() or "low"
+    # none / off → выключить thinking
+    if effort in {"none", "off", "false", "0"}:
+        enable = False
+        effort = "none"
+    else:
+        enable = _env_bool("LLM_ENABLE_THINKING", True)
+        if effort not in {"low", "medium", "high", "xhigh", "minimal", "max"}:
+            log.warning("Unknown LLM_REASONING_EFFORT=%s, using low", effort)
+            effort = "low"
+
+    opts: dict[str, Any] = {
+        "enable_thinking": enable,
+        "chat_template_kwargs": {"enable_thinking": enable},
+    }
+    if enable and effort != "none":
+        opts["reasoning_effort"] = effort
+    budget = os.environ.get("LLM_THINKING_BUDGET", "").strip()
+    if enable and budget.isdigit():
+        # Qwen: thinking_budget и reasoning_effort вместе иногда нельзя —
+        # если задан budget, effort не шлём
+        opts.pop("reasoning_effort", None)
+        opts["thinking_budget"] = int(budget)
+    return opts
+
+
 def ensure_catalog() -> None:
     catalog_path = resolve_path(os.environ.get("CATALOG_PATH", "catalog.json"))
     pages_path = resolve_path(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
@@ -220,20 +255,29 @@ def _delta_text(delta: dict) -> str:
 
 
 async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) -> str:
+    thinking = llm_thinking_options()
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0,
         "stream": True,
+        **thinking,
     }
     log.info(
-        "LLM → %s model=%s chars=%s stream=true",
+        "LLM → %s model=%s chars=%s stream=true thinking=%s",
         llm_base_url(),
         model,
         sum(len(str(m.get("content") or "")) for m in messages),
+        {
+            "enable_thinking": thinking.get("enable_thinking"),
+            "reasoning_effort": thinking.get("reasoning_effort"),
+            "thinking_budget": thinking.get("thinking_budget"),
+        },
     )
     started = time.perf_counter()
-    parts: list[str] = []
+    answer_parts: list[str] = []
+    think_parts: list[str] = []
+    in_think = False
     print("\n=== LLM stream ===", flush=True)
     async with llm.stream("POST", "chat/completions", json=payload) as response:
         response.raise_for_status()
@@ -251,19 +295,44 @@ async def llm_chat(llm: httpx.AsyncClient, *, model: str, messages: list[dict]) 
             if not choices:
                 continue
             choice = choices[0] or {}
-            delta = choice.get("delta") or {}
-            piece = _delta_text(delta if isinstance(delta, dict) else {})
-            if not piece:
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            reason = ""
+            if isinstance(delta, dict):
+                for key in ("reasoning_content", "reasoning"):
+                    value = delta.get(key)
+                    if isinstance(value, str) and value:
+                        reason = value
+                        break
+            content = ""
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                content = delta["content"]
+            if not content and not reason:
                 msg = choice.get("message") or {}
-                piece = message_text(msg if isinstance(msg, dict) else {})
-            if not piece:
-                piece = _as_text(choice.get("text"))
-            if piece:
-                parts.append(piece)
-                print(piece, end="", flush=True)
+                if isinstance(msg, dict):
+                    reason = _as_text(msg.get("reasoning_content") or msg.get("reasoning"))
+                    content = message_text(msg)
+            if reason:
+                if not in_think:
+                    print("\n[thinking]\n", end="", flush=True)
+                    in_think = True
+                think_parts.append(reason)
+                print(reason, end="", flush=True)
+            if content:
+                if in_think:
+                    print("\n[/thinking]\n", end="", flush=True)
+                    in_think = False
+                answer_parts.append(content)
+                print(content, end="", flush=True)
+    if in_think:
+        print("\n[/thinking]", flush=True)
     print("\n=== end stream ===\n", flush=True)
-    text = "".join(parts).strip()
-    log.info("LLM ← %.2fs chars=%s", time.perf_counter() - started, len(text))
+    text = "".join(answer_parts).strip() or "".join(think_parts).strip()
+    log.info(
+        "LLM ← %.2fs answer_chars=%s think_chars=%s",
+        time.perf_counter() - started,
+        len("".join(answer_parts)),
+        len("".join(think_parts)),
+    )
     if not text:
         raise RuntimeError("LLM empty content (stream)")
     return text
@@ -288,10 +357,16 @@ async def lifespan(app: FastAPI):
         app.state.llm = llm
         app.state.model = model
         app.state.page_cards = cards
+        thinking = llm_thinking_options()
         log.info(
-            "Ready llm=%s model=%s pages=%s",
+            "Ready llm=%s model=%s thinking=%s pages=%s",
             llm_base_url(),
             model,
+            {
+                "enable_thinking": thinking.get("enable_thinking"),
+                "reasoning_effort": thinking.get("reasoning_effort"),
+                "thinking_budget": thinking.get("thinking_budget"),
+            },
             [(c["index"], c["page"]) for c in cards],
         )
         yield
@@ -310,10 +385,16 @@ app.add_middleware(
 
 @app.get("/health")
 async def health() -> dict:
+    thinking = llm_thinking_options()
     return {
         "ok": True,
         "llm": llm_base_url(),
         "model": app.state.model,
+        "thinking": {
+            "enable_thinking": thinking.get("enable_thinking"),
+            "reasoning_effort": thinking.get("reasoning_effort"),
+            "thinking_budget": thinking.get("thinking_budget"),
+        },
         "pages": [
             {"index": c["index"], "page": c["page"], "catalog": c["catalog"]}
             for c in app.state.page_cards
