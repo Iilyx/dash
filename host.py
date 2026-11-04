@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-""" /ask — LLM выбирает page, catalog пишем в ask_trace.txt """
+""" /ask — LLM выбирает page → из page вытаскиваем name используемых sources. """
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -165,6 +166,98 @@ def parse_page_index(text: str, cards: list[dict]) -> int:
     return cards[0]["index"]
 
 
+def _walk_strings(node, out: list[str]) -> None:
+    if isinstance(node, str):
+        if node.strip():
+            out.append(node)
+    elif isinstance(node, dict):
+        for value in node.values():
+            _walk_strings(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_strings(item, out)
+
+
+def source_names_from_page(page: dict, sources: list[dict]) -> list[str]:
+    """Из page: SourceName.Field / Sum(SourceName.X) / data_source → name из catalog.sources."""
+    if not isinstance(page, dict):
+        return []
+
+    blobs: list[str] = []
+    _walk_strings(page, blobs)
+    blob = "\n".join(blobs)
+    blob_l = blob.lower()
+
+    # кандидаты из выражений (products.X, Sum(products.Y))
+    hinted: set[str] = set()
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_ ]*?)\.[A-Za-z_]", blob):
+        hinted.add(match.group(1).strip().lower())
+    for match in re.finditer(
+        r"(?:Sum|Count|Avg|Min|Max)\(\s*([A-Za-z_][A-Za-z0-9_ ]*?)\.",
+        blob,
+        re.I,
+    ):
+        hinted.add(match.group(1).strip().lower())
+
+    def collect_data_sources(node, found: set[str]) -> None:
+        if isinstance(node, dict):
+            ds = node.get("data_source") or node.get("source")
+            if isinstance(ds, str) and ds.strip():
+                found.add(ds.strip().lower())
+            for value in node.values():
+                collect_data_sources(value, found)
+        elif isinstance(node, list):
+            for item in node:
+                collect_data_sources(item, found)
+
+    collect_data_sources(page, hinted)
+
+    used: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        canonical = name.strip()
+        keys = {canonical.lower()}
+        alias = source.get("alias")
+        if isinstance(alias, str) and alias.strip():
+            keys.add(alias.strip().lower())
+
+        hit = False
+        for key in keys:
+            if key in hinted:
+                hit = True
+                break
+            # имена с пробелом: "order details.Column"
+            if f"{key}." in blob_l or f"[{key}]" in blob_l:
+                hit = True
+                break
+        if hit and canonical.lower() not in seen:
+            seen.add(canonical.lower())
+            used.append(canonical)
+    return used
+
+
+def sources_by_names(sources: list[dict], names: list[str]) -> list[dict]:
+    want = {n.lower() for n in names}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        if not isinstance(name, str):
+            continue
+        key = name.strip().lower()
+        if key in want and key not in seen:
+            seen.add(key)
+            out.append(source)
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model = os.environ.get("LLM_MODEL", "").strip()
@@ -249,6 +342,7 @@ async def ask(body: Ask):
     catalog = json.loads(catalog_file.read_text(encoding="utf-8"))
     page = (catalog.get("pages") or [{}])[0]
     name = page.get("alias") or page.get("name") or f"page_{idx}"
+    all_sources = [s for s in (catalog.get("sources") or []) if isinstance(s, dict)]
 
     trace_step(
         "4. PAGE SELECTED",
@@ -256,21 +350,38 @@ async def ask(body: Ask):
     )
     # итог — полный файл catalog_pages/{index}.json, не кусок pages[0]
     trace_step("5. CATALOG (catalog_pages/{index}.json)", catalog)
+
+    source_names = source_names_from_page(page if isinstance(page, dict) else {}, all_sources)
+    sources = sources_by_names(all_sources, source_names)
     trace_step(
-        "6. RESULT",
+        "6. SOURCES FROM PAGE (name)",
+        {"source_names": source_names, "sources": sources},
+    )
+    trace_step(
+        "7. RESULT",
         {
             "page_index": idx,
             "page_name": name,
+            "source_names": source_names,
+            "sources": sources,
             "catalog": catalog,
             "route": raw,
             "trace": str(trace),
         },
     )
 
-    log.info("ask page=%s index=%s trace=%s", name, idx, trace)
+    log.info(
+        "ask page=%s index=%s sources=%s trace=%s",
+        name,
+        idx,
+        source_names,
+        trace,
+    )
     return {
         "page_index": idx,
         "page_name": name,
+        "source_names": source_names,
+        "sources": sources,
         "catalog": catalog,
         "route": raw,
         "trace": str(trace),
