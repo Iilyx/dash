@@ -855,6 +855,69 @@ async def answer_from_rows(
     raise RuntimeError("model returned an empty answer")
 
 
+def stage(title: str, payload: Any = None) -> None:
+    """Явная стадия пайплайна → лог + консоль."""
+    if payload is None:
+        msg = title
+    elif isinstance(payload, str):
+        msg = f"{title}\n{payload}"
+    else:
+        msg = f"{title}\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    log.info("%s", msg if len(msg) < 4000 else msg[:4000] + "…")
+    print(f"\n>>> {title}", flush=True)
+    if payload is not None:
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
+        print(text if len(text) < 8000 else text[:8000] + "\n…", flush=True)
+
+
+def dump_ask_trace(
+    *,
+    question: str,
+    pages: list[dict],
+    variables: dict,
+    queries: list[dict],
+    sql_results: list[dict],
+    answer: str,
+    elapsed_s: float,
+) -> Path:
+    path = resolve_path(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))
+    lines = [
+        "=== ASK ===",
+        f"question: {question}",
+        "",
+        "=== PAGES ===",
+        json.dumps(pages, ensure_ascii=False, indent=2),
+        "",
+        "=== VARIABLES ===",
+        json.dumps(variables, ensure_ascii=False, indent=2),
+        "",
+        "=== SQL ===",
+    ]
+    for item in queries:
+        lines.append(f"-- source: {item.get('source')}")
+        sql = (item.get("sql") or "").strip()
+        if sql:
+            lines.append(sql if sql.endswith(";") else sql + ";")
+        lines.append("")
+    lines.append("=== SQL RESULTS ===")
+    for item in sql_results:
+        lines.append(f"-- source: {item.get('source')} ok={item.get('ok')}")
+        lines.append(str(item.get("result") or ""))
+        lines.append("")
+    lines.extend(
+        [
+            "=== ANSWER ===",
+            answer or "",
+            "",
+            f"=== elapsed_s: {elapsed_s:.2f} ===",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    log.info("Ask trace → %s", path)
+    return path
+
+
 async def run_ask(
     *,
     session: ClientSession,
@@ -863,6 +926,8 @@ async def run_ask(
     question: str,
     cards: list[dict],
 ) -> dict[str, Any]:
+    stage("1. QUESTION", question)
+
     # 1) route pages
     route_user = (
         f"Вопрос пользователя:\n{question}\n\n"
@@ -878,7 +943,7 @@ async def run_ask(
         label="route",
     )
     page_indexes = parse_page_indexes(route_text, cards)
-    log.info("Router pages=%s", page_indexes)
+    stage("2. ROUTE pages", page_indexes)
 
     # 2) params + fill SQL per selected page
     all_resolved: dict[str, Any] = {}
@@ -898,11 +963,20 @@ async def run_ask(
                 "sources": [s.get("name") for s in sources],
             }
         )
-        log.info(
-            "page[%s] vars=%s sources=%s",
-            index,
-            preview(filters_payload(resolved)),
-            [s.get("name") for s in sources],
+        stage(
+            f"3. PAGE[{index}] variables (question|default)",
+            filters_payload(resolved),
+        )
+        stage(
+            f"3. PAGE[{index}] sql_filled",
+            [
+                {
+                    "source": s.get("name"),
+                    "sql_template": s.get("sql"),
+                    "sql_filled": s.get("sql_filled"),
+                }
+                for s in sources
+            ],
         )
 
     if not all_sources:
@@ -914,24 +988,29 @@ async def run_ask(
     )
     if not planned:
         raise RuntimeError("нет SQL для выполнения")
+    stage("4. PLAN queries", planned)
 
     results: list[dict] = []
     for item in planned:
-        log.info("Execute %s: %s", item.get("source"), preview(item.get("sql")))
+        stage(f"5. MCP execute_sql [{item.get('source')}]", item.get("sql"))
         executed = await mcp_execute_sql(session, item["sql"])
-        results.append(
-            {
-                "source": item.get("source"),
-                "sql": item.get("sql"),
-                "ok": executed.get("ok"),
-                "result": executed.get("result"),
-            }
+        row = {
+            "source": item.get("source"),
+            "sql": item.get("sql"),
+            "ok": executed.get("ok"),
+            "result": executed.get("result"),
+        }
+        results.append(row)
+        stage(
+            f"5. MCP result [{item.get('source')}] ok={executed.get('ok')}",
+            preview(executed.get("result"), 2000),
         )
 
     # 4) answer
     answer = await answer_from_rows(
         llm, model=model, question=question, resolved=all_resolved, results=results
     )
+    stage("6. ANSWER", answer)
     return {
         "answer": answer,
         "pages": pages_meta,
@@ -1047,7 +1126,17 @@ async def ask(body: Ask) -> dict:
             log.exception("ask failed")
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    log.info("ask %.2fs pages=%s", time.perf_counter() - started, result.get("pages"))
+    elapsed = time.perf_counter() - started
+    trace = dump_ask_trace(
+        question=question,
+        pages=result.get("pages") or [],
+        variables=result.get("variables") or {},
+        queries=result.get("queries") or [],
+        sql_results=result.get("sql_results") or [],
+        answer=result.get("answer") or "",
+        elapsed_s=elapsed,
+    )
+    log.info("ask %.2fs pages=%s trace=%s", elapsed, result.get("pages"), trace)
     return {
         "answer": result.get("answer"),
         "pages": result.get("pages"),
@@ -1062,6 +1151,7 @@ async def ask(body: Ask) -> dict:
             }
             for item in (result.get("sql_results") or [])
         ],
+        "trace": str(trace),
     }
 
 
