@@ -2,8 +2,8 @@
 """FastAPI ask:
 
 1) LLM: определить страницу
-2) пробросить всю page → Category / Filters → значения из вопроса или дефолты
-3) по name из page найти sources → SQL
+2) filters = variables с category «Фильтры» (+ SQL-параметры sources page)
+3) имена на page → sources по name → SQL с подстановкой
 4) MCP execute_sql → ответ
 """
 
@@ -275,170 +275,160 @@ def parameters_by_name(catalog: dict) -> dict[str, dict]:
         if not isinstance(variable, dict) or not variable.get("name"):
             continue
         name = str(variable["name"])
-        if name in result:
-            continue
-        result[name] = {
+        sql_param = variable.get("sql_parameter") is True
+        token = f"@{name}" if sql_param else f"{{{name}}}"
+        entry = {
             "name": name,
-            "token": f"{{{name}}}",
+            "token": token,
             "alias": variable.get("alias"),
             "description": variable.get("description"),
             "default": variable.get("value"),
             "type": variable.get("type"),
-            "kind": "brace",
+            "kind": "at" if sql_param else "brace",
+            "category": variable.get("category"),
         }
+        # variables с category «Фильтры» важнее source.parameters с тем же name
+        if name not in result or is_filters_category(variable.get("category")):
+            result[name] = entry
     return result
 
 
-def _is_category_token(text: Any) -> bool:
-    if not isinstance(text, str):
+def is_filters_category(value: Any) -> bool:
+    """Stimulsoft: variables[].category == «Фильтры» / Filters."""
+    if not isinstance(value, str):
         return False
-    return "categor" in text.lower()
+    text = value.strip().lower()
+    return text in {"фильтры", "filters", "filter"} or "фильтр" in text
 
 
-def collect_category_filters(page: dict, catalog: dict) -> list[dict[str, Any]]:
-    """Вся page + связанные sources: всё, где Category / Filters."""
+def collect_page_filters(page: dict, catalog: dict) -> list[dict[str, Any]]:
+    """Фильтры абстрактно:
+    1) variables с category «Фильтры»
+    2) SQL-параметры sources, на которые ссылается page (@Name / parameters[])
+    3) page elements с role=filter (для трассировки)
+    """
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
 
     def add(item: dict[str, Any]) -> None:
-        key = f"{item.get('kind')}:{item.get('name')}:{item.get('where')}"
+        key = f"{item.get('kind')}:{item.get('name')}:{item.get('source')}:{item.get('where')}"
         if key in seen:
             return
         seen.add(key)
         found.append(item)
 
-    # 1) элементы page: role=filter или любой узел с Category
-    def walk_page(node: Any, path: str = "page") -> None:
-        if isinstance(node, dict):
-            role = str(node.get("role") or "").lower()
-            name = node.get("name")
-            title = node.get("title")
-            blob = json.dumps(node, ensure_ascii=False)
-            is_filter = role == "filter" or "filter" in path.lower()
-            has_category = _is_category_token(blob)
-            if is_filter and has_category:
-                add(
-                    {
-                        "kind": "page_filter",
-                        "name": name,
-                        "title": title,
-                        "role": role or "filter",
-                        "where": path,
-                        "param": "Category",
-                        "default": None,
-                    }
-                )
-            elif has_category and any(
-                _is_category_token(str(node.get(k) or ""))
-                for k in ("name", "title", "alias", "expression", "text", "label")
-            ):
-                add(
-                    {
-                        "kind": "page_category",
-                        "name": name,
-                        "title": title,
-                        "role": role or None,
-                        "where": path,
-                        "param": "Category",
-                        "default": None,
-                    }
-                )
-            for key, value in node.items():
-                walk_page(value, f"{path}.{key}" if path else key)
-        elif isinstance(node, list):
-            for i, item in enumerate(node):
-                walk_page(item, f"{path}[{i}]")
+    # 1) Dictionary.Variables → category «Фильтры»
+    for variable in catalog.get("variables") or []:
+        if not isinstance(variable, dict) or not variable.get("name"):
+            continue
+        if not is_filters_category(variable.get("category")):
+            continue
+        name = str(variable["name"])
+        sql_param = variable.get("sql_parameter") is True
+        token = f"@{name}" if sql_param else f"{{{name}}}"
+        add(
+            {
+                "kind": "variable_filter",
+                "name": name,
+                "alias": variable.get("alias"),
+                "category": variable.get("category"),
+                "description": variable.get("description"),
+                "default": variable.get("value"),
+                "token": token,
+                "sql_parameter": sql_param,
+                "where": "variables",
+            }
+        )
 
-    walk_page(page)
-
-    # 2) sources: parameters / @Category в SQL (особенно для sources, связанных с page)
+    # 2) parameters / @Param у sources, на которые ссылается page
     page_names = {n.lower() for n in source_names_in_page(page)}
     for source in catalog.get("sources") or []:
         if not isinstance(source, dict):
             continue
         src_name = str(source.get("name") or "")
+        alias = str(source.get("alias") or "")
+        on_page = (
+            not page_names
+            or src_name.lower() in page_names
+            or (alias and alias.lower() in page_names)
+        )
+        if not on_page:
+            continue
         sql = str(source.get("sql") or "")
-        on_page = not page_names or src_name.lower() in page_names or _is_category_token(src_name)
-        if not on_page and not _is_category_token(sql):
-            # всё равно берём param Category из любого source — это фильтр отчёта
-            pass
-        for param in source.get("parameters") or []:
-            if not isinstance(param, dict) or not param.get("name"):
-                continue
-            pname = str(param["name"])
-            if not _is_category_token(pname) and not _is_category_token(sql):
-                continue
+        param_defaults = {
+            str(p["name"]): p.get("expression")
+            for p in (source.get("parameters") or [])
+            if isinstance(p, dict) and p.get("name")
+        }
+        for pname, default in param_defaults.items():
             add(
                 {
                     "kind": "source_param",
                     "name": pname,
                     "source": src_name,
-                    "where": f"sources.{src_name}.parameters",
-                    "param": pname,
+                    "default": default,
                     "token": f"@{pname}",
-                    "default": param.get("expression"),
+                    "where": f"sources.{src_name}.parameters",
                 }
             )
-        for pname in ats_in_sql(sql):
-            if not _is_category_token(pname):
-                continue
+        for pname in ats_in_sql(sql) + braces_in_sql(sql):
+            token = f"@{pname}" if f"@{pname}" in sql else f"{{{pname}}}"
             add(
                 {
-                    "kind": "sql_at",
+                    "kind": "sql_placeholder",
                     "name": pname,
                     "source": src_name,
+                    "default": param_defaults.get(pname),
+                    "token": token,
                     "where": f"sources.{src_name}.sql",
-                    "param": pname,
-                    "token": f"@{pname}",
-                    "default": None,
                 }
             )
 
-    # 3) relations с categories
-    for rel in catalog.get("relations") or []:
-        if not isinstance(rel, dict):
+    # 3) виджеты-фильтры на page
+    for element in page.get("elements") or []:
+        if not isinstance(element, dict):
             continue
-        blob = json.dumps(rel, ensure_ascii=False)
-        if not _is_category_token(blob):
+        if str(element.get("role") or "").lower() != "filter":
             continue
         add(
             {
-                "kind": "relation",
-                "name": rel.get("name"),
-                "where": "relations",
-                "param": "Category",
-                "parent": rel.get("parent"),
-                "child": rel.get("child"),
-                "default": None,
+                "kind": "page_filter_widget",
+                "name": element.get("name"),
+                "title": element.get("title"),
+                "type": element.get("type"),
+                "expressions": element.get("expressions"),
+                "where": "page.elements",
             }
         )
 
     return found
 
 
-def category_params_meta(filters: list[dict], catalog: dict) -> dict[str, dict]:
-    """Мета параметров Category-фильтров: token + default из sources.parameters."""
-    meta = parameters_by_name(catalog)
+def filter_params_meta(filters: list[dict], catalog: dict) -> dict[str, dict]:
+    """Параметры для подстановки: только именованные фильтры (не виджеты без param)."""
+    catalog_meta = parameters_by_name(catalog)
     needed: dict[str, dict] = {}
     for item in filters:
-        pname = str(item.get("param") or item.get("name") or "Category")
-        if not _is_category_token(pname) and item.get("kind") not in {"source_param", "sql_at"}:
-            pname = "Category"
-        base = meta.get(pname) or {
-            "name": pname,
-            "token": item.get("token") or f"@{pname}",
-            "alias": pname,
-            "default": item.get("default"),
-            "kind": "at",
+        if item.get("kind") == "page_filter_widget":
+            continue
+        name = item.get("name")
+        if not name:
+            continue
+        name = str(name)
+        base = catalog_meta.get(name) or {}
+        token = item.get("token") or base.get("token") or f"@{name}"
+        default = item.get("default")
+        if default in (None, ""):
+            default = base.get("default")
+        needed[name] = {
+            "name": name,
+            "token": token,
+            "alias": item.get("alias") or base.get("alias") or name,
+            "description": item.get("description") or base.get("description"),
+            "default": default,
+            "kind": "at" if str(token).startswith("@") else "brace",
+            "category": item.get("category"),
         }
-        if item.get("default") not in (None, "") and base.get("default") in (None, ""):
-            base = {**base, "default": item.get("default")}
-        needed[pname] = base
-    # если нашли category-фильтры на page, но param ещё без default — взять из products.@Category
-    if not needed:
-        for name, info in meta.items():
-            if _is_category_token(name):
-                needed[name] = info
     return needed
 
 
@@ -452,33 +442,39 @@ def coerce_param_value(raw: str) -> Any:
 
 
 def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str, Any]:
+    """Достать значения по name / alias / description параметра — без привязки к конкретному .mrt."""
     found: dict[str, Any] = {}
     for name, meta in variables.items():
-        labels = [name]
-        alias = meta.get("alias")
-        if isinstance(alias, str) and alias.strip() and alias.strip().lower() != name.lower():
-            labels.append(alias.strip())
+        labels: list[str] = [name]
+        for key in ("alias", "description"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip() and value.strip().lower() not in {
+                label.lower() for label in labels
+            }:
+                labels.append(value.strip())
         patterns: list[str] = [
             rf"(?i)\{{{re.escape(name)}\}}\s*[:=]?\s*([^\s,;]+)",
             rf"(?i)@{re.escape(name)}\s*[:=]?\s*([^\s,;]+)",
         ]
         for label in labels:
+            escaped = re.escape(label)
             patterns.extend(
                 [
-                    rf"(?i)\b{re.escape(label)}\b\s*[:=]\s*([^\s,;]+)",
-                    rf"(?i)\b{re.escape(label)}\b\s+(?:is|равен|равна|=)?\s*([^\s,;]+)",
-                    rf"(?i)\b{re.escape(label)}\b\s+(-?\d+(?:[.,]\d+)?)",
+                    rf"(?i)\b{escaped}\b\s*[:=]\s*([^\s,;]+)",
+                    rf"(?i)\b{escaped}\b\s+(?:is|равен|равна|=)?\s*([^\s,;]+)",
+                    rf"(?i)\b{escaped}\b\s+(-?\d+(?:[.,]\d+)?)",
                 ]
             )
-        lower = name.lower()
-        if lower == "year" or (isinstance(alias, str) and alias.lower() in {"год", "year"}):
+        # мягкие эвристики только если имя/alias само намекает
+        hint = " ".join(labels).lower()
+        if "year" in hint or "год" in hint:
             patterns.extend(
                 [
                     r"(?i)\b(?:за|в|год(?:у)?)\s*[:=]?\s*((?:19|20)\d{2})\b",
                     r"(?i)\b((?:19|20)\d{2})\s*(?:год(?:у|а)?)?\b",
                 ]
             )
-        if lower == "category" or (isinstance(alias, str) and "категор" in str(alias).lower()):
+        if "categor" in hint or "категор" in hint:
             patterns.extend(
                 [
                     r"(?i)\bкатегор\w*\s*(?:№|#|id)?\s*[:=]?\s*(-?\d+)",
@@ -495,7 +491,7 @@ def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str
 
 
 def resolve_parameters(question: str, variables: dict[str, dict]) -> dict[str, Any]:
-    """Для каждого Category-фильтра: значение из вопроса, иначе default."""
+    """Для каждого фильтра: значение из вопроса, иначе default из variables/parameters."""
     extracted = extract_from_question(question, variables)
     resolved: dict[str, Any] = {}
     for name, meta in variables.items():
@@ -656,7 +652,7 @@ ROUTE_PROMPT = """Шаг 1 из пайплайна: определи ОДНУ с
 """
 
 
-ANSWER_PROMPT = """Хост уже выбрал страницу, подставил Category-фильтры и выполнил SQL через MCP.
+ANSWER_PROMPT = """Хост уже выбрал страницу, подставил фильтры (variables category «Фильтры» / SQL-параметры) и выполнил SQL через MCP.
 По строкам результата ответь на вопрос. Не вызывай инструменты. Не выдумывай числа.
 Ответь на языке вопроса, коротко.
 """
@@ -983,7 +979,7 @@ async def run_ask(
 ) -> dict[str, Any]:
     """План:
     1) страница
-    2) вся page → Category / Filters → значения из вопроса или дефолты
+    2) variables[category=Фильтры] + SQL-параметры sources page → question|default
     3) имена на page → sources.sql → fill
     4) MCP execute_sql
     5) ответ
@@ -1021,11 +1017,11 @@ async def run_ask(
         },
     )
 
-    # --- Шаг 2: Category / Filters на page → значения ---
-    stage("STEP 2/5 — ищу Category / Filters на всей page")
-    category_filters = collect_category_filters(page, catalog)
-    stage("STEP 2/5 — найденные Category/Filters", category_filters)
-    params_meta = category_params_meta(category_filters, catalog)
+    # --- Шаг 2: filters из variables.category «Фильтры» (+ SQL params page sources) ---
+    stage("STEP 2/5 — filters: variables.category «Фильтры» + SQL-параметры sources page")
+    page_filters = collect_page_filters(page, catalog)
+    stage("STEP 2/5 — найденные filters", page_filters)
+    params_meta = filter_params_meta(page_filters, catalog)
     resolved = resolve_parameters(question, params_meta)
     variables = filters_payload(resolved)
     stage("STEP 2/5 — значения (question|default)", variables)
@@ -1046,7 +1042,7 @@ async def run_ask(
     ]
     stage("STEP 3/5 — sql_filled", filled)
 
-    # --- Шаг 4: MCP (без LLM-planner) ---
+    # --- Шаг 4: MCP ---
     stage("STEP 4/5 — MCP execute_sql по sources страницы")
     planned = [{"source": s.get("name"), "sql": s.get("sql_filled")} for s in sources]
     results: list[dict] = []
@@ -1076,7 +1072,7 @@ async def run_ask(
         {
             "index": page_index,
             "page": page_name,
-            "category_filters": category_filters,
+            "filters": page_filters,
             "variables": variables,
             "source_names_on_page": page_refs,
             "sources": [s.get("name") for s in sources],
@@ -1086,13 +1082,13 @@ async def run_ask(
         "answer": answer,
         "pages": pages_meta,
         "variables": variables,
-        "category_filters": category_filters,
+        "filters": page_filters,
         "queries": planned,
         "sql_results": results,
         "route": route_text,
         "steps": {
             "1_page": {"index": page_index, "page": page_name},
-            "2_category_filters": category_filters,
+            "2_filters": page_filters,
             "2_variables": variables,
             "3_page_source_names": page_refs,
             "3_sql_filled": filled,
