@@ -254,14 +254,14 @@ async def ask(body: Ask):
         "4. PAGE SELECTED",
         {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)},
     )
-    trace_step("5. PAGE JSON", page)
-    trace_step("6. CATALOG JSON", catalog)
+    # итог — полный файл catalog_pages/{index}.json, не кусок pages[0]
+    trace_step("5. CATALOG (catalog_pages/{index}.json)", catalog)
     trace_step(
-        "7. RESULT",
+        "6. RESULT",
         {
             "page_index": idx,
             "page_name": name,
-            "page": page,
+            "catalog": catalog,
             "route": raw,
             "trace": str(trace),
         },
@@ -271,7 +271,7 @@ async def ask(body: Ask):
     return {
         "page_index": idx,
         "page_name": name,
-        "page": page,
+        "catalog": catalog,
         "route": raw,
         "trace": str(trace),
     }
