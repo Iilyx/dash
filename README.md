@@ -12,4 +12,7 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе"}'
 ```
 
-Ответ: `page_index`, `page_name`, `page`, `catalog`, `trace`.
+Ответ: `page_index`, `page_name`, `page`, `route`, `trace`.
+
+`ask_trace.txt` — по шагам логики:
+1. QUESTION → 2. PAGES/PROMPT → 3. LLM ROUTE → 4. PAGE SELECTED → 5. PAGE JSON → 6. CATALOG JSON

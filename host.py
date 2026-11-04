@@ -197,33 +197,74 @@ async def health():
     return {"ok": True, "model": app.state.model, "pages": app.state.cards}
 
 
+def trace_path() -> Path:
+    return path_of(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))
+
+
+def trace_reset() -> Path:
+    path = trace_path()
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def trace_step(title: str, payload: object | None = None) -> None:
+    path = trace_path()
+    lines = [f"=== {title} ==="]
+    if payload is not None:
+        if isinstance(payload, str):
+            lines.append(payload)
+        else:
+            lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
+    lines.append("")
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f">>> TRACE {title}", flush=True)
+
+
 @app.post("/ask")
 async def ask(body: Ask):
     q = body.question.strip()
     if not q:
         raise HTTPException(400, "question is empty")
+
+    system = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
+    user = f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}"
+
+    trace = trace_reset()
+    trace_step("1. QUESTION", q)
+    trace_step("2. PAGES → LLM", app.state.cards)
+    trace_step("2. PROMPT", {"system": system, "user": user})
+
     try:
-        raw = await llm(
-            app.state.llm,
-            app.state.model,
-            'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}',
-            f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}",
-        )
+        raw = await llm(app.state.llm, app.state.model, system, user)
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "LLM timeout") from exc
     except (httpx.HTTPError, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
+    trace_step("3. LLM ROUTE", raw)
+
     idx = parse_page_index(raw, app.state.cards)
-    catalog = json.loads(
-        path_of(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages")).joinpath(f"{idx}.json").read_text(encoding="utf-8")
-    )
+    catalog_file = path_of(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages")) / f"{idx}.json"
+    catalog = json.loads(catalog_file.read_text(encoding="utf-8"))
     page = (catalog.get("pages") or [{}])[0]
     name = page.get("alias") or page.get("name") or f"page_{idx}"
-    out = {"question": q, "page_index": idx, "page_name": name, "page": page, "catalog": catalog, "route": raw}
-    trace = path_of(os.environ.get("ASK_DUMP_PATH", "ask_trace.txt"))
-    trace.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {**out, "trace": str(trace)}
+
+    trace_step(
+        "4. PAGE SELECTED",
+        {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)},
+    )
+    trace_step("5. PAGE JSON", page)
+    trace_step("6. CATALOG JSON", catalog)
+
+    log.info("ask page=%s index=%s trace=%s", name, idx, trace)
+    return {
+        "page_index": idx,
+        "page_name": name,
+        "page": page,
+        "route": raw,
+        "trace": str(trace),
+    }
 
 
 def main() -> None:
