@@ -31,21 +31,17 @@ PLAN_SYSTEM = """Тебе дан полный catalog JSON одной стран
 
 Сделай строго по шагам (только данные из JSON, ничего не выдумывай):
 
-1) В pages найди имена источников данных: в expressions / meters / text и т.п.
-   вид "SourceName.Field" или ссылки на SourceName — собери уникальные SourceName.
-2) В sources[] возьми ТОЛЬКО объекты, у которых name совпадает с найденными SourceName.
-   Другие sources не трогай и их SQL не выполняй.
-3) В pages найди все параметры в фигурных скобках: {Name}.
-4) Каждое {Name} ищи в variables[] по name.
-5) Если у variable "category": "Фильтры" (или Filters):
-   - значение из вопроса пользователя, если есть;
-   - иначе default из variable.value.
-6) Если у variable есть dialog:
-   - dialog.source или путь dialog.keys_column = "SourceName.Column"
-     → SourceName тоже из sources[] по name (добавь в список, если ещё нет).
-7) Верни ТОЛЬКО JSON:
+1) Сначала смотри pages: какие источники данных там используются
+   (expressions / meters / text вида "SourceName.Field" и любые ссылки на SourceName).
+2) Потом в sources[] возьми ТОЛЬКО объекты с name = эти SourceName.
+   Остальные sources не трогай, их SQL не бери.
+3) В pages найди все {Name} → ищи в variables[] по name.
+4) Если у variable "category": "Фильтры" (или Filters):
+   - значение из вопроса, если есть; иначе default из variable.value.
+5) Если у variable есть dialog (dialog.source или keys_column "SourceName.Column"):
+   добавь этот SourceName из sources[] по name, если его ещё нет.
+6) Верни ТОЛЬКО JSON:
 {
-  "page_source_names": ["SourceName", "..."],
   "braces": ["Name", "..."],
   "filters": [ /* исходные variables с category Фильтры */ ],
   "resolved": { "Name": значение },
@@ -58,7 +54,7 @@ PLAN_SYSTEM = """Тебе дан полный catalog JSON одной стран
       "value": "..."
     }
   },
-  "sources": [ /* ТОЛЬКО исходные objects sources с name из page_source_names (+ dialog) */ ],
+  "sources": [ /* исходные objects из sources[] — только те, что нужны по pages (+ dialog) */ ],
   "queries": [ { "name": "...", "sql": "...", "sql_filled": "..." } ]
 }
 """
