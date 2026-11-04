@@ -25,26 +25,37 @@ log = logging.getLogger("host")
 # LLM только выбирает page (короткий JSON).
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
-# После page — вся логика у модели на исходном catalog JSON.
-PLAN_SYSTEM = """Тебе дан полный catalog JSON одной страницы Stimulsoft (catalog_pages).
+# После page — логика у модели на исходном catalog JSON (без ручного парсинга).
+PLAN_SYSTEM = """Тебе дан полный catalog JSON одной страницы Stimulsoft (catalog_pages/{N}.json).
 
-Правила:
-1) Всё, что в фигурных скобках {Name} — параметры.
-   Параметр либо определён в variables[], либо это результат SQL из sources[] (по name).
-2) Среди variables есть записи с "category": "Фильтры".
-   Для них возьми значение из вопроса пользователя, иначе значение по умолчанию из JSON (value).
-3) Смотри pages: по name найди нужные sources[] — какие SQL выполнять.
-4) Верни ТОЛЬКО JSON:
+Сделай строго по шагам (только данные из JSON, ничего не выдумывай):
+
+1) В pages найди все параметры в фигурных скобках: {Name}.
+2) Каждое {Name} ищи в variables[] по name.
+3) Если у variable "category": "Фильтры" (или Filters):
+   - значение из вопроса пользователя, если есть;
+   - иначе default из variable.value.
+4) Если у variable есть dialog:
+   - dialog.source или путь вида dialog.keys_column = "SourceName.Column"
+     означает, что список/значение берётся из результата SQL sources[name=SourceName].
+5) По pages: какие sources нужны (по name на page и по dialog.source) — какие SQL выполнять.
+6) Верни ТОЛЬКО JSON:
 {
-  "filters": [ /* исходные objects variables с category Фильтры */ ],
-  "resolved": { "Имя": значение },
+  "braces": ["Name", "..."],
+  "filters": [ /* исходные variables с category Фильтры */ ],
+  "resolved": { "Name": значение },
   "params": {
-     "Имя": { "kind": "variable"|"source_sql"|"source_param", "note": "..." }
+    "Name": {
+      "from": "variable"|"dialog_source"|"unknown",
+      "variable": { /* исходный object или null */ },
+      "dialog_source": "sourceName или null",
+      "default": "...",
+      "value": "..."
+    }
   },
   "sources": [ /* исходные objects sources которые нужно выполнить */ ],
   "queries": [ { "name": "...", "sql": "...", "sql_filled": "..." } ]
 }
-Не выдумывай таблицы и поля — только то, что есть в catalog.
 """
 
 

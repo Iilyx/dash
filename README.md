@@ -1,7 +1,12 @@
 # dash
 
 1. LLM выбирает **page** → `catalog_pages/{N}.json`
-2. LLM по **полному catalog** + вопросу: Фильтры / `{params}` / sources.sql
+2. LLM по **полному catalog** + вопросу:
+   - в `pages` найти все `{Name}`
+   - найти в `variables`
+   - `category: "Фильтры"` → значение из вопроса или default
+   - `dialog` → путь к `sources` (например `keys_column` / `dialog.source`)
+   - какие `sources.sql` выполнять
 
 ```bash
 cp .env.example .env   # LLM_MODEL=...

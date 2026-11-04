@@ -569,14 +569,23 @@ def dialog_items(info: dict) -> list[dict]:
 def dialog_info(node: dict | None) -> dict | None:
     if not isinstance(node, dict):
         return None
+    keys_column = text(node.get("KeysColumn"))
+    values_column = text(node.get("ValuesColumn"))
+    # путь к source: KeysColumn вида "categories.CategoryID" или явное DataSourceName
+    source_name = text(
+        node.get("DataSourceName") or node.get("DataSource") or node.get("NameInSource")
+    )
+    if not source_name and keys_column and "." in keys_column:
+        source_name = keys_column.split(".", 1)[0].strip() or None
     info = {
         "items": dialog_items(node),
-        "keys_column": text(node.get("KeysColumn")),
-        "values_column": text(node.get("ValuesColumn")),
+        "keys_column": keys_column,
+        "values_column": values_column,
         "checked_column": text(node.get("CheckedColumn")),
         "filter": text(node.get("FilterExpression")),
         "binding_values_column": text(node.get("BindingValuesColumn")),
         "binding_variable": text(node.get("BindingVariable")),
+        "source": source_name,
         "mask": text(node.get("Mask")),
         "validation": text(node.get("Validation")),
         "date_time_type": text(node.get("DateTimeType")),
