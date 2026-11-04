@@ -1,9 +1,6 @@
 # dash
 
-1. LLM выбирает **page** (только список pages) → `catalog_pages/{N}.json`
-2. LLM получает **полный catalog** + вопрос:
-   - в `pages` — какие источники используются
-   - в `sources` у каждого есть `name` → взять только совпадающие → их SQL
+`.mrt` → `catalog_pages/N.json` → `/ask` спрашивает LLM какую page выбрать.
 
 ```bash
 cp .env.example .env   # LLM_MODEL=...
@@ -15,6 +12,7 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе"}'
 ```
 
-Ответ: `page_index`, `page_name`, `catalog`, `plan`, `route`, `trace`.
+Ответ: `page_index`, `page_name`, `page`, `route`, `trace`.
 
-`ask_trace.txt`: QUESTION → ROUTE → CATALOG → PLAN → RESULT.
+`ask_trace.txt` — по шагам логики:
+1. QUESTION → 2. PAGES/PROMPT → 3. LLM ROUTE → 4. PAGE SELECTED → 5. PAGE JSON → 6. CATALOG JSON → 7. RESULT

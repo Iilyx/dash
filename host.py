@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-""" /ask:
-1) LLM → только pages → page → catalog_pages/{N}.json
-2) LLM ← полный catalog: в pages какие источники, в sources[] по name — их SQL
-"""
+""" /ask — LLM выбирает page, catalog пишем в ask_trace.txt """
 
 from __future__ import annotations
 
@@ -21,23 +18,6 @@ from extract_mrt import catalog_from_report, load_mrt, write_page_packs
 
 ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("host")
-
-# Шаг 1: только список pages.
-ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
-
-# Шаг 2: полный catalog. В sources у каждого объекта есть name — по нему связываем с pages.
-PLAN_SYSTEM = """Тебе дан полный catalog JSON одной страницы (catalog_pages/{N}.json).
-
-1) Смотри pages: какие источники данных используются (SourceName.Field и т.п.).
-2) В catalog.sources у каждого источника есть поле name.
-   Возьми ТОЛЬКО те sources, у которых name совпадает с источниками из pages.
-3) Верни ТОЛЬКО JSON:
-{
-  "sources": [ /* исходные objects из catalog.sources с нужным name */ ],
-  "queries": [ { "name": "...", "sql": "..." } ]
-}
-Ничего не выдумывай — только то, что есть в catalog.
-"""
 
 
 class Ask(BaseModel):
@@ -168,26 +148,14 @@ async def llm(client: httpx.AsyncClient, model: str, system: str, user: str) -> 
     return text
 
 
-def parse_json_object(text: str) -> dict:
-    text = (text or "").strip()
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            data = json.loads(text[start : end + 1])
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-
-
 def parse_page_index(text: str, cards: list[dict]) -> int:
     valid = {c["index"] for c in cards}
-    data = parse_json_object(text)
-    for item in data.get("pages") or []:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        data = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
+    for item in (data.get("pages") if isinstance(data, dict) else None) or []:
         try:
             idx = int(item)
         except (TypeError, ValueError):
@@ -259,53 +227,42 @@ async def ask(body: Ask):
     if not q:
         raise HTTPException(400, "question is empty")
 
-    route_user = f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}"
+    system = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
+    user = f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}"
+
     trace = trace_reset()
     trace_step("1. QUESTION", q)
     trace_step("2. PAGES → LLM", app.state.cards)
-    trace_step("2. PROMPT ROUTE", {"system": ROUTE_SYSTEM, "user": route_user})
+    trace_step("2. PROMPT", {"system": system, "user": user})
 
     try:
-        route_raw = await llm(app.state.llm, app.state.model, ROUTE_SYSTEM, route_user)
+        raw = await llm(app.state.llm, app.state.model, system, user)
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "LLM timeout") from exc
     except (httpx.HTTPError, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    trace_step("3. LLM ROUTE", route_raw)
+    trace_step("3. LLM ROUTE", raw)
 
-    idx = parse_page_index(route_raw, app.state.cards)
+    idx = parse_page_index(raw, app.state.cards)
     catalog_file = path_of(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages")) / f"{idx}.json"
     catalog = json.loads(catalog_file.read_text(encoding="utf-8"))
     page = (catalog.get("pages") or [{}])[0]
-    name = (page.get("alias") if isinstance(page, dict) else None) or (
-        page.get("name") if isinstance(page, dict) else None
-    ) or f"page_{idx}"
+    name = page.get("alias") or page.get("name") or f"page_{idx}"
 
-    trace_step("4. PAGE SELECTED", {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)})
-    trace_step("5. CATALOG → LLM", catalog)
-
-    plan_user = f"Вопрос пользователя:\n{q}\n\nCatalog JSON:\n{json.dumps(catalog, ensure_ascii=False, indent=2)}"
-    trace_step("5. PROMPT PLAN", {"system": PLAN_SYSTEM, "user_preview": plan_user[:2000]})
-
-    try:
-        plan_raw = await llm(app.state.llm, app.state.model, PLAN_SYSTEM, plan_user)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(504, "LLM timeout (plan)") from exc
-    except (httpx.HTTPError, RuntimeError) as exc:
-        raise HTTPException(502, str(exc)) from exc
-
-    plan = parse_json_object(plan_raw)
-    trace_step("6. LLM PLAN", plan_raw)
-    trace_step("6. PLAN JSON", plan)
+    trace_step(
+        "4. PAGE SELECTED",
+        {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)},
+    )
+    trace_step("5. PAGE JSON", page)
+    trace_step("6. CATALOG JSON", catalog)
     trace_step(
         "7. RESULT",
         {
             "page_index": idx,
             "page_name": name,
-            "catalog": catalog,
-            "plan": plan,
-            "route": route_raw,
+            "page": page,
+            "route": raw,
             "trace": str(trace),
         },
     )
@@ -314,9 +271,8 @@ async def ask(body: Ask):
     return {
         "page_index": idx,
         "page_name": name,
-        "catalog": catalog,
-        "plan": plan,
-        "route": route_raw,
+        "page": page,
+        "route": raw,
         "trace": str(trace),
     }
 
