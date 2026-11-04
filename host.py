@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ /ask:
 1) LLM → page → catalog_pages/{N}.json
-2) LLM ← catalog: name из sources, на которые ссылается pages
+2) LLM ← pages: name из sources
+3) SQL sources → {Name} → variables; variable.dialog.source → ещё sources
+4) Фильтр ← вопрос / default → sql_filled
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,6 +24,9 @@ from extract_mrt import catalog_from_report, load_mrt, write_page_packs
 
 ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("host")
+
+BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
@@ -36,6 +42,28 @@ SOURCES_SYSTEM = """Задача: какие DataSources реально испо
 3) НЕ копируй весь available_source_names. Нет ссылки в pages — не включай.
 4) Регистр не важен (Products ≡ products). Ничего не выдумывай.
 5) Верни ТОЛЬКО JSON: {"source_names":["name", "..."]}
+"""
+
+RESOLVE_SYSTEM = """Задача: подставить значения переменных для SQL.
+
+Дано:
+- question — вопрос пользователя
+- braces — имена {Name} из SQL выбранных sources
+- variables — объекты catalog.variables с этими name
+- filters — среди них те, у кого category Фильтр / Фильтры / Filter / Filters
+- dialog_sources — variable.dialog.source (список значений фильтра из другого source)
+
+Правила:
+1) Для каждой переменной из braces верни значение.
+2) Если variable — фильтр (есть в filters):
+   - возьми значение из question, если пользователь его назвал;
+   - иначе default = variable.value.
+3) dialog.source / dialog.keys_column значит список опций из SQL другого source —
+   это уже учтено в sources; значение всё равно из question или default.
+4) Если не фильтр — используй variable.value (или null, если нет).
+5) Ничего не выдумывай сверх question и variable.value.
+6) Верни ТОЛЬКО JSON:
+{"resolved": {"Name": "value или null", "...": "..."}}
 """
 
 
@@ -237,6 +265,172 @@ def sources_by_names(sources: list[dict], names: list[str]) -> list[dict]:
     return out
 
 
+def braces_from_sources(sources: list[dict]) -> list[str]:
+    """{Name} из SQL уже выбранных sources — порядок появления, без дублей."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        sql = source.get("sql") if isinstance(source, dict) else None
+        if not isinstance(sql, str):
+            continue
+        for name in BRACE_NAME.findall(sql):
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def variables_by_names(variables: list[dict], names: list[str]) -> list[dict]:
+    by_key: dict[str, dict] = {}
+    for item in variables:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            by_key[name.strip().lower()] = item
+    out: list[dict] = []
+    seen: set[str] = set()
+    for name in names:
+        key = name.strip().lower()
+        item = by_key.get(key)
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def is_filter_variable(variable: dict) -> bool:
+    category = variable.get("category")
+    return isinstance(category, str) and category.strip().lower() in FILTER_CATEGORIES
+
+
+def dialog_source_name(variable: dict) -> str | None:
+    """variable.dialog.source или SourceName из keys_column = SourceName.Column."""
+    dialog = variable.get("dialog")
+    if not isinstance(dialog, dict):
+        return None
+    source = dialog.get("source")
+    if isinstance(source, str) and source.strip():
+        return source.strip()
+    for key in ("keys_column", "values_column"):
+        path = dialog.get(key)
+        if isinstance(path, str) and "." in path:
+            head = path.split(".", 1)[0].strip()
+            if head:
+                return head
+    return None
+
+
+def dialog_source_names(variables: list[dict]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        name = dialog_source_name(variable)
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    return out
+
+
+def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: list[str]) -> tuple[list[dict], list[str]]:
+    """Добавить sources по name (из variable.dialog.source), вернуть (sources, добавленные name)."""
+    have = {
+        str(s["name"]).strip().lower()
+        for s in existing
+        if isinstance(s.get("name"), str) and str(s["name"]).strip()
+    }
+    added: list[str] = []
+    out = list(existing)
+    by_key = {
+        str(s["name"]).strip().lower(): s
+        for s in all_sources
+        if isinstance(s.get("name"), str) and str(s["name"]).strip()
+    }
+    for raw in extra_names:
+        key = raw.strip().lower()
+        if key in have:
+            continue
+        source = by_key.get(key)
+        if not source:
+            continue
+        out.append(source)
+        have.add(key)
+        added.append(str(source["name"]).strip())
+    return out, added
+
+
+def default_resolved(variables: list[dict], braces: list[str]) -> dict[str, object]:
+    by_key = {
+        str(v["name"]).strip().lower(): v
+        for v in variables
+        if isinstance(v.get("name"), str) and str(v["name"]).strip()
+    }
+    out: dict[str, object] = {}
+    for name in braces:
+        item = by_key.get(name.lower())
+        if item is None:
+            out[name] = None
+        else:
+            out[name] = item.get("value")
+    return out
+
+
+def parse_resolved(text: str, braces: list[str], fallback: dict[str, object]) -> dict[str, object]:
+    data = parse_json_object(text)
+    raw = data.get("resolved") if isinstance(data.get("resolved"), dict) else {}
+    out: dict[str, object] = dict(fallback)
+    by_brace = {b.lower(): b for b in braces}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            continue
+        canonical = by_brace.get(key.strip().lower())
+        if not canonical:
+            continue
+        out[canonical] = value
+    return out
+
+
+def fill_sql(sql: str, resolved: dict[str, object]) -> str:
+    by_key = {k.lower(): v for k, v in resolved.items()}
+
+    def repl(match: re.Match[str]) -> str:
+        if match.group(1).lower() not in by_key:
+            return match.group(0)
+        value = by_key[match.group(1).lower()]
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return "'" + str(value).replace("'", "''") + "'"
+
+    return BRACE_NAME.sub(repl, sql)
+
+
+def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict]:
+    queries: list[dict] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        sql = source.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        item = {
+            "name": source.get("name"),
+            "sql": sql,
+            "sql_filled": fill_sql(sql, resolved),
+        }
+        queries.append({k: v for k, v in item.items() if v is not None})
+    return queries
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model = os.environ.get("LLM_MODEL", "").strip()
@@ -355,29 +549,109 @@ async def ask(body: Ask):
     sources = sources_by_names(all_sources, source_names)
     trace_step("6. LLM SOURCES", sources_raw)
     trace_step("6. SOURCE NAMES", {"source_names": source_names, "sources": sources})
+
+    # SQL выбранных sources → {Name} → variables по name
+    all_variables = [v for v in (catalog.get("variables") or []) if isinstance(v, dict)]
+    braces = braces_from_sources(sources)
+    variables = variables_by_names(all_variables, braces)
+    filters = [v for v in variables if is_filter_variable(v)]
     trace_step(
-        "7. RESULT",
+        "7. BRACES → VARIABLES",
+        {"braces": braces, "variables": variables, "filters": filters},
+    )
+
+    # variable.dialog.source (или keys_column SourceName.Col) → ещё sources по name
+    dialog_names = dialog_source_names(variables)
+    sources, dialog_added = merge_sources(sources, all_sources, dialog_names)
+    for added in dialog_added:
+        if added.lower() not in {n.lower() for n in source_names}:
+            source_names.append(added)
+    # у новых sources тоже могут быть {Name} → дотянуть variables
+    if dialog_added:
+        braces = braces_from_sources(sources)
+        variables = variables_by_names(all_variables, braces)
+        filters = [v for v in variables if is_filter_variable(v)]
+    trace_step(
+        "7. VARIABLES → DIALOG SOURCES",
+        {
+            "dialog_source_names": dialog_names,
+            "dialog_added": dialog_added,
+            "source_names": source_names,
+            "braces": braces,
+            "variables": variables,
+            "filters": filters,
+        },
+    )
+
+    resolved = default_resolved(variables, braces)
+    resolve_raw = ""
+    if braces and filters:
+        resolve_payload = {
+            "question": q,
+            "braces": braces,
+            "variables": variables,
+            "filters": filters,
+            "dialog_sources": dialog_names,
+        }
+        resolve_user = f"Input JSON:\n{json.dumps(resolve_payload, ensure_ascii=False, indent=2)}"
+        trace_step("7. PROMPT RESOLVE", {"system": RESOLVE_SYSTEM, "user": resolve_user})
+        try:
+            resolve_raw = await llm(app.state.llm, app.state.model, RESOLVE_SYSTEM, resolve_user)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(504, "LLM timeout (resolve)") from exc
+        except (httpx.HTTPError, RuntimeError) as exc:
+            raise HTTPException(502, str(exc)) from exc
+        resolved = parse_resolved(resolve_raw, braces, resolved)
+        trace_step("8. LLM RESOLVE", resolve_raw)
+
+    queries = build_queries(sources, resolved)
+    trace_step("8. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
+    trace_step(
+        "9. RESULT",
         {
             "page_index": idx,
             "page_name": name,
             "source_names": source_names,
             "sources": sources,
+            "braces": braces,
+            "variables": variables,
+            "filters": filters,
+            "dialog_source_names": dialog_names,
+            "resolved": resolved,
+            "queries": queries,
             "catalog": catalog,
             "route": route_raw,
             "sources_route": sources_raw,
+            "resolve_route": resolve_raw,
             "trace": str(trace),
         },
     )
 
-    log.info("ask page=%s index=%s sources=%s trace=%s", name, idx, source_names, trace)
+    log.info(
+        "ask page=%s index=%s sources=%s braces=%s filters=%s dialog=%s trace=%s",
+        name,
+        idx,
+        source_names,
+        braces,
+        [f.get("name") for f in filters],
+        dialog_names,
+        trace,
+    )
     return {
         "page_index": idx,
         "page_name": name,
         "source_names": source_names,
         "sources": sources,
+        "braces": braces,
+        "variables": variables,
+        "filters": filters,
+        "dialog_source_names": dialog_names,
+        "resolved": resolved,
+        "queries": queries,
         "catalog": catalog,
         "route": route_raw,
         "sources_route": sources_raw,
+        "resolve_route": resolve_raw,
         "trace": str(trace),
     }
 

@@ -12,7 +12,15 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе"}'
 ```
 
-Ответ: `page_index`, `page_name`, `source_names` (LLM: name из `sources[]` по page),
-`sources` (эти объекты), `catalog`, `route`, `sources_route`, `trace`.
+Пайплайн `/ask`:
+1. LLM → page
+2. LLM → `source_names` по ссылкам в pages
+3. SQL этих sources → `{Name}` → `variables` по `name`
+4. `variable.dialog.source` → ещё sources по name (список значений фильтра)
+5. `category` Фильтр → значение из вопроса / default → `queries.sql_filled`
 
-`ask_trace.txt`: QUESTION → PAGES → LLM ROUTE → PAGE SELECTED → PAGES+NAMES → LLM SOURCES → RESULT
+Ответ: `page_index`, `page_name`, `source_names`, `sources`, `braces`, `variables`,
+`filters`, `dialog_source_names`, `resolved`, `queries`, `catalog`, `route`,
+`sources_route`, `resolve_route`, `trace`.
+
+`ask_trace.txt`: … → SOURCES → BRACES→VARIABLES → DIALOG SOURCES → RESOLVE → QUERIES → RESULT
