@@ -24,15 +24,18 @@ log = logging.getLogger("host")
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
-SOURCES_SYSTEM = """Тебе дан полный catalog JSON одной страницы (catalog_pages/{N}.json).
+SOURCES_SYSTEM = """Задача: какие DataSources реально используются на странице.
 
-1) Смотри pages: какие источники данных используются
-   (expressions / meters / text вида SourceName.Field, Sum(SourceName.X), data_source и т.п.).
-2) В catalog.sources у каждого источника есть поле name.
-   Собери ТОЛЬКО те name, которые реально встречаются в pages.
-3) Верни ТОЛЬКО JSON:
-{"source_names": ["name", "..."]}
-Ничего не выдумывай — только name из catalog.sources, на которые ссылается pages.
+Дано:
+- pages — JSON страницы (elements / expressions / meters / text / data_source)
+- available_source_names — допустимые name из catalog.sources
+
+Правила:
+1) Смотри ТОЛЬКО pages. Ищи ссылки SourceName.Field, Sum(SourceName.X), data_source и т.п.
+2) В ответ клади ТОЛЬКО те name из available_source_names, на которые в pages есть явная ссылка.
+3) НЕ копируй весь available_source_names. Нет ссылки в pages — не включай.
+4) Регистр не важен (Products ≡ products). Ничего не выдумывай.
+5) Верни ТОЛЬКО JSON: {"source_names":["name", "..."]}
 """
 
 
@@ -323,13 +326,23 @@ async def ask(body: Ask):
         "4. PAGE SELECTED",
         {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)},
     )
-    trace_step("5. CATALOG → LLM", catalog)
+    # в LLM — pages + список допустимых name; полный sources[] не даём (иначе копирует всё)
+    available_names = [
+        str(s["name"]).strip()
+        for s in all_sources
+        if isinstance(s.get("name"), str) and str(s["name"]).strip()
+    ]
+    sources_payload = {
+        "pages": catalog.get("pages") or [],
+        "available_source_names": available_names,
+    }
+    trace_step("5. PAGES + SOURCE NAMES → LLM", sources_payload)
 
     sources_user = (
         f"Вопрос пользователя:\n{q}\n\n"
-        f"Catalog JSON:\n{json.dumps(catalog, ensure_ascii=False, indent=2)}"
+        f"Input JSON:\n{json.dumps(sources_payload, ensure_ascii=False, indent=2)}"
     )
-    trace_step("5. PROMPT SOURCES", {"system": SOURCES_SYSTEM, "user_preview": sources_user[:2000]})
+    trace_step("5. PROMPT SOURCES", {"system": SOURCES_SYSTEM, "user": sources_user})
 
     try:
         sources_raw = await llm(app.state.llm, app.state.model, SOURCES_SYSTEM, sources_user)

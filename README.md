@@ -15,4 +15,4 @@ curl -s http://127.0.0.1:8090/ask \
 Ответ: `page_index`, `page_name`, `source_names` (LLM: name из `sources[]` по page),
 `sources` (эти объекты), `catalog`, `route`, `sources_route`, `trace`.
 
-`ask_trace.txt`: QUESTION → PAGES → LLM ROUTE → PAGE SELECTED → CATALOG → LLM SOURCES → RESULT
+`ask_trace.txt`: QUESTION → PAGES → LLM ROUTE → PAGE SELECTED → PAGES+NAMES → LLM SOURCES → RESULT
