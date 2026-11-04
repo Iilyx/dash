@@ -29,12 +29,12 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе по категории 8"}'
 ```
 
-План `/ask`:
+План `/ask` — куски тянем **полными `{}` из catalog JSON**, не собираем свои схемы:
 
-1. определить **страницу**
-2. filters = `variables` с `"category": "Фильтры"` (+ SQL-параметры sources этой page) → значение из вопроса или дефолт
-3. имена на page → `sources` по **name** → `sql_filled`
+1. полный **page `{}`**
+2. полные `variables[]` с `"category": "Фильтры"` + полные `sources[].parameters[]` этой page → значение из вопроса или дефолт
+3. полные `sources[]` по name с page → `sql_filled`
 4. MCP `execute_sql`
-5. ответ по строкам
+5. ответ
 
-В логах: `STEP 1/5` … `STEP 5/5`. В JSON: `answer`, `steps`, `filters`, `variables`, `queries`, `sql_results`, `trace`.
+В логах: `STEP 1/5` … `STEP 5/5`. В ответе: `page`, `filters`, `sources`, `variables`, `queries`, `sql_results`, `steps`, `trace`.
