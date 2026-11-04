@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-""" /ask — LLM выбирает page, catalog пишем в ask_trace.txt """
+""" /ask:
+1) LLM → page → catalog_pages/{N}.json
+2) LLM ← catalog: name из sources, на которые ссылается pages
+"""
 
 from __future__ import annotations
 
@@ -18,6 +21,19 @@ from extract_mrt import catalog_from_report, load_mrt, write_page_packs
 
 ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("host")
+
+ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
+
+SOURCES_SYSTEM = """Тебе дан полный catalog JSON одной страницы (catalog_pages/{N}.json).
+
+1) Смотри pages: какие источники данных используются
+   (expressions / meters / text вида SourceName.Field, Sum(SourceName.X), data_source и т.п.).
+2) В catalog.sources у каждого источника есть поле name.
+   Собери ТОЛЬКО те name, которые реально встречаются в pages.
+3) Верни ТОЛЬКО JSON:
+{"source_names": ["name", "..."]}
+Ничего не выдумывай — только name из catalog.sources, на которые ссылается pages.
+"""
 
 
 class Ask(BaseModel):
@@ -148,14 +164,19 @@ async def llm(client: httpx.AsyncClient, model: str, system: str, user: str) -> 
     return text
 
 
-def parse_page_index(text: str, cards: list[dict]) -> int:
-    valid = {c["index"] for c in cards}
+def parse_json_object(text: str) -> dict:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
         data = json.loads(text[start : end + 1]) if start >= 0 and end > start else {}
-    for item in (data.get("pages") if isinstance(data, dict) else None) or []:
+    return data if isinstance(data, dict) else {}
+
+
+def parse_page_index(text: str, cards: list[dict]) -> int:
+    valid = {c["index"] for c in cards}
+    data = parse_json_object(text)
+    for item in data.get("pages") or []:
         try:
             idx = int(item)
         except (TypeError, ValueError):
@@ -163,6 +184,54 @@ def parse_page_index(text: str, cards: list[dict]) -> int:
         if idx in valid:
             return idx
     return cards[0]["index"]
+
+
+def parse_source_names(text: str, sources: list[dict]) -> list[str]:
+    """LLM JSON → только name, которые есть в catalog.sources (case-insensitive)."""
+    data = parse_json_object(text)
+    raw = data.get("source_names")
+    if not isinstance(raw, list):
+        raw = data.get("sources") if isinstance(data.get("sources"), list) else []
+    by_key: dict[str, str] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        if isinstance(name, str) and name.strip():
+            by_key[name.strip().lower()] = name.strip()
+        alias = source.get("alias")
+        if isinstance(alias, str) and alias.strip() and isinstance(name, str) and name.strip():
+            by_key.setdefault(alias.strip().lower(), name.strip())
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        candidate = item.get("name") if isinstance(item, dict) else item
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        canonical = by_key.get(candidate.strip().lower())
+        if not canonical or canonical.lower() in seen:
+            continue
+        seen.add(canonical.lower())
+        out.append(canonical)
+    return out
+
+
+def sources_by_names(sources: list[dict], names: list[str]) -> list[dict]:
+    want = {n.lower() for n in names}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        if not isinstance(name, str):
+            continue
+        key = name.strip().lower()
+        if key in want and key not in seen:
+            seen.add(key)
+            out.append(source)
+    return out
 
 
 @asynccontextmanager
@@ -227,52 +296,75 @@ async def ask(body: Ask):
     if not q:
         raise HTTPException(400, "question is empty")
 
-    system = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
-    user = f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}"
+    route_user = f"Вопрос:\n{q}\n\nPages:\n{json.dumps(app.state.cards, ensure_ascii=False, indent=2)}"
 
     trace = trace_reset()
     trace_step("1. QUESTION", q)
     trace_step("2. PAGES → LLM", app.state.cards)
-    trace_step("2. PROMPT", {"system": system, "user": user})
+    trace_step("2. PROMPT ROUTE", {"system": ROUTE_SYSTEM, "user": route_user})
 
     try:
-        raw = await llm(app.state.llm, app.state.model, system, user)
+        route_raw = await llm(app.state.llm, app.state.model, ROUTE_SYSTEM, route_user)
     except httpx.TimeoutException as exc:
         raise HTTPException(504, "LLM timeout") from exc
     except (httpx.HTTPError, RuntimeError) as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    trace_step("3. LLM ROUTE", raw)
+    trace_step("3. LLM ROUTE", route_raw)
 
-    idx = parse_page_index(raw, app.state.cards)
+    idx = parse_page_index(route_raw, app.state.cards)
     catalog_file = path_of(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages")) / f"{idx}.json"
     catalog = json.loads(catalog_file.read_text(encoding="utf-8"))
     page = (catalog.get("pages") or [{}])[0]
     name = page.get("alias") or page.get("name") or f"page_{idx}"
+    all_sources = [s for s in (catalog.get("sources") or []) if isinstance(s, dict)]
 
     trace_step(
         "4. PAGE SELECTED",
         {"page_index": idx, "page_name": name, "catalog_file": str(catalog_file)},
     )
-    # итог — полный файл catalog_pages/{index}.json, не кусок pages[0]
-    trace_step("5. CATALOG (catalog_pages/{index}.json)", catalog)
+    trace_step("5. CATALOG → LLM", catalog)
+
+    sources_user = (
+        f"Вопрос пользователя:\n{q}\n\n"
+        f"Catalog JSON:\n{json.dumps(catalog, ensure_ascii=False, indent=2)}"
+    )
+    trace_step("5. PROMPT SOURCES", {"system": SOURCES_SYSTEM, "user_preview": sources_user[:2000]})
+
+    try:
+        sources_raw = await llm(app.state.llm, app.state.model, SOURCES_SYSTEM, sources_user)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "LLM timeout (sources)") from exc
+    except (httpx.HTTPError, RuntimeError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    source_names = parse_source_names(sources_raw, all_sources)
+    sources = sources_by_names(all_sources, source_names)
+    trace_step("6. LLM SOURCES", sources_raw)
+    trace_step("6. SOURCE NAMES", {"source_names": source_names, "sources": sources})
     trace_step(
-        "6. RESULT",
+        "7. RESULT",
         {
             "page_index": idx,
             "page_name": name,
+            "source_names": source_names,
+            "sources": sources,
             "catalog": catalog,
-            "route": raw,
+            "route": route_raw,
+            "sources_route": sources_raw,
             "trace": str(trace),
         },
     )
 
-    log.info("ask page=%s index=%s trace=%s", name, idx, trace)
+    log.info("ask page=%s index=%s sources=%s trace=%s", name, idx, source_names, trace)
     return {
         "page_index": idx,
         "page_name": name,
+        "source_names": source_names,
+        "sources": sources,
         "catalog": catalog,
-        "route": raw,
+        "route": route_raw,
+        "sources_route": sources_raw,
         "trace": str(trace),
     }
 
