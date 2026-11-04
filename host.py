@@ -262,6 +262,7 @@ async def ask(body: Ask):
             "page_index": idx,
             "page_name": name,
             "page": page,
+            "catalog": catalog,
             "route": raw,
             "trace": str(trace),
         },
@@ -272,6 +273,7 @@ async def ask(body: Ask):
         "page_index": idx,
         "page_name": name,
         "page": page,
+        "catalog": catalog,  # полный catalog_pages/{index}.json
         "route": raw,
         "trace": str(trace),
     }
