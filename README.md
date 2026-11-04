@@ -2,11 +2,11 @@
 
 1. LLM выбирает **page** → `catalog_pages/{N}.json`
 2. LLM по **полному catalog** + вопросу:
-   - в `pages` найти все `{Name}`
-   - найти в `variables`
+   - в `pages` найти имена источников (`SourceName.Field` …)
+   - из `sources` взять **только** объекты с таким `name` — только их SQL
+   - в `pages` найти все `{Name}` → `variables`
    - `category: "Фильтры"` → значение из вопроса или default
-   - `dialog` → путь к `sources` (например `keys_column` / `dialog.source`)
-   - какие `sources.sql` выполнять
+   - `dialog` → путь к `sources` по name (добавить в список SQL)
 
 ```bash
 cp .env.example .env   # LLM_MODEL=...
