@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """FastAPI ask:
 
-1) MRT → catalog_pages/N.json
-2) LLM: какие pages подходят под вопрос
-3) из вопроса — переменные (иначе дефолты из sources.parameters / variables)
-4) подставить в SQL → выполнить через Postgres MCP → ответ
+1) LLM: определить страницу
+2) пробросить всю page → Category / Filters → значения из вопроса или дефолты
+3) по name из page найти sources → SQL
+4) MCP execute_sql → ответ
 """
 
 from __future__ import annotations
@@ -289,32 +289,156 @@ def parameters_by_name(catalog: dict) -> dict[str, dict]:
     return result
 
 
-def needed_parameters(catalog: dict) -> dict[str, dict]:
-    meta = parameters_by_name(catalog)
-    needed: dict[str, dict] = {}
+def _is_category_token(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    return "categor" in text.lower()
+
+
+def collect_category_filters(page: dict, catalog: dict) -> list[dict[str, Any]]:
+    """Вся page + связанные sources: всё, где Category / Filters."""
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        key = f"{item.get('kind')}:{item.get('name')}:{item.get('where')}"
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(item)
+
+    # 1) элементы page: role=filter или любой узел с Category
+    def walk_page(node: Any, path: str = "page") -> None:
+        if isinstance(node, dict):
+            role = str(node.get("role") or "").lower()
+            name = node.get("name")
+            title = node.get("title")
+            blob = json.dumps(node, ensure_ascii=False)
+            is_filter = role == "filter" or "filter" in path.lower()
+            has_category = _is_category_token(blob)
+            if is_filter and has_category:
+                add(
+                    {
+                        "kind": "page_filter",
+                        "name": name,
+                        "title": title,
+                        "role": role or "filter",
+                        "where": path,
+                        "param": "Category",
+                        "default": None,
+                    }
+                )
+            elif has_category and any(
+                _is_category_token(str(node.get(k) or ""))
+                for k in ("name", "title", "alias", "expression", "text", "label")
+            ):
+                add(
+                    {
+                        "kind": "page_category",
+                        "name": name,
+                        "title": title,
+                        "role": role or None,
+                        "where": path,
+                        "param": "Category",
+                        "default": None,
+                    }
+                )
+            for key, value in node.items():
+                walk_page(value, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk_page(item, f"{path}[{i}]")
+
+    walk_page(page)
+
+    # 2) sources: parameters / @Category в SQL (особенно для sources, связанных с page)
+    page_names = {n.lower() for n in source_names_in_page(page)}
     for source in catalog.get("sources") or []:
         if not isinstance(source, dict):
             continue
+        src_name = str(source.get("name") or "")
         sql = str(source.get("sql") or "")
-        for name in ats_in_sql(sql) + braces_in_sql(sql):
-            if name in needed:
-                continue
-            if name in meta:
-                needed[name] = meta[name]
-            else:
-                token = f"@{name}" if f"@{name}" in sql else f"{{{name}}}"
-                needed[name] = {"name": name, "token": token, "default": None, "kind": "at" if token.startswith("@") else "brace"}
+        on_page = not page_names or src_name.lower() in page_names or _is_category_token(src_name)
+        if not on_page and not _is_category_token(sql):
+            # всё равно берём param Category из любого source — это фильтр отчёта
+            pass
         for param in source.get("parameters") or []:
-            if isinstance(param, dict) and param.get("name"):
-                name = str(param["name"])
-                needed.setdefault(name, meta.get(name) or {
-                    "name": name,
-                    "token": f"@{name}",
+            if not isinstance(param, dict) or not param.get("name"):
+                continue
+            pname = str(param["name"])
+            if not _is_category_token(pname) and not _is_category_token(sql):
+                continue
+            add(
+                {
+                    "kind": "source_param",
+                    "name": pname,
+                    "source": src_name,
+                    "where": f"sources.{src_name}.parameters",
+                    "param": pname,
+                    "token": f"@{pname}",
                     "default": param.get("expression"),
-                    "kind": "at",
-                })
-    for name, info in meta.items():
-        needed.setdefault(name, info)
+                }
+            )
+        for pname in ats_in_sql(sql):
+            if not _is_category_token(pname):
+                continue
+            add(
+                {
+                    "kind": "sql_at",
+                    "name": pname,
+                    "source": src_name,
+                    "where": f"sources.{src_name}.sql",
+                    "param": pname,
+                    "token": f"@{pname}",
+                    "default": None,
+                }
+            )
+
+    # 3) relations с categories
+    for rel in catalog.get("relations") or []:
+        if not isinstance(rel, dict):
+            continue
+        blob = json.dumps(rel, ensure_ascii=False)
+        if not _is_category_token(blob):
+            continue
+        add(
+            {
+                "kind": "relation",
+                "name": rel.get("name"),
+                "where": "relations",
+                "param": "Category",
+                "parent": rel.get("parent"),
+                "child": rel.get("child"),
+                "default": None,
+            }
+        )
+
+    return found
+
+
+def category_params_meta(filters: list[dict], catalog: dict) -> dict[str, dict]:
+    """Мета параметров Category-фильтров: token + default из sources.parameters."""
+    meta = parameters_by_name(catalog)
+    needed: dict[str, dict] = {}
+    for item in filters:
+        pname = str(item.get("param") or item.get("name") or "Category")
+        if not _is_category_token(pname) and item.get("kind") not in {"source_param", "sql_at"}:
+            pname = "Category"
+        base = meta.get(pname) or {
+            "name": pname,
+            "token": item.get("token") or f"@{pname}",
+            "alias": pname,
+            "default": item.get("default"),
+            "kind": "at",
+        }
+        if item.get("default") not in (None, "") and base.get("default") in (None, ""):
+            base = {**base, "default": item.get("default")}
+        needed[pname] = base
+    # если нашли category-фильтры на page, но param ещё без default — взять из products.@Category
+    if not needed:
+        for name, info in meta.items():
+            if _is_category_token(name):
+                needed[name] = info
     return needed
 
 
@@ -370,8 +494,8 @@ def extract_from_question(question: str, variables: dict[str, dict]) -> dict[str
     return found
 
 
-def resolve_parameters(question: str, catalog: dict) -> dict[str, Any]:
-    variables = needed_parameters(catalog)
+def resolve_parameters(question: str, variables: dict[str, dict]) -> dict[str, Any]:
+    """Для каждого Category-фильтра: значение из вопроса, иначе default."""
     extracted = extract_from_question(question, variables)
     resolved: dict[str, Any] = {}
     for name, meta in variables.items():
@@ -468,53 +592,53 @@ def source_names_in_page(page: dict) -> set[str]:
     return names
 
 
-def page_sources(catalog: dict, resolved: dict[str, Any]) -> list[dict]:
-    pages = [p for p in (catalog.get("pages") or []) if isinstance(p, dict)]
-    page = pages[0] if pages else {}
+def match_sources_by_page_names(
+    catalog: dict,
+    page: dict,
+    resolved: dict[str, Any],
+) -> list[dict]:
+    """Имена из page (products.X / Sum(products.Y)) → SQL из catalog.sources по name."""
     wanted = source_names_in_page(page)
-    sources: list[dict] = []
+    by_name: dict[str, dict] = {}
     for source in catalog.get("sources") or []:
         if not isinstance(source, dict) or not source.get("sql"):
             continue
         name = str(source.get("name") or "")
-        if wanted and name.lower() not in wanted:
+        by_name[name.lower()] = source
+        alias = source.get("alias")
+        if isinstance(alias, str) and alias.strip():
+            by_name.setdefault(alias.strip().lower(), source)
+
+    selected: list[dict] = []
+    seen: set[str] = set()
+    for key in sorted(wanted):
+        source = by_name.get(key)
+        if not source:
             continue
+        name = str(source.get("name") or key)
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
         sql = str(source["sql"]).strip()
-        sources.append(
+        selected.append(
             {
                 "name": name,
                 "alias": source.get("alias"),
+                "matched_as": key,
                 "sql": sql,
                 "sql_filled": to_postgres_sql(fill_sql(sql, resolved)),
                 "parameters": source.get("parameters") or [],
             }
         )
-    if not sources:
-        for source in catalog.get("sources") or []:
-            if not isinstance(source, dict) or not source.get("sql"):
-                continue
-            sql = str(source["sql"]).strip()
-            sources.append(
-                {
-                    "name": source.get("name"),
-                    "sql": sql,
-                    "sql_filled": to_postgres_sql(fill_sql(sql, resolved)),
-                }
-            )
-    return sources
 
-
-def compact_sources_for_planner(sources: list[dict]) -> list[dict]:
-    out = []
-    for source in sources:
-        out.append(
-            {
-                "name": source.get("name"),
-                "sql_filled": source.get("sql_filled"),
-                "parameters": source.get("parameters") or [],
-            }
+    # если page ссылается на products с @Category — уже в selected;
+    # если Category-source нужен отдельно (categories) и упомянут relation/filter — добавить
+    if not selected:
+        raise RuntimeError(
+            f"на page нет имён sources (нашёл refs={sorted(wanted)}, "
+            f"известны={sorted({str(s.get('name') or '').lower() for s in (catalog.get('sources') or [])})})"
         )
-    return out
+    return selected
 
 
 # --- LLM helpers -------------------------------------------------------------
@@ -532,14 +656,7 @@ ROUTE_PROMPT = """Шаг 1 из пайплайна: определи ОДНУ с
 """
 
 
-PLAN_PROMPT = """Шаг 4: выбери SQL для ответа. Верни ТОЛЬКО JSON:
-{"queries":[{"source":"name","sql":"SELECT ..."}]}
-Бери sql_filled из списка; при необходимости слегка поправь под PostgreSQL.
-Не выдумывай таблицы. Не оставляй @Param / {Param}.
-"""
-
-
-ANSWER_PROMPT = """Шаг 5: хост уже выполнил SQL.
+ANSWER_PROMPT = """Хост уже выбрал страницу, подставил Category-фильтры и выполнил SQL через MCP.
 По строкам результата ответь на вопрос. Не вызывай инструменты. Не выдумывай числа.
 Ответь на языке вопроса, коротко.
 """
@@ -763,65 +880,6 @@ async def mcp_execute_sql(session: ClientSession, sql: str) -> dict:
 # --- pipeline ----------------------------------------------------------------
 
 
-async def plan_queries(
-    llm: httpx.AsyncClient,
-    *,
-    model: str,
-    question: str,
-    resolved: dict[str, Any],
-    sources: list[dict],
-) -> list[dict]:
-    compact = compact_sources_for_planner(sources)
-    user = (
-        f"Вопрос: {question}\n"
-        f"Фильтры: {json.dumps(filters_payload(resolved), ensure_ascii=False)}\n"
-        f"Sources:\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
-    )
-    raw = await llm_chat(
-        llm,
-        model=model,
-        messages=[
-            {"role": "system", "content": PLAN_PROMPT},
-            {"role": "user", "content": user},
-        ],
-        label="plan",
-    )
-    parsed = extract_json_object(raw) or {}
-    planned: list[dict] = []
-    for item in parsed.get("queries") or []:
-        if not isinstance(item, dict):
-            continue
-        sql = item.get("sql") or item.get("sql_filled")
-        if not isinstance(sql, str) or not sql.strip():
-            continue
-        # если модель вернула шаблон с @ — дозаполним
-        sql = to_postgres_sql(fill_sql(sql.strip(), resolved))
-        planned.append(
-            {
-                "source": item.get("source") or item.get("name") or "query",
-                "sql": sql,
-            }
-        )
-    if planned:
-        log.info("Planner queries=%s", [p["source"] for p in planned])
-        return planned
-
-    fallback: list[dict] = []
-    seen: set[str] = set()
-    for source in sources:
-        name = str(source.get("name") or "query")
-        sql = source.get("sql_filled") or source.get("sql")
-        if not isinstance(sql, str) or not sql.strip():
-            continue
-        key = name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        fallback.append({"source": name, "sql": to_postgres_sql(str(sql).strip())})
-    log.warning("Planner пуст — fallback %s sources", len(fallback))
-    return fallback
-
-
 async def answer_from_rows(
     llm: httpx.AsyncClient,
     *,
@@ -923,16 +981,16 @@ async def run_ask(
     question: str,
     cards: list[dict],
 ) -> dict[str, Any]:
-    """План строго по шагам:
-    1) определить страницу
-    2) переменные из вопроса (иначе дефолты)
-    3) подставить в SQL
-    4) выполнить SQL через MCP
-    5) вернуть ответ
+    """План:
+    1) страница
+    2) вся page → Category / Filters → значения из вопроса или дефолты
+    3) имена на page → sources.sql → fill
+    4) MCP execute_sql
+    5) ответ
     """
     stage("QUESTION", question)
 
-    # --- Шаг 1: только страница ---
+    # --- Шаг 1: страница ---
     stage("STEP 1/5 — определяю страницу")
     route_user = (
         f"Вопрос пользователя:\n{question}\n\n"
@@ -947,31 +1005,40 @@ async def run_ask(
         ],
         label="step1-page",
     )
-    page_indexes = parse_page_indexes(route_text, cards)
-    # по плану — одна страница, дальше работаем только с ней
-    page_index = page_indexes[0]
+    page_index = parse_page_indexes(route_text, cards)[0]
     catalog = load_page_catalog(page_index)
     page = (catalog.get("pages") or [{}])[0]
-    page_name = page_label(page if isinstance(page, dict) else {}, page_index)
+    if not isinstance(page, dict):
+        page = {}
+    page_name = page_label(page, page_index)
     stage(
-        "STEP 1/5 — страница выбрана",
-        {"index": page_index, "page": page_name, "catalog": f"catalog_pages/{page_index}.json"},
+        "STEP 1/5 — страница выбрана, пробрасываю всю page",
+        {
+            "index": page_index,
+            "page": page_name,
+            "catalog": f"catalog_pages/{page_index}.json",
+            "elements": len(page.get("elements") or []),
+        },
     )
 
-    # --- Шаг 2: переменные из вопроса / дефолты этой страницы ---
-    stage("STEP 2/5 — переменные из запроса (иначе дефолты)")
-    resolved = resolve_parameters(question, catalog)
+    # --- Шаг 2: Category / Filters на page → значения ---
+    stage("STEP 2/5 — ищу Category / Filters на всей page")
+    category_filters = collect_category_filters(page, catalog)
+    stage("STEP 2/5 — найденные Category/Filters", category_filters)
+    params_meta = category_params_meta(category_filters, catalog)
+    resolved = resolve_parameters(question, params_meta)
     variables = filters_payload(resolved)
-    stage("STEP 2/5 — переменные", variables)
+    stage("STEP 2/5 — значения (question|default)", variables)
 
-    # --- Шаг 3: подставить в SQL ---
-    stage("STEP 3/5 — подставляю переменные в SQL")
-    sources = page_sources(catalog, resolved)
-    if not sources:
-        raise RuntimeError(f"на page[{page_index}] нет SQL sources")
+    # --- Шаг 3: page names → sources SQL ---
+    stage("STEP 3/5 — имена на page → sources по name")
+    page_refs = sorted(source_names_in_page(page))
+    stage("STEP 3/5 — names из page", page_refs)
+    sources = match_sources_by_page_names(catalog, page, resolved)
     filled = [
         {
             "source": s.get("name"),
+            "matched_as": s.get("matched_as"),
             "sql_template": s.get("sql"),
             "sql_filled": s.get("sql_filled"),
         }
@@ -979,18 +1046,12 @@ async def run_ask(
     ]
     stage("STEP 3/5 — sql_filled", filled)
 
-    # --- Шаг 4: plan + MCP execute ---
-    stage("STEP 4/5 — выбираю и выполняю SQL через MCP")
-    planned = await plan_queries(
-        llm, model=model, question=question, resolved=resolved, sources=sources
-    )
-    if not planned:
-        raise RuntimeError("нет SQL для выполнения")
-    stage("STEP 4/5 — plan", planned)
-
+    # --- Шаг 4: MCP (без LLM-planner) ---
+    stage("STEP 4/5 — MCP execute_sql по sources страницы")
+    planned = [{"source": s.get("name"), "sql": s.get("sql_filled")} for s in sources]
     results: list[dict] = []
     for item in planned:
-        stage(f"STEP 4/5 — MCP execute [{item.get('source')}]", item.get("sql"))
+        stage(f"STEP 4/5 — MCP [{item.get('source')}]", item.get("sql"))
         executed = await mcp_execute_sql(session, item["sql"])
         row = {
             "source": item.get("source"),
@@ -1000,7 +1061,7 @@ async def run_ask(
         }
         results.append(row)
         stage(
-            f"STEP 4/5 — MCP result [{item.get('source')}] ok={executed.get('ok')}",
+            f"STEP 4/5 — result [{item.get('source')}] ok={executed.get('ok')}",
             preview(executed.get("result"), 2000),
         )
 
@@ -1015,7 +1076,9 @@ async def run_ask(
         {
             "index": page_index,
             "page": page_name,
+            "category_filters": category_filters,
             "variables": variables,
+            "source_names_on_page": page_refs,
             "sources": [s.get("name") for s in sources],
         }
     ]
@@ -1023,12 +1086,15 @@ async def run_ask(
         "answer": answer,
         "pages": pages_meta,
         "variables": variables,
+        "category_filters": category_filters,
         "queries": planned,
         "sql_results": results,
         "route": route_text,
         "steps": {
             "1_page": {"index": page_index, "page": page_name},
+            "2_category_filters": category_filters,
             "2_variables": variables,
+            "3_page_source_names": page_refs,
             "3_sql_filled": filled,
             "4_queries": planned,
             "5_answer": answer,
