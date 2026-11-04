@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ /ask:
-1) LLM → page → catalog_pages/{N}.json
-2) LLM ← catalog + вопрос: page sources by name → SQL; Фильтры / {params}
+1) LLM → только pages → page → catalog_pages/{N}.json
+2) LLM ← полный catalog: в pages какие источники, в sources[] по name — их SQL
 """
 
 from __future__ import annotations
@@ -22,41 +22,21 @@ from extract_mrt import catalog_from_report, load_mrt, write_page_packs
 ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("host")
 
-# LLM только выбирает page (короткий JSON).
+# Шаг 1: только список pages.
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
-# После page — логика у модели на исходном catalog JSON (без ручного парсинга).
-PLAN_SYSTEM = """Тебе дан полный catalog JSON одной страницы Stimulsoft (catalog_pages/{N}.json).
-Страница уже выбрана — работай только с этим JSON.
+# Шаг 2: полный catalog. В sources у каждого объекта есть name — по нему связываем с pages.
+PLAN_SYSTEM = """Тебе дан полный catalog JSON одной страницы (catalog_pages/{N}.json).
 
-Сделай строго по шагам (только данные из JSON, ничего не выдумывай):
-
-1) Сначала смотри pages: какие источники данных там используются
-   (expressions / meters / text вида "SourceName.Field" и любые ссылки на SourceName).
-2) Потом в sources[] возьми ТОЛЬКО объекты с name = эти SourceName.
-   Остальные sources не трогай, их SQL не бери.
-3) В pages найди все {Name} → ищи в variables[] по name.
-4) Если у variable "category": "Фильтры" (или Filters):
-   - значение из вопроса, если есть; иначе default из variable.value.
-5) Если у variable есть dialog (dialog.source или keys_column "SourceName.Column"):
-   добавь этот SourceName из sources[] по name, если его ещё нет.
-6) Верни ТОЛЬКО JSON:
+1) Смотри pages: какие источники данных используются (SourceName.Field и т.п.).
+2) В catalog.sources у каждого источника есть поле name.
+   Возьми ТОЛЬКО те sources, у которых name совпадает с источниками из pages.
+3) Верни ТОЛЬКО JSON:
 {
-  "braces": ["Name", "..."],
-  "filters": [ /* исходные variables с category Фильтры */ ],
-  "resolved": { "Name": значение },
-  "params": {
-    "Name": {
-      "from": "variable"|"dialog_source"|"unknown",
-      "variable": { /* исходный object или null */ },
-      "dialog_source": "sourceName или null",
-      "default": "...",
-      "value": "..."
-    }
-  },
-  "sources": [ /* исходные objects из sources[] — только те, что нужны по pages (+ dialog) */ ],
-  "queries": [ { "name": "...", "sql": "...", "sql_filled": "..." } ]
+  "sources": [ /* исходные objects из catalog.sources с нужным name */ ],
+  "queries": [ { "name": "...", "sql": "..." } ]
 }
+Ничего не выдумывай — только то, что есть в catalog.
 """
 
 
