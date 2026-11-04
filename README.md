@@ -1,6 +1,7 @@
 # dash
 
-`.mrt` → `catalog_pages/N.json` → `/ask` спрашивает LLM какую page выбрать.
+1. LLM выбирает **page** → `catalog_pages/{N}.json`
+2. LLM по **полному catalog** + вопросу: Фильтры / `{params}` / sources.sql
 
 ```bash
 cp .env.example .env   # LLM_MODEL=...
@@ -12,6 +13,6 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе"}'
 ```
 
-Ответ: `page_index`, `page_name`, `catalog` (= полный `catalog_pages/{N}.json`), `route`, `trace`.
+Ответ: `page_index`, `page_name`, `catalog`, `plan`, `route`, `trace`.
 
-`ask_trace.txt`: QUESTION → PAGES/PROMPT → LLM ROUTE → PAGE SELECTED → CATALOG → RESULT
+`ask_trace.txt`: QUESTION → ROUTE → CATALOG → PLAN → RESULT.
