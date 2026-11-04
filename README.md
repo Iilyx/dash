@@ -12,7 +12,6 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе"}'
 ```
 
-Ответ: `page_index`, `page_name`, `source_names` (LLM: name из `sources[]` по ссылкам в page),
-`sources` (только эти объекты из catalog), `catalog`, `route`, `sources_route`, `trace`.
+Ответ: `page_index`, `page_name`, `catalog` (= полный `catalog_pages/{N}.json`), `route`, `trace`.
 
-`ask_trace.txt`: QUESTION → PAGES → LLM ROUTE → PAGE SELECTED → CATALOG → LLM SOURCES → RESULT
+`ask_trace.txt`: QUESTION → PAGES/PROMPT → LLM ROUTE → PAGE SELECTED → CATALOG → RESULT
