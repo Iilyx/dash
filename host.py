@@ -85,39 +85,66 @@ def page_cards() -> list[dict]:
 
 
 async def llm(client: httpx.AsyncClient, model: str, system: str, user: str) -> str:
+    enable = os.environ.get("LLM_ENABLE_THINKING", "true").lower() in {"1", "true", "yes"}
     thinking = {
-        "enable_thinking": os.environ.get("LLM_ENABLE_THINKING", "true").lower() in {"1", "true", "yes"},
-        "reasoning_effort": os.environ.get("LLM_REASONING_EFFORT", "low"),
-        "chat_template_kwargs": {
-            "enable_thinking": os.environ.get("LLM_ENABLE_THINKING", "true").lower() in {"1", "true", "yes"}
-        },
+        "enable_thinking": enable,
+        "chat_template_kwargs": {"enable_thinking": enable},
     }
-    if not thinking["enable_thinking"]:
-        thinking = {"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}}
+    if enable:
+        thinking["reasoning_effort"] = os.environ.get("LLM_REASONING_EFFORT", "low")
 
-    r = await client.post(
+    parts: list[str] = []
+    think: list[str] = []
+    in_think = False
+    print("\n=== LLM stream ===", flush=True)
+    async with client.stream(
+        "POST",
         "chat/completions",
         json={
             "model": model,
             "temperature": 0,
+            "stream": True,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             **thinking,
         },
-    )
-    r.raise_for_status()
-    msg = (r.json().get("choices") or [{}])[0].get("message") or {}
-    text = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
-    if isinstance(text, list):
-        text = "\n".join(
-            part.get("text", "") if isinstance(part, dict) else str(part) for part in text
-        )
-    text = str(text).strip()
+    ) as r:
+        r.raise_for_status()
+        async for line in r.aiter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            delta = ((chunk.get("choices") or [{}])[0].get("delta")) or {}
+            if not isinstance(delta, dict):
+                continue
+            reason = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            content = delta.get("content") or ""
+            if isinstance(reason, str) and reason:
+                if not in_think:
+                    print("\n[thinking]\n", end="", flush=True)
+                    in_think = True
+                think.append(reason)
+                print(reason, end="", flush=True)
+            if isinstance(content, str) and content:
+                if in_think:
+                    print("\n[/thinking]\n", end="", flush=True)
+                    in_think = False
+                parts.append(content)
+                print(content, end="", flush=True)
+    if in_think:
+        print("\n[/thinking]", flush=True)
+    print("\n=== end stream ===\n", flush=True)
+    text = "".join(parts).strip() or "".join(think).strip()
     if not text:
         raise RuntimeError("LLM empty content")
-    print(text, flush=True)
     return text
 
 
