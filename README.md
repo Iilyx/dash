@@ -1,19 +1,21 @@
 # dash
 
-1. `.mrt` → `catalog_pages/N.json` (по одной page)
-2. `/ask` — LLM проходит **каждую** page, смотрит русский/видимый текст (`ru_text`), говорит подходит или нет
+1. `.mrt` → `catalog_pages/N.json`
+2. `/ask` — route page → переменные из вопроса (или дефолты) → fill SQL → Postgres MCP → ответ
 
 ## Запуск
 
 ```bash
 cp .env.example .env
 # LLM_MODEL=...
+# POSTGRES_* или DATABASE_URL
 
+docker compose up -d
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python host.py
 ```
 
-Thinking (Qwen 3.5) — только через `.env`:
+Thinking (Qwen 3.5) — через `.env`:
 
 | переменная | пример | смысл |
 |---|---|---|
@@ -24,7 +26,9 @@ Thinking (Qwen 3.5) — только через `.env`:
 ```bash
 curl -s http://127.0.0.1:8090/ask \
   -H 'Content-Type: application/json' \
-  -d '{"question":"сколько единиц на складе"}'
+  -d '{"question":"сколько единиц на складе по категории 8"}'
 ```
 
-В консоли host — стрим (`[thinking]` / ответ). В JSON: `{"pages_checked": N, "answer": "..."}`. Текущие настройки — `GET /health` → `thinking`.
+Пайплайн: **route** → **resolve `@Category` / `{Var}`** → **plan SQL** → **MCP `execute_sql`** → **answer**.
+
+В JSON: `answer`, `pages`, `variables`, `queries`, `sql_results`. Настройки — `GET /health`.
