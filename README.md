@@ -29,6 +29,12 @@ curl -s http://127.0.0.1:8090/ask \
   -d '{"question":"сколько единиц на складе по категории 8"}'
 ```
 
-Пайплайн: **route** → **resolve `@Category` / `{Var}`** → **plan SQL** → **MCP `execute_sql`** → **answer**.
+План `/ask` строго по шагам:
 
-В JSON: `answer`, `pages`, `variables`, `queries`, `sql_results`. Настройки — `GET /health`.
+1. определить **страницу**
+2. переменные из вопроса (иначе дефолты)
+3. подставить в SQL
+4. выполнить через MCP `execute_sql`
+5. вернуть ответ
+
+В логах: `STEP 1/5` … `STEP 5/5`. В JSON: `answer`, `steps`, `pages`, `variables`, `queries`, `sql_results`, `trace`.

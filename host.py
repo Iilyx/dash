@@ -520,29 +520,26 @@ def compact_sources_for_planner(sources: list[dict]) -> list[dict]:
 # --- LLM helpers -------------------------------------------------------------
 
 
-ROUTE_PROMPT = """Ты помогаешь выбрать страницы Stimulsoft-дашборда под вопрос пользователя.
+# Шаг 1 — только выбор страницы. Дальше хост идёт по плану сам.
+ROUTE_PROMPT = """Шаг 1 из пайплайна: определи ОДНУ страницу Stimulsoft-дашборда под вопрос.
 
-Тебе дан список pages. У каждой есть index, page, ru_text.
+Дан список pages: index, page, ru_text (видимый/русский текст).
+Смотри на ru_text. Выбери наиболее подходящую page.
 
-Задача:
-1) Пройдись по КАЖДОЙ page.
-2) Смотри на русский и понятный текст в ru_text.
-3) Коротко скажи да/нет и почему.
-4) В КОНЦЕ обязательно верни ТОЛЬКО одну JSON-строку вида:
-{"pages":[0]}
-с индексами подходящих pages. Если не уверен — все индексы.
+Верни ТОЛЬКО JSON, без пояснений:
+{"pages":[<index>]}
+Если совсем не уверен — всё равно выбери одну лучшую.
 """
 
 
-PLAN_PROMPT = """Ты планировщик SQL по Stimulsoft page sources.
-Выбери 1..N запросов для ответа на вопрос. Верни ТОЛЬКО JSON:
+PLAN_PROMPT = """Шаг 4: выбери SQL для ответа. Верни ТОЛЬКО JSON:
 {"queries":[{"source":"name","sql":"SELECT ..."}]}
 Бери sql_filled из списка; при необходимости слегка поправь под PostgreSQL.
 Не выдумывай таблицы. Не оставляй @Param / {Param}.
 """
 
 
-ANSWER_PROMPT = """Ты аналитик Stimulsoft-дашборда. Хост уже выполнил SQL.
+ANSWER_PROMPT = """Шаг 5: хост уже выполнил SQL.
 По строкам результата ответь на вопрос. Не вызывай инструменты. Не выдумывай числа.
 Ответь на языке вопроса, коротко.
 """
@@ -926,9 +923,17 @@ async def run_ask(
     question: str,
     cards: list[dict],
 ) -> dict[str, Any]:
-    stage("1. QUESTION", question)
+    """План строго по шагам:
+    1) определить страницу
+    2) переменные из вопроса (иначе дефолты)
+    3) подставить в SQL
+    4) выполнить SQL через MCP
+    5) вернуть ответ
+    """
+    stage("QUESTION", question)
 
-    # 1) route pages
+    # --- Шаг 1: только страница ---
+    stage("STEP 1/5 — определяю страницу")
     route_user = (
         f"Вопрос пользователя:\n{question}\n\n"
         f"Список pages:\n{json.dumps(cards, ensure_ascii=False, indent=2)}"
@@ -940,59 +945,52 @@ async def run_ask(
             {"role": "system", "content": ROUTE_PROMPT},
             {"role": "user", "content": route_user},
         ],
-        label="route",
+        label="step1-page",
     )
     page_indexes = parse_page_indexes(route_text, cards)
-    stage("2. ROUTE pages", page_indexes)
+    # по плану — одна страница, дальше работаем только с ней
+    page_index = page_indexes[0]
+    catalog = load_page_catalog(page_index)
+    page = (catalog.get("pages") or [{}])[0]
+    page_name = page_label(page if isinstance(page, dict) else {}, page_index)
+    stage(
+        "STEP 1/5 — страница выбрана",
+        {"index": page_index, "page": page_name, "catalog": f"catalog_pages/{page_index}.json"},
+    )
 
-    # 2) params + fill SQL per selected page
-    all_resolved: dict[str, Any] = {}
-    all_sources: list[dict] = []
-    pages_meta: list[dict] = []
-    for index in page_indexes:
-        catalog = load_page_catalog(index)
-        resolved = resolve_parameters(question, catalog)
-        sources = page_sources(catalog, resolved)
-        all_resolved.update(resolved)
-        all_sources.extend(sources)
-        pages_meta.append(
-            {
-                "index": index,
-                "page": page_label((catalog.get("pages") or [{}])[0], index),
-                "variables": filters_payload(resolved),
-                "sources": [s.get("name") for s in sources],
-            }
-        )
-        stage(
-            f"3. PAGE[{index}] variables (question|default)",
-            filters_payload(resolved),
-        )
-        stage(
-            f"3. PAGE[{index}] sql_filled",
-            [
-                {
-                    "source": s.get("name"),
-                    "sql_template": s.get("sql"),
-                    "sql_filled": s.get("sql_filled"),
-                }
-                for s in sources
-            ],
-        )
+    # --- Шаг 2: переменные из вопроса / дефолты этой страницы ---
+    stage("STEP 2/5 — переменные из запроса (иначе дефолты)")
+    resolved = resolve_parameters(question, catalog)
+    variables = filters_payload(resolved)
+    stage("STEP 2/5 — переменные", variables)
 
-    if not all_sources:
-        raise RuntimeError("на выбранных pages нет SQL sources")
+    # --- Шаг 3: подставить в SQL ---
+    stage("STEP 3/5 — подставляю переменные в SQL")
+    sources = page_sources(catalog, resolved)
+    if not sources:
+        raise RuntimeError(f"на page[{page_index}] нет SQL sources")
+    filled = [
+        {
+            "source": s.get("name"),
+            "sql_template": s.get("sql"),
+            "sql_filled": s.get("sql_filled"),
+        }
+        for s in sources
+    ]
+    stage("STEP 3/5 — sql_filled", filled)
 
-    # 3) plan + execute
+    # --- Шаг 4: plan + MCP execute ---
+    stage("STEP 4/5 — выбираю и выполняю SQL через MCP")
     planned = await plan_queries(
-        llm, model=model, question=question, resolved=all_resolved, sources=all_sources
+        llm, model=model, question=question, resolved=resolved, sources=sources
     )
     if not planned:
         raise RuntimeError("нет SQL для выполнения")
-    stage("4. PLAN queries", planned)
+    stage("STEP 4/5 — plan", planned)
 
     results: list[dict] = []
     for item in planned:
-        stage(f"5. MCP execute_sql [{item.get('source')}]", item.get("sql"))
+        stage(f"STEP 4/5 — MCP execute [{item.get('source')}]", item.get("sql"))
         executed = await mcp_execute_sql(session, item["sql"])
         row = {
             "source": item.get("source"),
@@ -1002,22 +1000,39 @@ async def run_ask(
         }
         results.append(row)
         stage(
-            f"5. MCP result [{item.get('source')}] ok={executed.get('ok')}",
+            f"STEP 4/5 — MCP result [{item.get('source')}] ok={executed.get('ok')}",
             preview(executed.get("result"), 2000),
         )
 
-    # 4) answer
+    # --- Шаг 5: ответ ---
+    stage("STEP 5/5 — формирую ответ")
     answer = await answer_from_rows(
-        llm, model=model, question=question, resolved=all_resolved, results=results
+        llm, model=model, question=question, resolved=resolved, results=results
     )
-    stage("6. ANSWER", answer)
+    stage("STEP 5/5 — ответ", answer)
+
+    pages_meta = [
+        {
+            "index": page_index,
+            "page": page_name,
+            "variables": variables,
+            "sources": [s.get("name") for s in sources],
+        }
+    ]
     return {
         "answer": answer,
         "pages": pages_meta,
-        "variables": filters_payload(all_resolved),
+        "variables": variables,
         "queries": planned,
         "sql_results": results,
         "route": route_text,
+        "steps": {
+            "1_page": {"index": page_index, "page": page_name},
+            "2_variables": variables,
+            "3_sql_filled": filled,
+            "4_queries": planned,
+            "5_answer": answer,
+        },
     }
 
 
@@ -1142,6 +1157,7 @@ async def ask(body: Ask) -> dict:
         "pages": result.get("pages"),
         "variables": result.get("variables"),
         "queries": result.get("queries"),
+        "steps": result.get("steps"),
         "sql_results": [
             {
                 "source": item.get("source"),
