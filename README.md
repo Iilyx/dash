@@ -22,9 +22,10 @@ curl -s http://127.0.0.1:8090/ask \
 7. LLM resolve фильтров с учётом `variable.type` (в т.ч. StringList):
    вопрос → `dialog_results` → default; `{Name}` → SQL-литерал по типу
 8. `queries.sql_filled` page sources → MCP `execute_sql` → `sql_results`
+9. LLM: `pages` + `sql_results`/`dialog_results` → `answer` + `dashboard.widgets`
 
 Нужны Docker + `DATABASE_URL` или `POSTGRES_*` (см. `.env.example`).
 
-Ответ: … `dialog_results`, `resolved`, `queries`, `sql_results`, `catalog`, `route`, …
+Ответ: `answer`, `dashboard`, `dialog_results`, `resolved`, `queries`, `sql_results`, …
 
-`ask_trace.txt`: … → DIALOG SQL → RESOLVE → QUERIES → SQL (MCP) → RESULT
+`ask_trace.txt`: … → SQL (MCP) → DASHBOARD → RESULT

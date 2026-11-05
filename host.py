@@ -6,6 +6,7 @@
 4) SQL dialog.source → MCP → dialog_results
 5) Фильтр ← вопрос / default / dialog_results → sql_filled
 6) Основной SQL → MCP → sql_results
+7) LLM ← pages + sql/dialog results → dashboard answer
 """
 
 from __future__ import annotations
@@ -100,6 +101,41 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
 6) Верни ТОЛЬКО JSON:
 {"resolved": {"Name": value_or_null_or_array, "...": "..."},
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
+"""
+
+DASHBOARD_SYSTEM = """Ты аналитик Stimulsoft-дашборда. SQL уже выполнен хостом.
+
+Дано:
+- question — вопрос пользователя
+- page — catalog pages[0]: elements (type/role/title/text/meters/expressions/filters)
+- resolved — значения фильтров / {params}
+- dialog_results — опции фильтров из dialog.source (MCP)
+- sql_results — данные page sources (MCP): [{name, sql_filled, ok, result}]
+
+Задача:
+1) По page.elements восстанови логику дашборда: что считает каждый виджет
+   (Indicator / Gauge / Chart / Map / Table / Text / filter TreeView…).
+2) Сопоставь expressions/meters с колонками и агрегатами из sql_results
+   (и при необходимости dialog_results). Числа НЕ выдумывай — только из result.
+3) Ответь на question на языке вопроса, опираясь на виджеты и данные.
+4) Верни ТОЛЬКО JSON:
+{
+  "answer": "краткий ответ пользователю",
+  "dashboard": {
+    "page": "alias или name",
+    "filters": {"Name": "value", "...": "..."},
+    "widgets": [
+      {
+        "name": "Indicator1",
+        "type": "StiIndicatorElement",
+        "title": "...",
+        "logic": "Sum(products.UnitPrice) …",
+        "value": "число или текст из sql_results / null",
+        "source": "products"
+      }
+    ]
+  }
+}
 """
 
 
@@ -858,6 +894,73 @@ def build_queries(
     return queries
 
 
+def compact_page_for_dashboard(page: dict) -> dict:
+    """Урезанный pages[0] для LLM: виджеты без лишнего шума."""
+    if not isinstance(page, dict):
+        return {}
+    elements_out: list[dict] = []
+    for el in page.get("elements") or []:
+        if not isinstance(el, dict):
+            continue
+        item = {
+            "name": el.get("name"),
+            "alias": el.get("alias"),
+            "type": el.get("type"),
+            "role": el.get("role"),
+            "title": el.get("title"),
+            "text": el.get("text"),
+            "meters": el.get("meters"),
+            "expressions": el.get("expressions"),
+            "filters": el.get("filters"),
+            "data_source": el.get("data_source"),
+            "top_n": el.get("top_n"),
+        }
+        elements_out.append({k: v for k, v in item.items() if v not in (None, "", [], {})})
+    out = {
+        "name": page.get("name"),
+        "alias": page.get("alias"),
+        "type": page.get("type"),
+        "is_dashboard": page.get("is_dashboard"),
+        "elements": elements_out,
+    }
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
+def compact_sql_results_for_llm(results: list[dict], *, max_chars: int = 12_000) -> list[dict]:
+    """Обрезать огромные MCP result, чтобы влезли в промпт."""
+    out: list[dict] = []
+    budget = max_chars
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        result = item.get("result")
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        if len(text) > min(4000, budget):
+            text = text[: min(4000, budget)] + "\n...truncated"
+        packed = {
+            "name": item.get("name"),
+            "ok": item.get("ok"),
+            "sql_filled": item.get("sql_filled"),
+            "result": text,
+        }
+        out.append({k: v for k, v in packed.items() if v is not None})
+        budget -= len(text)
+        if budget <= 0:
+            break
+    return out
+
+
+def parse_dashboard(text: str) -> dict:
+    data = parse_json_object(text)
+    if not data:
+        return {"answer": text.strip(), "dashboard": None}
+    answer = data.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        answer = text.strip()
+    dashboard = data.get("dashboard") if isinstance(data.get("dashboard"), dict) else None
+    return {"answer": answer, "dashboard": dashboard}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model = os.environ.get("LLM_MODEL", "").strip()
@@ -1111,26 +1214,42 @@ async def ask(body: Ask):
     async with app.state.lock:
         sql_results = await execute_queries_mcp(app.state.session, queries, label="query")
     trace_step("10. SQL (MCP)", sql_results)
+
+    # 4) page + данные → логика дашборда и ответ на вопрос
+    page_compact = compact_page_for_dashboard(page if isinstance(page, dict) else {})
+    dashboard_payload = {
+        "question": q,
+        "page": page_compact,
+        "resolved": resolved,
+        "dialog_results": compact_sql_results_for_llm(dialog_results, max_chars=4000),
+        "sql_results": compact_sql_results_for_llm(sql_results, max_chars=12_000),
+    }
+    dashboard_user = f"Input JSON:\n{json.dumps(dashboard_payload, ensure_ascii=False, indent=2)}"
+    trace_step("11. PROMPT DASHBOARD", {"system": DASHBOARD_SYSTEM, "user_preview": dashboard_user[:3000]})
+    try:
+        dashboard_raw = await llm(app.state.llm, app.state.model, DASHBOARD_SYSTEM, dashboard_user)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "LLM timeout (dashboard)") from exc
+    except (httpx.HTTPError, RuntimeError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    rendered = parse_dashboard(dashboard_raw)
+    answer = rendered.get("answer")
+    dashboard = rendered.get("dashboard")
+    trace_step("11. LLM DASHBOARD", dashboard_raw)
     trace_step(
-        "11. RESULT",
+        "12. RESULT",
         {
             "page_index": idx,
             "page_name": name,
+            "answer": answer,
+            "dashboard": dashboard,
             "source_names": source_names,
             "page_source_names": page_source_names,
-            "sources": sources,
-            "braces": braces,
-            "variables": variables,
-            "filters": filters,
-            "dialog_source_names": dialog_names,
-            "dialog_results": dialog_results,
             "resolved": resolved,
+            "dialog_results": dialog_results,
             "queries": queries,
             "sql_results": sql_results,
-            "catalog": catalog,
-            "route": route_raw,
-            "sources_route": sources_raw,
-            "resolve_route": resolve_raw,
             "trace": str(trace),
         },
     )
@@ -1149,6 +1268,8 @@ async def ask(body: Ask):
     return {
         "page_index": idx,
         "page_name": name,
+        "answer": answer,
+        "dashboard": dashboard,
         "source_names": source_names,
         "page_source_names": page_source_names,
         "sources": sources,
@@ -1164,6 +1285,7 @@ async def ask(body: Ask):
         "route": route_raw,
         "sources_route": sources_raw,
         "resolve_route": resolve_raw,
+        "dashboard_route": dashboard_raw,
         "trace": str(trace),
     }
 
