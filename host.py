@@ -35,25 +35,6 @@ log = logging.getLogger("host")
 BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
 MAX_TOOL_CHARS = 24_000
-INT_RE = re.compile(r"^-?\d+$")
-FLOAT_RE = re.compile(r"^-?\d+[.,]\d+$")
-BOOL_TRUE = {"true", "1", "yes", "y", "on", "t"}
-BOOL_FALSE = {"false", "0", "no", "n", "off", "f"}
-NUMERIC_TYPE_HINTS = (
-    "int",
-    "long",
-    "short",
-    "byte",
-    "decimal",
-    "double",
-    "float",
-    "single",
-    "number",
-    "numeric",
-    "money",
-)
-BOOL_TYPE_HINTS = ("bool", "boolean")
-DATE_TYPE_HINTS = ("date", "time", "datetime", "timestamp")
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
@@ -76,22 +57,22 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
 Дано:
 - question — вопрос пользователя
 - braces — имена {Name} из SQL sources
-- variables / filters — у каждой есть name, type, value, dialog
-  dialog.source → DataSource; dialog.keys_column / values_column → какие поля результата
-  dialog.source_columns → колонки этого source (что возвращает SQL)
-  dialog.options → уже разобранные строки [{key, value}, ...] из MCP (key = keys_column)
-- dialog_results — сырой MCP (если options пусты — смотри result)
+- variables / filters — variables (filters = category Фильтр)
+- dialog_results — уже выполненный SQL dialog.source: [{name, sql_filled, ok, result}, ...]
+  result — строки опций фильтра (ключи/значения из БД)
 
 Правила приоритета для каждого name из braces и filters:
-1) Тип значения = variable.type (System.Int32 / Decimal / Boolean / DateTime / String).
-   Числа и bool в JSON — настоящими типами (1, true), не строками "1".
-2) Если в question есть фильтр — сопоставь с dialog.options.value (подпись)
-   и в resolved положи dialog.options.key (поле keys_column), в типе variable.type.
-3) Иначе variable.value (default), тоже в типе variable.type.
+1) Если в question есть явное значение фильтра — возьми его.
+   Если у фильтра есть dialog_results: сопоставь вопрос со строками result
+   (по подписи/имени/ключу) и подставь реальное значение из result
+   (обычно ключ / id / код колонки keys_column, не выдуманный текст).
+2) Иначе если подходит default variable.value — и он есть в dialog_results
+   (когда dialog есть) — используй default (или соответствующий ключ из result).
+3) Иначе variable.value (default), даже без dialog.
 4) Если не фильтр — variable.value или null.
-5) Ничего не выдумывай сверх question, variable.value и dialog.options / dialog_results.
+5) Ничего не выдумывай сверх question, variable.value и dialog_results.
 6) Верни ТОЛЬКО JSON:
-{"resolved": {"Name": value_or_null, "...": "..."},
+{"resolved": {"Name": "value или null", "...": "..."},
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
 
@@ -240,7 +221,6 @@ async def execute_dialog_sources(
     dialog_names: list[str],
     all_sources: list[dict],
     resolved: dict[str, object],
-    types: dict[str, str] | None = None,
 ) -> list[dict]:
     """Найти sources по dialog name и выполнить их SQL через MCP."""
     if not dialog_names:
@@ -248,7 +228,7 @@ async def execute_dialog_sources(
     dialog_sources = sources_by_names(all_sources, dialog_names)
     return await execute_queries_mcp(
         session,
-        build_queries(dialog_sources, resolved, types),
+        build_queries(dialog_sources, resolved),
         label="dialog",
     )
 
@@ -521,148 +501,6 @@ def dialog_source_names(variables: list[dict]) -> list[str]:
     return out
 
 
-def _column_leaf(path: str | None) -> str | None:
-    if not isinstance(path, str) or not path.strip():
-        return None
-    return path.split(".")[-1].strip() or None
-
-
-def _row_get(row: dict, field: str | None) -> object:
-    if not field or not isinstance(row, dict):
-        return None
-    if field in row:
-        return row[field]
-    low = field.lower()
-    for key, value in row.items():
-        if isinstance(key, str) and key.lower() == low:
-            return value
-    return None
-
-
-def parse_result_rows(result: object) -> list[dict]:
-    """Достать list[dict] из MCP result (JSON / обёртка)."""
-    if result is None:
-        return []
-    if isinstance(result, list):
-        return [r for r in result if isinstance(r, dict)]
-    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-    text = text.strip()
-    if not text:
-        return []
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        start_obj, end_obj = text.find("{"), text.rfind("}")
-        start_arr, end_arr = text.find("["), text.rfind("]")
-        data = None
-        if start_arr >= 0 and end_arr > start_arr:
-            try:
-                data = json.loads(text[start_arr : end_arr + 1])
-            except json.JSONDecodeError:
-                data = None
-        if data is None and start_obj >= 0 and end_obj > start_obj:
-            try:
-                data = json.loads(text[start_obj : end_obj + 1])
-            except json.JSONDecodeError:
-                return []
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    if isinstance(data, dict):
-        for key in ("rows", "data", "result", "records", "items"):
-            rows = data.get(key)
-            if isinstance(rows, list):
-                return [r for r in rows if isinstance(r, dict)]
-        if all(not isinstance(v, (list, dict)) for v in data.values()):
-            return [data]
-    return []
-
-
-def attach_dialog_source_schema(variables: list[dict], all_sources: list[dict]) -> list[dict]:
-    """В variable.dialog положить columns source (что возвращает SQL). type у variable не трогаем."""
-    by_name = {
-        str(s["name"]).strip().lower(): s
-        for s in all_sources
-        if isinstance(s, dict) and isinstance(s.get("name"), str) and str(s["name"]).strip()
-    }
-    out: list[dict] = []
-    for variable in variables:
-        if not isinstance(variable, dict):
-            continue
-        item = dict(variable)
-        dialog = item.get("dialog")
-        if not isinstance(dialog, dict):
-            out.append(item)
-            continue
-        dialog = dict(dialog)
-        src_name = dialog_source_name(item)
-        source = by_name.get(src_name.lower()) if src_name else None
-        if source:
-            dialog["source"] = source.get("name") or src_name
-            cols = source.get("columns") if isinstance(source.get("columns"), list) else []
-            dialog["source_columns"] = cols
-            dialog["key_field"] = _column_leaf(dialog.get("keys_column"))
-            dialog["value_field"] = _column_leaf(dialog.get("values_column"))
-        item["dialog"] = dialog
-        out.append(item)
-    return out
-
-
-def apply_dialog_options(
-    variables: list[dict],
-    dialog_results: list[dict],
-) -> list[dict]:
-    """Разобрать MCP rows → dialog.options [{key, value}] по keys_column/values_column.
-    Тип значения переменной по-прежнему variable.type."""
-    by_source: dict[str, dict] = {}
-    for item in dialog_results:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if isinstance(name, str) and name.strip():
-            by_source[name.strip().lower()] = item
-
-    out: list[dict] = []
-    for variable in variables:
-        if not isinstance(variable, dict):
-            continue
-        item = dict(variable)
-        dialog = item.get("dialog")
-        if not isinstance(dialog, dict):
-            out.append(item)
-            continue
-        dialog = dict(dialog)
-        src = dialog_source_name(item)
-        result = by_source.get(src.lower()) if src else None
-        rows = parse_result_rows((result or {}).get("result"))
-        key_field = dialog.get("key_field") or _column_leaf(dialog.get("keys_column"))
-        value_field = dialog.get("value_field") or _column_leaf(dialog.get("values_column"))
-        options: list[dict] = []
-        var_type = item.get("type") if isinstance(item.get("type"), str) else None
-        for row in rows:
-            key = _row_get(row, key_field) if key_field else None
-            val = _row_get(row, value_field) if value_field else None
-            if key is None and val is None and len(row) == 1:
-                only = next(iter(row.values()))
-                key = only
-                val = only
-            elif key is None and row:
-                # fallback: первая колонка = key
-                key = next(iter(row.values()))
-            if key is None and val is None:
-                continue
-            options.append(
-                {
-                    "key": coerce_value(key, var_type),
-                    "value": val if val is not None else key,
-                }
-            )
-        if options:
-            dialog["options"] = options
-        item["dialog"] = dialog
-        out.append(item)
-    return out
-
-
 def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: list[str]) -> tuple[list[dict], list[str]]:
     """Добавить sources по name (из variable.dialog.source), вернуть (sources, добавленные name)."""
     have = {
@@ -690,174 +528,56 @@ def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: li
     return out, added
 
 
-def variable_types(variables: list[dict]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for item in variables:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        typ = item.get("type")
-        if isinstance(name, str) and name.strip() and isinstance(typ, str) and typ.strip():
-            out[name.strip().lower()] = typ.strip()
-    return out
-
-
-def type_kind(typ: str | None) -> str:
-    """bool | int | float | date | string."""
-    raw = (typ or "").strip().lower()
-    leaf = raw.rsplit(".", 1)[-1]
-    if any(h in leaf for h in BOOL_TYPE_HINTS) or any(h in raw for h in BOOL_TYPE_HINTS):
-        return "bool"
-    if any(h in leaf for h in DATE_TYPE_HINTS) or any(h in raw for h in DATE_TYPE_HINTS):
-        return "date"
-    if leaf in {"int16", "int32", "int64", "uint16", "uint32", "uint64", "byte", "sbyte"}:
-        return "int"
-    if leaf in {"decimal", "double", "single", "float"}:
-        return "float"
-    if any(h in leaf for h in NUMERIC_TYPE_HINTS) or any(h in raw for h in NUMERIC_TYPE_HINTS):
-        return "float" if any(h in leaf for h in ("decimal", "double", "float", "single", "money")) else "int"
-    return "string"
-
-
-def coerce_value(value: object, typ: str | None = None) -> object:
-    """Привести value к Python-типу по variable.type / эвристике."""
-    if value is None:
-        return None
-    kind = type_kind(typ)
-
-    if isinstance(value, bool) and kind in {"bool", "string"}:
-        return value if kind == "bool" else ("true" if value else "false")
-    if isinstance(value, bool) and kind in {"int", "float"}:
-        return int(value) if kind == "int" else float(value)
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if kind == "bool":
-            return bool(value)
-        if kind == "int":
-            return int(value)
-        if kind == "float":
-            return float(value)
-        if kind == "string":
-            return str(value)
-        return value
-
-    if not isinstance(value, str):
-        return value
-
-    text = value.strip()
-    if not text or text.lower() in {"null", "none"}:
-        return None
-
-    if kind == "bool" or (kind == "string" and text.lower() in BOOL_TRUE | BOOL_FALSE):
-        low = text.lower()
-        if low in BOOL_TRUE:
-            return True
-        if low in BOOL_FALSE:
-            return False
-        if kind == "bool":
-            return text
-
-    if kind in {"int", "float"} or (kind == "string" and (INT_RE.fullmatch(text) or FLOAT_RE.fullmatch(text))):
-        if INT_RE.fullmatch(text):
-            number: object = int(text)
-        elif FLOAT_RE.fullmatch(text):
-            number = float(text.replace(",", "."))
-        else:
-            return text
-        if kind == "int":
-            return int(number)  # type: ignore[arg-type]
-        if kind == "float":
-            return float(number)  # type: ignore[arg-type]
-        # string field but numeric text → keep numeric for SQL literal (без кавычек)
-        return number
-
-    return text
-
-
-def sql_literal(value: object, typ: str | None = None) -> str:
-    """SQL-литерал с учётом типа: числа/bool без кавычек, строки/даты в кавычках."""
-    coerced = coerce_value(value, typ)
-    if coerced is None:
-        return "NULL"
-    if isinstance(coerced, bool):
-        return "TRUE" if coerced else "FALSE"
-    if isinstance(coerced, int) and not isinstance(coerced, bool):
-        return str(coerced)
-    if isinstance(coerced, float):
-        return repr(coerced) if coerced != int(coerced) else str(int(coerced))
-    text = str(coerced)
-    # запасной путь: числовая строка без type
-    if INT_RE.fullmatch(text):
-        return text
-    if FLOAT_RE.fullmatch(text):
-        return text.replace(",", ".")
-    kind = type_kind(typ)
-    if kind == "date":
-        return "'" + text.replace("'", "''") + "'"
-    return "'" + text.replace("'", "''") + "'"
-
-
 def default_resolved(variables: list[dict], names: list[str]) -> dict[str, object]:
     by_key = {
         str(v["name"]).strip().lower(): v
         for v in variables
         if isinstance(v.get("name"), str) and str(v["name"]).strip()
     }
-    types = variable_types(variables)
     out: dict[str, object] = {}
     for name in names:
         item = by_key.get(name.lower())
         if item is None:
             out[name] = None
         else:
-            out[name] = coerce_value(item.get("value"), types.get(name.lower()))
+            out[name] = item.get("value")
     return out
 
 
-def parse_resolved(
-    text: str,
-    names: list[str],
-    fallback: dict[str, object],
-    types: dict[str, str] | None = None,
-) -> dict[str, object]:
+def parse_resolved(text: str, names: list[str], fallback: dict[str, object]) -> dict[str, object]:
     data = parse_json_object(text)
     raw = data.get("resolved") if isinstance(data.get("resolved"), dict) else {}
     out: dict[str, object] = dict(fallback)
     by_name = {n.lower(): n for n in names}
-    types = types or {}
     for key, value in raw.items():
         if not isinstance(key, str):
             continue
         canonical = by_name.get(key.strip().lower())
         if not canonical:
             continue
-        out[canonical] = coerce_value(value, types.get(canonical.lower()))
+        out[canonical] = value
     return out
 
 
-def fill_sql(
-    sql: str,
-    resolved: dict[str, object],
-    types: dict[str, str] | None = None,
-) -> str:
+def fill_sql(sql: str, resolved: dict[str, object]) -> str:
     by_key = {k.lower(): v for k, v in resolved.items()}
-    types = types or {}
 
     def repl(match: re.Match[str]) -> str:
-        name = match.group(1)
-        key = name.lower()
-        if key not in by_key:
+        if match.group(1).lower() not in by_key:
             return match.group(0)
-        return sql_literal(by_key[key], types.get(key))
+        value = by_key[match.group(1).lower()]
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return "'" + str(value).replace("'", "''") + "'"
 
     return BRACE_NAME.sub(repl, sql)
 
 
-def build_queries(
-    sources: list[dict],
-    resolved: dict[str, object],
-    types: dict[str, str] | None = None,
-) -> list[dict]:
+def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict]:
     queries: list[dict] = []
     for source in sources:
         if not isinstance(source, dict):
@@ -868,7 +588,7 @@ def build_queries(
         item = {
             "name": source.get("name"),
             "sql": sql,
-            "sql_filled": fill_sql(sql, resolved, types),
+            "sql_filled": fill_sql(sql, resolved),
         }
         queries.append({k: v for k, v in item.items() if v is not None})
     return queries
@@ -1068,9 +788,6 @@ async def ask(body: Ask):
                 ]
             )
         )
-    # schema source (columns) → в variable.dialog; type остаётся variable.type
-    variables = attach_dialog_source_schema(variables, all_sources)
-    filters = [v for v in variables if is_filter_variable(v)]
     trace_step(
         "7. VARIABLES → DIALOG SOURCES",
         {
@@ -1084,7 +801,6 @@ async def ask(body: Ask):
     )
 
     # defaults сначала — чтобы dialog SQL тоже мог подставить {Name}
-    types = variable_types(variables)  # только variable.type
     resolved = default_resolved(variables, resolve_names)
 
     # 1) dialog.source SQL → MCP (список опций фильтра)
@@ -1094,14 +810,10 @@ async def ask(body: Ask):
             dialog_names=dialog_names,
             all_sources=all_sources,
             resolved=resolved,
-            types=types,
         )
-    # rows source → dialog.options [{key,value}]; key в типе variable.type
-    variables = apply_dialog_options(variables, dialog_results)
-    filters = [v for v in variables if is_filter_variable(v)]
-    trace_step("8. DIALOG SQL (MCP)", {"dialog_results": dialog_results, "variables": variables})
+    trace_step("8. DIALOG SQL (MCP)", dialog_results)
 
-    # 2) LLM: вопрос / default / dialog.options (тип = variable.type)
+    # 2) LLM: вопрос / default / значение из dialog_results
     resolve_raw = ""
     if filters or braces:
         resolve_payload = {
@@ -1121,12 +833,12 @@ async def ask(body: Ask):
             raise HTTPException(504, "LLM timeout (resolve)") from exc
         except (httpx.HTTPError, RuntimeError) as exc:
             raise HTTPException(502, str(exc)) from exc
-        resolved = parse_resolved(resolve_raw, resolve_names, resolved, types)
-        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved, "types": types})
+        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
+        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved})
 
     # 3) основной SQL page sources (не dialog) с финальными значениями → MCP
     page_sources = sources_by_names(all_sources, page_source_names)
-    queries = build_queries(page_sources, resolved, types)
+    queries = build_queries(page_sources, resolved)
     trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
 
     async with app.state.lock:
