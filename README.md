@@ -18,8 +18,9 @@ curl -s http://127.0.0.1:8090/ask \
 3. SQL этих sources → `{Name}` → `variables` по `name`
 4. `filters` = все `variables` с `category` Фильтр (не только из `{}`)
 5. `variable.dialog.source` → ещё sources по name
-6. фильтры ← вопрос / default → `queries.sql_filled`
-7. SQL этих dialog sources → MCP `execute_sql` → `dialog_results`
+6. SQL dialog sources → MCP `execute_sql` → `dialog_results`
+7. LLM resolve фильтров: вопрос → иначе значение из `dialog_results` → иначе default
+8. `queries.sql_filled` с финальным `resolved`
 
 Нужны Docker + `DATABASE_URL` или `POSTGRES_*` (см. `.env.example`).
 
@@ -27,4 +28,4 @@ curl -s http://127.0.0.1:8090/ask \
 `filters`, `dialog_source_names`, `dialog_results`, `resolved`, `queries`, `catalog`,
 `route`, `sources_route`, `resolve_route`, `trace`.
 
-`ask_trace.txt`: … → DIALOG SOURCES → RESOLVE → QUERIES → DIALOG SQL (MCP) → RESULT
+`ask_trace.txt`: … → DIALOG SOURCES → DIALOG SQL → RESOLVE → QUERIES → RESULT

@@ -3,8 +3,8 @@
 1) LLM → page → catalog_pages/{N}.json
 2) LLM ← pages: name из sources
 3) SQL sources → {Name} → variables; variable.dialog.source → ещё sources
-4) Фильтр ← вопрос / default → sql_filled
-5) SQL dialog.source → MCP execute_sql → dialog_results
+4) SQL dialog.source → MCP → dialog_results
+5) Фильтр ← вопрос / default / значение из dialog_results → sql_filled
 """
 
 from __future__ import annotations
@@ -51,26 +51,28 @@ SOURCES_SYSTEM = """Задача: какие DataSources реально испо
 5) Верни ТОЛЬКО JSON: {"source_names":["name", "..."]}
 """
 
-RESOLVE_SYSTEM = """Задача: подставить значения переменных для SQL.
+RESOLVE_SYSTEM = """Задача: подставить значения переменных / фильтров для SQL.
 
 Дано:
 - question — вопрос пользователя
-- braces — имена {Name} из SQL выбранных sources
-- variables — variables по braces + все с category Фильтр
-- filters — ВСЕ catalog.variables с category Фильтр / Фильтры / Filter / Filters
-- dialog_sources — variable.dialog.source (список значений фильтра из другого source)
+- braces — имена {Name} из SQL sources
+- variables / filters — variables (filters = category Фильтр)
+- dialog_results — уже выполненный SQL dialog.source: [{name, sql_filled, ok, result}, ...]
+  result — строки опций фильтра (ключи/значения из БД)
 
-Правила:
-1) Для каждого name из braces и filters верни значение.
-2) Если variable — фильтр (есть в filters):
-   - возьми значение из question, если пользователь его назвал;
-   - иначе default = variable.value.
-3) dialog.source / dialog.keys_column значит список опций из SQL другого source —
-   это уже учтено в sources; значение всё равно из question или default.
-4) Если не фильтр — используй variable.value (или null, если нет).
-5) Ничего не выдумывай сверх question и variable.value.
+Правила приоритета для каждого name из braces и filters:
+1) Если в question есть явное значение фильтра — возьми его.
+   Если у фильтра есть dialog_results: сопоставь вопрос со строками result
+   (по подписи/имени/ключу) и подставь реальное значение из result
+   (обычно ключ / id / код колонки keys_column, не выдуманный текст).
+2) Иначе если подходит default variable.value — и он есть в dialog_results
+   (когда dialog есть) — используй default (или соответствующий ключ из result).
+3) Иначе variable.value (default), даже без dialog.
+4) Если не фильтр — variable.value или null.
+5) Ничего не выдумывай сверх question, variable.value и dialog_results.
 6) Верни ТОЛЬКО JSON:
-{"resolved": {"Name": "value или null", "...": "..."}}
+{"resolved": {"Name": "value или null", "...": "..."},
+ "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
 
 
@@ -781,31 +783,10 @@ async def ask(body: Ask):
         },
     )
 
+    # defaults сначала — чтобы dialog SQL тоже мог подставить {Name}
     resolved = default_resolved(variables, resolve_names)
-    resolve_raw = ""
-    if filters:
-        resolve_payload = {
-            "question": q,
-            "braces": braces,
-            "variables": variables,
-            "filters": filters,
-            "dialog_sources": dialog_names,
-        }
-        resolve_user = f"Input JSON:\n{json.dumps(resolve_payload, ensure_ascii=False, indent=2)}"
-        trace_step("7. PROMPT RESOLVE", {"system": RESOLVE_SYSTEM, "user": resolve_user})
-        try:
-            resolve_raw = await llm(app.state.llm, app.state.model, RESOLVE_SYSTEM, resolve_user)
-        except httpx.TimeoutException as exc:
-            raise HTTPException(504, "LLM timeout (resolve)") from exc
-        except (httpx.HTTPError, RuntimeError) as exc:
-            raise HTTPException(502, str(exc)) from exc
-        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
-        trace_step("8. LLM RESOLVE", resolve_raw)
 
-    queries = build_queries(sources, resolved)
-    trace_step("8. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
-
-    # dialog.source SQL → MCP execute_sql
+    # 1) dialog.source SQL → MCP (список опций фильтра)
     async with app.state.lock:
         dialog_results = await execute_dialog_sources(
             app.state.session,
@@ -813,7 +794,34 @@ async def ask(body: Ask):
             all_sources=all_sources,
             resolved=resolved,
         )
-    trace_step("9. DIALOG SQL (MCP)", dialog_results)
+    trace_step("8. DIALOG SQL (MCP)", dialog_results)
+
+    # 2) LLM: вопрос / default / значение из dialog_results
+    resolve_raw = ""
+    if filters or braces:
+        resolve_payload = {
+            "question": q,
+            "braces": braces,
+            "variables": variables,
+            "filters": filters,
+            "dialog_source_names": dialog_names,
+            "dialog_results": dialog_results,
+            "defaults": resolved,
+        }
+        resolve_user = f"Input JSON:\n{json.dumps(resolve_payload, ensure_ascii=False, indent=2)}"
+        trace_step("8. PROMPT RESOLVE", {"system": RESOLVE_SYSTEM, "user": resolve_user})
+        try:
+            resolve_raw = await llm(app.state.llm, app.state.model, RESOLVE_SYSTEM, resolve_user)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(504, "LLM timeout (resolve)") from exc
+        except (httpx.HTTPError, RuntimeError) as exc:
+            raise HTTPException(502, str(exc)) from exc
+        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
+        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved})
+
+    # 3) основной SQL с финальными значениями
+    queries = build_queries(sources, resolved)
+    trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
     trace_step(
         "10. RESULT",
         {
