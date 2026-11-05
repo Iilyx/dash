@@ -76,24 +76,21 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
 Дано:
 - question — вопрос пользователя
 - braces — имена {Name} из SQL sources
-- variables / filters — variables (filters = category Фильтр)
-- dialog_results — уже выполненный SQL dialog.source: [{name, sql_filled, ok, result}, ...]
-  result — строки опций фильтра (ключи/значения из БД)
+- variables / filters — у каждой есть name, type, value, dialog
+  dialog.source → DataSource; dialog.keys_column / values_column → какие поля результата
+  dialog.source_columns → колонки этого source (что возвращает SQL)
+  dialog.options → уже разобранные строки [{key, value}, ...] из MCP (key = keys_column)
+- dialog_results — сырой MCP (если options пусты — смотри result)
 
 Правила приоритета для каждого name из braces и filters:
-1) Если в question есть явное значение фильтра — возьми его.
-   Если у фильтра есть dialog_results: сопоставь вопрос со строками result
-   (по подписи/имени/ключу) и подставь реальное значение из result
-   (обычно ключ / id / код колонки keys_column, не выдуманный текст).
-2) Иначе если подходит default variable.value — и он есть в dialog_results
-   (когда dialog есть) — используй default (или соответствующий ключ из result).
-3) Иначе variable.value (default), даже без dialog.
+1) Тип значения = variable.type (System.Int32 / Decimal / Boolean / DateTime / String).
+   Числа и bool в JSON — настоящими типами (1, true), не строками "1".
+2) Если в question есть фильтр — сопоставь с dialog.options.value (подпись)
+   и в resolved положи dialog.options.key (поле keys_column), в типе variable.type.
+3) Иначе variable.value (default), тоже в типе variable.type.
 4) Если не фильтр — variable.value или null.
-5) Типы: смотри variable.type (System.Int32 / Decimal / Boolean / DateTime / String).
-   Числа и bool в JSON пиши НАСТОЯЩИМИ типами (1, 3.5, true), не строками "1".
-   Строки и даты — строками.
-6) Ничего не выдумывай сверх question, variable.value и dialog_results.
-7) Верни ТОЛЬКО JSON:
+5) Ничего не выдумывай сверх question, variable.value и dialog.options / dialog_results.
+6) Верни ТОЛЬКО JSON:
 {"resolved": {"Name": value_or_null, "...": "..."},
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
@@ -524,6 +521,148 @@ def dialog_source_names(variables: list[dict]) -> list[str]:
     return out
 
 
+def _column_leaf(path: str | None) -> str | None:
+    if not isinstance(path, str) or not path.strip():
+        return None
+    return path.split(".")[-1].strip() or None
+
+
+def _row_get(row: dict, field: str | None) -> object:
+    if not field or not isinstance(row, dict):
+        return None
+    if field in row:
+        return row[field]
+    low = field.lower()
+    for key, value in row.items():
+        if isinstance(key, str) and key.lower() == low:
+            return value
+    return None
+
+
+def parse_result_rows(result: object) -> list[dict]:
+    """Достать list[dict] из MCP result (JSON / обёртка)."""
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [r for r in result if isinstance(r, dict)]
+    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start_obj, end_obj = text.find("{"), text.rfind("}")
+        start_arr, end_arr = text.find("["), text.rfind("]")
+        data = None
+        if start_arr >= 0 and end_arr > start_arr:
+            try:
+                data = json.loads(text[start_arr : end_arr + 1])
+            except json.JSONDecodeError:
+                data = None
+        if data is None and start_obj >= 0 and end_obj > start_obj:
+            try:
+                data = json.loads(text[start_obj : end_obj + 1])
+            except json.JSONDecodeError:
+                return []
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for key in ("rows", "data", "result", "records", "items"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return [r for r in rows if isinstance(r, dict)]
+        if all(not isinstance(v, (list, dict)) for v in data.values()):
+            return [data]
+    return []
+
+
+def attach_dialog_source_schema(variables: list[dict], all_sources: list[dict]) -> list[dict]:
+    """В variable.dialog положить columns source (что возвращает SQL). type у variable не трогаем."""
+    by_name = {
+        str(s["name"]).strip().lower(): s
+        for s in all_sources
+        if isinstance(s, dict) and isinstance(s.get("name"), str) and str(s["name"]).strip()
+    }
+    out: list[dict] = []
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        item = dict(variable)
+        dialog = item.get("dialog")
+        if not isinstance(dialog, dict):
+            out.append(item)
+            continue
+        dialog = dict(dialog)
+        src_name = dialog_source_name(item)
+        source = by_name.get(src_name.lower()) if src_name else None
+        if source:
+            dialog["source"] = source.get("name") or src_name
+            cols = source.get("columns") if isinstance(source.get("columns"), list) else []
+            dialog["source_columns"] = cols
+            dialog["key_field"] = _column_leaf(dialog.get("keys_column"))
+            dialog["value_field"] = _column_leaf(dialog.get("values_column"))
+        item["dialog"] = dialog
+        out.append(item)
+    return out
+
+
+def apply_dialog_options(
+    variables: list[dict],
+    dialog_results: list[dict],
+) -> list[dict]:
+    """Разобрать MCP rows → dialog.options [{key, value}] по keys_column/values_column.
+    Тип значения переменной по-прежнему variable.type."""
+    by_source: dict[str, dict] = {}
+    for item in dialog_results:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            by_source[name.strip().lower()] = item
+
+    out: list[dict] = []
+    for variable in variables:
+        if not isinstance(variable, dict):
+            continue
+        item = dict(variable)
+        dialog = item.get("dialog")
+        if not isinstance(dialog, dict):
+            out.append(item)
+            continue
+        dialog = dict(dialog)
+        src = dialog_source_name(item)
+        result = by_source.get(src.lower()) if src else None
+        rows = parse_result_rows((result or {}).get("result"))
+        key_field = dialog.get("key_field") or _column_leaf(dialog.get("keys_column"))
+        value_field = dialog.get("value_field") or _column_leaf(dialog.get("values_column"))
+        options: list[dict] = []
+        var_type = item.get("type") if isinstance(item.get("type"), str) else None
+        for row in rows:
+            key = _row_get(row, key_field) if key_field else None
+            val = _row_get(row, value_field) if value_field else None
+            if key is None and val is None and len(row) == 1:
+                only = next(iter(row.values()))
+                key = only
+                val = only
+            elif key is None and row:
+                # fallback: первая колонка = key
+                key = next(iter(row.values()))
+            if key is None and val is None:
+                continue
+            options.append(
+                {
+                    "key": coerce_value(key, var_type),
+                    "value": val if val is not None else key,
+                }
+            )
+        if options:
+            dialog["options"] = options
+        item["dialog"] = dialog
+        out.append(item)
+    return out
+
+
 def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: list[str]) -> tuple[list[dict], list[str]]:
     """Добавить sources по name (из variable.dialog.source), вернуть (sources, добавленные name)."""
     have = {
@@ -929,6 +1068,9 @@ async def ask(body: Ask):
                 ]
             )
         )
+    # schema source (columns) → в variable.dialog; type остаётся variable.type
+    variables = attach_dialog_source_schema(variables, all_sources)
+    filters = [v for v in variables if is_filter_variable(v)]
     trace_step(
         "7. VARIABLES → DIALOG SOURCES",
         {
@@ -942,7 +1084,7 @@ async def ask(body: Ask):
     )
 
     # defaults сначала — чтобы dialog SQL тоже мог подставить {Name}
-    types = variable_types(variables)
+    types = variable_types(variables)  # только variable.type
     resolved = default_resolved(variables, resolve_names)
 
     # 1) dialog.source SQL → MCP (список опций фильтра)
@@ -954,9 +1096,12 @@ async def ask(body: Ask):
             resolved=resolved,
             types=types,
         )
-    trace_step("8. DIALOG SQL (MCP)", dialog_results)
+    # rows source → dialog.options [{key,value}]; key в типе variable.type
+    variables = apply_dialog_options(variables, dialog_results)
+    filters = [v for v in variables if is_filter_variable(v)]
+    trace_step("8. DIALOG SQL (MCP)", {"dialog_results": dialog_results, "variables": variables})
 
-    # 2) LLM: вопрос / default / значение из dialog_results
+    # 2) LLM: вопрос / default / dialog.options (тип = variable.type)
     resolve_raw = ""
     if filters or braces:
         resolve_payload = {
@@ -967,7 +1112,6 @@ async def ask(body: Ask):
             "dialog_source_names": dialog_names,
             "dialog_results": dialog_results,
             "defaults": resolved,
-            "types": types,
         }
         resolve_user = f"Input JSON:\n{json.dumps(resolve_payload, ensure_ascii=False, indent=2)}"
         trace_step("8. PROMPT RESOLVE", {"system": RESOLVE_SYSTEM, "user": resolve_user})
