@@ -33,6 +33,10 @@ ROOT = Path(__file__).resolve().parent
 log = logging.getLogger("host")
 
 BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# '{Name}' / "{Name}" — кавычки уже в SQL, подставляем значение без новых кавычек
+QUOTED_BRACE = re.compile(
+    r"(?P<q>['\"])\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}(?P=q)"
+)
 FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
 MAX_TOOL_CHARS = 24_000
 INT_RE = re.compile(r"^-?\d+$")
@@ -707,14 +711,27 @@ def coerce_value(value: object, typ: str | None = None) -> object:
     return text
 
 
-def sql_literal(value: object, typ: str | None = None) -> str:
-    """SQL-литерал по типу: {Var} → значение; StringList → 'a','b' для IN (...)."""
+def _escape_sql_str(text: str) -> str:
+    """Экранирование внутри уже существующих '...': ' → ''."""
+    return text.replace("'", "''")
+
+
+def sql_literal(value: object, typ: str | None = None, *, already_quoted: bool = False) -> str:
+    """SQL-подстановка для {Var}.
+
+    {Var}        → литерал с кавычками по типу ('f' / 1 / TRUE)
+    '{Var}'      → already_quoted: только значение f (не 'f'), иначе ''f''
+    StringList   → 'a','b' для IN ({Var})
+    """
     coerced = coerce_value(value, typ)
     if coerced is None:
         return "NULL"
     if isinstance(coerced, list):
         if not coerced:
             return "NULL"
+        if already_quoted:
+            # внутри '...': a,b без дополнительных кавычек на каждый элемент
+            return ",".join(_escape_sql_str(str(item)) for item in coerced)
         elem_typ = list_element_kind(typ)
         parts: list[str] = []
         for item in coerced:
@@ -728,20 +745,24 @@ def sql_literal(value: object, typ: str | None = None) -> str:
                     item_typ = "float"
                 else:
                     item_typ = "string"
-            parts.append(sql_literal(item, item_typ))
+            parts.append(sql_literal(item, item_typ, already_quoted=False))
         return ",".join(parts)
     if isinstance(coerced, bool):
-        return "TRUE" if coerced else "FALSE"
+        text = "TRUE" if coerced else "FALSE"
+        return _escape_sql_str(text) if already_quoted else text
     if isinstance(coerced, int) and not isinstance(coerced, bool):
         return str(coerced)
     if isinstance(coerced, float):
         return repr(coerced) if coerced != int(coerced) else str(int(coerced))
     text = str(coerced)
+    if already_quoted:
+        # '{Var}' + f → 'f'  (не ''f'')
+        return _escape_sql_str(text)
     if INT_RE.fullmatch(text):
         return text
     if FLOAT_RE.fullmatch(text):
         return text.replace(",", ".")
-    return "'" + text.replace("'", "''") + "'"
+    return "'" + _escape_sql_str(text) + "'"
 
 
 def default_resolved(variables: list[dict], names: list[str]) -> dict[str, object]:
@@ -790,14 +811,30 @@ def fill_sql(
     by_key = {k.lower(): v for k, v in resolved.items()}
     types = types or {}
 
-    def repl(match: re.Match[str]) -> str:
+    def repl_quoted(match: re.Match[str]) -> str:
+        """'{Name}' / \"{Name}\" → кавычки из шаблона, значение без новых кавычек."""
+        name = match.group("name")
+        key = name.lower()
+        quote = match.group("q")
+        if key not in by_key:
+            return match.group(0)
+        value = by_key[key]
+        typ = types.get(key)
+        if coerce_value(value, typ) is None:
+            return "NULL"
+        inner = sql_literal(value, typ, already_quoted=True)
+        return f"{quote}{inner}{quote}"
+
+    def repl_bare(match: re.Match[str]) -> str:
         name = match.group(1)
         key = name.lower()
         if key not in by_key:
             return match.group(0)
-        return sql_literal(by_key[key], types.get(key))
+        return sql_literal(by_key[key], types.get(key), already_quoted=False)
 
-    return BRACE_NAME.sub(repl, sql)
+    # сначала '{Var}', потом оставшиеся {Var}
+    out = QUOTED_BRACE.sub(repl_quoted, sql)
+    return BRACE_NAME.sub(repl_bare, out)
 
 
 def build_queries(
