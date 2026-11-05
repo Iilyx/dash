@@ -49,12 +49,12 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
 Дано:
 - question — вопрос пользователя
 - braces — имена {Name} из SQL выбранных sources
-- variables — объекты catalog.variables с этими name
-- filters — среди них те, у кого category Фильтр / Фильтры / Filter / Filters
+- variables — variables по braces + все с category Фильтр
+- filters — ВСЕ catalog.variables с category Фильтр / Фильтры / Filter / Filters
 - dialog_sources — variable.dialog.source (список значений фильтра из другого source)
 
 Правила:
-1) Для каждой переменной из braces верни значение.
+1) Для каждого name из braces и filters верни значение.
 2) Если variable — фильтр (есть в filters):
    - возьми значение из question, если пользователь его назвал;
    - иначе default = variable.value.
@@ -307,6 +307,29 @@ def is_filter_variable(variable: dict) -> bool:
     return isinstance(category, str) and category.strip().lower() in FILTER_CATEGORIES
 
 
+def filter_variables(variables: list[dict]) -> list[dict]:
+    """Все variables с category Фильтр / Фильтры — не только те, что встретились в SQL {}."""
+    return [v for v in variables if isinstance(v, dict) and is_filter_variable(v)]
+
+
+def merge_variables(*groups: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+    return out
+
+
 def dialog_source_name(variable: dict) -> str | None:
     """variable.dialog.source или SourceName из keys_column = SourceName.Column."""
     dialog = variable.get("dialog")
@@ -365,14 +388,14 @@ def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: li
     return out, added
 
 
-def default_resolved(variables: list[dict], braces: list[str]) -> dict[str, object]:
+def default_resolved(variables: list[dict], names: list[str]) -> dict[str, object]:
     by_key = {
         str(v["name"]).strip().lower(): v
         for v in variables
         if isinstance(v.get("name"), str) and str(v["name"]).strip()
     }
     out: dict[str, object] = {}
-    for name in braces:
+    for name in names:
         item = by_key.get(name.lower())
         if item is None:
             out[name] = None
@@ -381,15 +404,15 @@ def default_resolved(variables: list[dict], braces: list[str]) -> dict[str, obje
     return out
 
 
-def parse_resolved(text: str, braces: list[str], fallback: dict[str, object]) -> dict[str, object]:
+def parse_resolved(text: str, names: list[str], fallback: dict[str, object]) -> dict[str, object]:
     data = parse_json_object(text)
     raw = data.get("resolved") if isinstance(data.get("resolved"), dict) else {}
     out: dict[str, object] = dict(fallback)
-    by_brace = {b.lower(): b for b in braces}
+    by_name = {n.lower(): n for n in names}
     for key, value in raw.items():
         if not isinstance(key, str):
             continue
-        canonical = by_brace.get(key.strip().lower())
+        canonical = by_name.get(key.strip().lower())
         if not canonical:
             continue
         out[canonical] = value
@@ -550,13 +573,26 @@ async def ask(body: Ask):
     trace_step("6. LLM SOURCES", sources_raw)
     trace_step("6. SOURCE NAMES", {"source_names": source_names, "sources": sources})
 
-    # SQL выбранных sources → {Name} → variables по name
+    # SQL → {Name} → variables по name; filters = ВСЕ с category Фильтр из catalog
     all_variables = [v for v in (catalog.get("variables") or []) if isinstance(v, dict)]
     braces = braces_from_sources(sources)
-    variables = variables_by_names(all_variables, braces)
-    filters = [v for v in variables if is_filter_variable(v)]
+    brace_variables = variables_by_names(all_variables, braces)
+    filters = filter_variables(all_variables)
+    variables = merge_variables(brace_variables, filters)
+    resolve_names = list(
+        dict.fromkeys(
+            [
+                *braces,
+                *[
+                    str(v["name"]).strip()
+                    for v in filters
+                    if isinstance(v.get("name"), str) and str(v["name"]).strip()
+                ],
+            ]
+        )
+    )
     trace_step(
-        "7. BRACES → VARIABLES",
+        "7. BRACES → VARIABLES + FILTERS",
         {"braces": braces, "variables": variables, "filters": filters},
     )
 
@@ -566,11 +602,23 @@ async def ask(body: Ask):
     for added in dialog_added:
         if added.lower() not in {n.lower() for n in source_names}:
             source_names.append(added)
-    # у новых sources тоже могут быть {Name} → дотянуть variables
+    # у новых sources тоже могут быть {Name} → дотянуть variables (filters уже все)
     if dialog_added:
         braces = braces_from_sources(sources)
-        variables = variables_by_names(all_variables, braces)
-        filters = [v for v in variables if is_filter_variable(v)]
+        brace_variables = variables_by_names(all_variables, braces)
+        variables = merge_variables(brace_variables, filters)
+        resolve_names = list(
+            dict.fromkeys(
+                [
+                    *braces,
+                    *[
+                        str(v["name"]).strip()
+                        for v in filters
+                        if isinstance(v.get("name"), str) and str(v["name"]).strip()
+                    ],
+                ]
+            )
+        )
     trace_step(
         "7. VARIABLES → DIALOG SOURCES",
         {
@@ -583,9 +631,9 @@ async def ask(body: Ask):
         },
     )
 
-    resolved = default_resolved(variables, braces)
+    resolved = default_resolved(variables, resolve_names)
     resolve_raw = ""
-    if braces and filters:
+    if filters:
         resolve_payload = {
             "question": q,
             "braces": braces,
@@ -601,7 +649,7 @@ async def ask(body: Ask):
             raise HTTPException(504, "LLM timeout (resolve)") from exc
         except (httpx.HTTPError, RuntimeError) as exc:
             raise HTTPException(502, str(exc)) from exc
-        resolved = parse_resolved(resolve_raw, braces, resolved)
+        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
         trace_step("8. LLM RESOLVE", resolve_raw)
 
     queries = build_queries(sources, resolved)

@@ -16,8 +16,9 @@ curl -s http://127.0.0.1:8090/ask \
 1. LLM → page
 2. LLM → `source_names` по ссылкам в pages
 3. SQL этих sources → `{Name}` → `variables` по `name`
-4. `variable.dialog.source` → ещё sources по name (список значений фильтра)
-5. `category` Фильтр → значение из вопроса / default → `queries.sql_filled`
+4. `filters` = все `variables` с `category` Фильтр (не только из `{}`)
+5. `variable.dialog.source` → ещё sources по name
+6. фильтры ← вопрос / default → `queries.sql_filled`
 
 Ответ: `page_index`, `page_name`, `source_names`, `sources`, `braces`, `variables`,
 `filters`, `dialog_source_names`, `resolved`, `queries`, `catalog`, `route`,
