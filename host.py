@@ -4,7 +4,8 @@
 2) LLM ← pages: name из sources
 3) SQL sources → {Name} → variables; variable.dialog.source → ещё sources
 4) SQL dialog.source → MCP → dialog_results
-5) Фильтр ← вопрос / default / значение из dialog_results → sql_filled
+5) Фильтр ← вопрос / default / dialog_results → sql_filled
+6) Основной SQL → MCP → sql_results
 """
 
 from __future__ import annotations
@@ -180,30 +181,27 @@ async def mcp_execute_sql(session: ClientSession, sql: str) -> dict:
     return {"ok": False, "sql": sql, "result": f"SQL error: {last_error}", "arg": None}
 
 
-async def execute_dialog_sources(
+async def execute_queries_mcp(
     session: ClientSession | None,
+    queries: list[dict],
     *,
-    dialog_names: list[str],
-    all_sources: list[dict],
-    resolved: dict[str, object],
+    label: str = "query",
 ) -> list[dict]:
-    """Найти sources по dialog name и выполнить их SQL через MCP."""
-    if not dialog_names:
+    """Выполнить список {name, sql, sql_filled} через MCP execute_sql."""
+    if not queries:
         return []
     if session is None:
         raise HTTPException(503, "MCP Postgres не запущен (нужны DATABASE_URL/POSTGRES_* + Docker)")
-    dialog_sources = sources_by_names(all_sources, dialog_names)
-    queries = build_queries(dialog_sources, resolved)
     results: list[dict] = []
     for item in queries:
         sql = str(item.get("sql_filled") or item.get("sql") or "").strip()
-        name = item.get("name") or "dialog"
+        name = item.get("name") or label
         if not sql:
             results.append(
                 {"name": name, "sql": item.get("sql"), "sql_filled": None, "ok": False, "result": "empty sql"}
             )
             continue
-        log.info("MCP dialog source=%s sql=%s", name, sql[:200])
+        log.info("MCP %s source=%s sql=%s", label, name, sql[:200])
         executed = await mcp_execute_sql(session, sql)
         results.append(
             {
@@ -215,6 +213,24 @@ async def execute_dialog_sources(
             }
         )
     return results
+
+
+async def execute_dialog_sources(
+    session: ClientSession | None,
+    *,
+    dialog_names: list[str],
+    all_sources: list[dict],
+    resolved: dict[str, object],
+) -> list[dict]:
+    """Найти sources по dialog name и выполнить их SQL через MCP."""
+    if not dialog_names:
+        return []
+    dialog_sources = sources_by_names(all_sources, dialog_names)
+    return await execute_queries_mcp(
+        session,
+        build_queries(dialog_sources, resolved),
+        label="dialog",
+    )
 
 
 def ensure_catalog() -> None:
@@ -721,6 +737,7 @@ async def ask(body: Ask):
         raise HTTPException(502, str(exc)) from exc
 
     source_names = parse_source_names(sources_raw, all_sources)
+    page_source_names = list(source_names)
     sources = sources_by_names(all_sources, source_names)
     trace_step("6. LLM SOURCES", sources_raw)
     trace_step("6. SOURCE NAMES", {"source_names": source_names, "sources": sources})
@@ -819,15 +836,21 @@ async def ask(body: Ask):
         resolved = parse_resolved(resolve_raw, resolve_names, resolved)
         trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved})
 
-    # 3) основной SQL с финальными значениями
-    queries = build_queries(sources, resolved)
+    # 3) основной SQL page sources (не dialog) с финальными значениями → MCP
+    page_sources = sources_by_names(all_sources, page_source_names)
+    queries = build_queries(page_sources, resolved)
     trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
+
+    async with app.state.lock:
+        sql_results = await execute_queries_mcp(app.state.session, queries, label="query")
+    trace_step("10. SQL (MCP)", sql_results)
     trace_step(
-        "10. RESULT",
+        "11. RESULT",
         {
             "page_index": idx,
             "page_name": name,
             "source_names": source_names,
+            "page_source_names": page_source_names,
             "sources": sources,
             "braces": braces,
             "variables": variables,
@@ -836,6 +859,7 @@ async def ask(body: Ask):
             "dialog_results": dialog_results,
             "resolved": resolved,
             "queries": queries,
+            "sql_results": sql_results,
             "catalog": catalog,
             "route": route_raw,
             "sources_route": sources_raw,
@@ -845,20 +869,21 @@ async def ask(body: Ask):
     )
 
     log.info(
-        "ask page=%s index=%s sources=%s braces=%s filters=%s dialog=%s dialog_ok=%s trace=%s",
+        "ask page=%s index=%s sources=%s braces=%s filters=%s dialog=%s sql_ok=%s trace=%s",
         name,
         idx,
         source_names,
         braces,
         [f.get("name") for f in filters],
         dialog_names,
-        [r.get("ok") for r in dialog_results],
+        [r.get("ok") for r in sql_results],
         trace,
     )
     return {
         "page_index": idx,
         "page_name": name,
         "source_names": source_names,
+        "page_source_names": page_source_names,
         "sources": sources,
         "braces": braces,
         "variables": variables,
@@ -867,6 +892,7 @@ async def ask(body: Ask):
         "dialog_results": dialog_results,
         "resolved": resolved,
         "queries": queries,
+        "sql_results": sql_results,
         "catalog": catalog,
         "route": route_raw,
         "sources_route": sources_raw,

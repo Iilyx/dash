@@ -20,12 +20,10 @@ curl -s http://127.0.0.1:8090/ask \
 5. `variable.dialog.source` → ещё sources по name
 6. SQL dialog sources → MCP `execute_sql` → `dialog_results`
 7. LLM resolve фильтров: вопрос → иначе значение из `dialog_results` → иначе default
-8. `queries.sql_filled` с финальным `resolved`
+8. `queries.sql_filled` page sources → MCP `execute_sql` → `sql_results`
 
 Нужны Docker + `DATABASE_URL` или `POSTGRES_*` (см. `.env.example`).
 
-Ответ: `page_index`, `page_name`, `source_names`, `sources`, `braces`, `variables`,
-`filters`, `dialog_source_names`, `dialog_results`, `resolved`, `queries`, `catalog`,
-`route`, `sources_route`, `resolve_route`, `trace`.
+Ответ: … `dialog_results`, `resolved`, `queries`, `sql_results`, `catalog`, `route`, …
 
-`ask_trace.txt`: … → DIALOG SOURCES → DIALOG SQL → RESOLVE → QUERIES → RESULT
+`ask_trace.txt`: … → DIALOG SQL → RESOLVE → QUERIES → SQL (MCP) → RESULT
