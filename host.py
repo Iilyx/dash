@@ -103,35 +103,51 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
 
-DASHBOARD_SYSTEM = """Ты аналитик Stimulsoft-дашборда. SQL уже выполнен хостом.
+DASHBOARD_SYSTEM = """Ты воссоздаёшь Stimulsoft-дашборд ОБРАЗНО по page.elements + данным SQL.
 
 Дано:
 - question — вопрос пользователя
-- page — catalog pages[0]: elements (type/role/title/text/meters/expressions/filters)
-- resolved — значения фильтров / {params}
-- dialog_results — опции фильтров из dialog.source (MCP)
-- sql_results — данные page sources (MCP): [{name, sql_filled, ok, result}]
+- page — pages[0]: elements по порядку (это «холст» дашборда)
+  у каждого: name, type, role, title, text, meters, expressions, filters, data_source…
+- resolved — активные фильтры
+- dialog_results / sql_results — факты из БД (MCP). Числа НЕ выдумывай.
+
+Как читать elements (логика дашборда):
+- role=filter (TreeView/ComboBox/ListBox/DatePicker…) — панель фильтров / навигация
+- StiTextElement — заголовок / подпись
+- StiIndicatorElement — KPI-карточка (одно число)
+- StiGaugeElement — шкала/стрелка (value + зоны 0/33/66/100 если есть)
+- StiChartElement — ряд/категории из expressions/meters
+- StiRegionMapElement / OnlineMap — карта (ключ страны/региона + value)
+- StiTableElement / Pivot / Cards — таблица/карточки
+Порядок elements ≈ порядок блоков на экране сверху вниз / слева направо.
 
 Задача:
-1) По page.elements восстанови логику дашборда: что считает каждый виджет
-   (Indicator / Gauge / Chart / Map / Table / Text / filter TreeView…).
-2) Сопоставь expressions/meters с колонками и агрегатами из sql_results
-   (и при необходимости dialog_results). Числа НЕ выдумывай — только из result.
-3) Ответь на question на языке вопроса, опираясь на виджеты и данные.
-4) Верни ТОЛЬКО JSON:
+1) Пройди ВСЕ elements по порядку — не пропускай.
+2) Для каждого восстанови смысл (logic) из meters/expressions/title/text.
+3) Подставь value только из sql_results / dialog_results (или null).
+4) Собери образную «сцену» дашборда: markdown-картинка доски, как будто смотришь UI.
+5) Кратко ответь на question.
+
+Верни ТОЛЬКО JSON:
 {
-  "answer": "краткий ответ пользователю",
+  "answer": "краткий ответ на языке вопроса",
+  "view": "markdown: образная доска дашборда (фильтры → KPI → gauges → map/chart/table). Используй простые рамки/блоки, без HTML.",
   "dashboard": {
     "page": "alias или name",
-    "filters": {"Name": "value", "...": "..."},
-    "widgets": [
+    "filters_active": {"Name": "value"},
+    "layout": [
       {
+        "zone": "header|filters|kpi|gauges|map|chart|table|text|other",
         "name": "Indicator1",
         "type": "StiIndicatorElement",
+        "role": "viz|filter|element",
         "title": "...",
-        "logic": "Sum(products.UnitPrice) …",
-        "value": "число или текст из sql_results / null",
-        "source": "products"
+        "logic": "Sum(products.UnitPrice)",
+        "value": "… или null",
+        "unit": "опционально",
+        "source": "products",
+        "figurative": "одна фраза-образ: что видно на виджете"
       }
     ]
   }
@@ -895,7 +911,7 @@ def build_queries(
 
 
 def compact_page_for_dashboard(page: dict) -> dict:
-    """Урезанный pages[0] для LLM: виджеты без лишнего шума."""
+    """pages[0] для LLM: вся логика elements (порядок = холст дашборда)."""
     if not isinstance(page, dict):
         return {}
     elements_out: list[dict] = []
@@ -911,9 +927,16 @@ def compact_page_for_dashboard(page: dict) -> dict:
             "text": el.get("text"),
             "meters": el.get("meters"),
             "expressions": el.get("expressions"),
+            "named_expressions": el.get("named_expressions"),
             "filters": el.get("filters"),
+            "user_filters": el.get("user_filters"),
             "data_source": el.get("data_source"),
             "top_n": el.get("top_n"),
+            "selection_mode": el.get("selection_mode"),
+            "show_all_value": el.get("show_all_value"),
+            "interaction": el.get("interaction"),
+            "group": el.get("group"),
+            "parent": el.get("parent"),
         }
         elements_out.append({k: v for k, v in item.items() if v not in (None, "", [], {})})
     out = {
@@ -921,9 +944,62 @@ def compact_page_for_dashboard(page: dict) -> dict:
         "alias": page.get("alias"),
         "type": page.get("type"),
         "is_dashboard": page.get("is_dashboard"),
+        "element_count": len(elements_out),
         "elements": elements_out,
     }
     return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
+def figurative_view_fallback(page: dict, dashboard: dict | None, resolved: dict) -> str:
+    """Локальный markdown-холст, если LLM не вернул view."""
+    page_title = ""
+    if isinstance(dashboard, dict):
+        page_title = str(dashboard.get("page") or "")
+    if not page_title and isinstance(page, dict):
+        page_title = str(page.get("alias") or page.get("name") or "Dashboard")
+
+    lines = [f"# {page_title}", ""]
+    if resolved:
+        filt = ", ".join(f"{k}={v}" for k, v in resolved.items())
+        lines += [f"**Фильтры:** {filt}", ""]
+
+    layout = []
+    if isinstance(dashboard, dict) and isinstance(dashboard.get("layout"), list):
+        layout = dashboard["layout"]
+    elif isinstance(dashboard, dict) and isinstance(dashboard.get("widgets"), list):
+        layout = dashboard["widgets"]
+
+    if layout:
+        for item in layout:
+            if not isinstance(item, dict):
+                continue
+            zone = item.get("zone") or item.get("role") or "widget"
+            title = item.get("title") or item.get("name") or "?"
+            value = item.get("value")
+            figurative = item.get("figurative") or item.get("logic") or ""
+            value_s = "—" if value is None else str(value)
+            lines.append(f"### [{zone}] {title}")
+            lines.append(f"{value_s}")
+            if figurative:
+                lines.append(f"_{figurative}_")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    # нет layout — набросок прямо из page.elements
+    for el in (page.get("elements") if isinstance(page, dict) else None) or []:
+        if not isinstance(el, dict):
+            continue
+        title = el.get("title") or el.get("text") or el.get("name") or "?"
+        typ = el.get("type") or ""
+        role = el.get("role") or ""
+        exprs = el.get("expressions") or []
+        logic = ", ".join(str(x) for x in exprs[:4]) if exprs else ""
+        lines.append(f"### {title}")
+        lines.append(f"`{typ}` · {role}")
+        if logic:
+            lines.append(f"_{logic}_")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def compact_sql_results_for_llm(results: list[dict], *, max_chars: int = 12_000) -> list[dict]:
@@ -953,12 +1029,20 @@ def compact_sql_results_for_llm(results: list[dict], *, max_chars: int = 12_000)
 def parse_dashboard(text: str) -> dict:
     data = parse_json_object(text)
     if not data:
-        return {"answer": text.strip(), "dashboard": None}
+        return {"answer": text.strip(), "dashboard": None, "view": None}
     answer = data.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         answer = text.strip()
     dashboard = data.get("dashboard") if isinstance(data.get("dashboard"), dict) else None
-    return {"answer": answer, "dashboard": dashboard}
+    view = data.get("view")
+    if not isinstance(view, str) or not view.strip():
+        view = None
+    else:
+        view = view.strip()
+    # совместимость: старый widgets → layout
+    if isinstance(dashboard, dict) and not dashboard.get("layout") and isinstance(dashboard.get("widgets"), list):
+        dashboard = {**dashboard, "layout": dashboard.get("widgets")}
+    return {"answer": answer, "dashboard": dashboard, "view": view}
 
 
 @asynccontextmanager
@@ -1236,13 +1320,22 @@ async def ask(body: Ask):
     rendered = parse_dashboard(dashboard_raw)
     answer = rendered.get("answer")
     dashboard = rendered.get("dashboard")
+    view = rendered.get("view") or figurative_view_fallback(
+        page if isinstance(page, dict) else {},
+        dashboard if isinstance(dashboard, dict) else None,
+        resolved,
+    )
+    if isinstance(dashboard, dict):
+        dashboard = {**dashboard, "view": view}
     trace_step("11. LLM DASHBOARD", dashboard_raw)
+    trace_step("11. DASHBOARD VIEW", view)
     trace_step(
         "12. RESULT",
         {
             "page_index": idx,
             "page_name": name,
             "answer": answer,
+            "view": view,
             "dashboard": dashboard,
             "source_names": source_names,
             "page_source_names": page_source_names,
@@ -1269,6 +1362,7 @@ async def ask(body: Ask):
         "page_index": idx,
         "page_name": name,
         "answer": answer,
+        "view": view,
         "dashboard": dashboard,
         "source_names": source_names,
         "page_source_names": page_source_names,
