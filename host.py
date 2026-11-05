@@ -35,6 +35,25 @@ log = logging.getLogger("host")
 BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
 MAX_TOOL_CHARS = 24_000
+INT_RE = re.compile(r"^-?\d+$")
+FLOAT_RE = re.compile(r"^-?\d+[.,]\d+$")
+BOOL_TRUE = {"true", "1", "yes", "y", "on", "t"}
+BOOL_FALSE = {"false", "0", "no", "n", "off", "f"}
+NUMERIC_TYPE_HINTS = (
+    "int",
+    "long",
+    "short",
+    "byte",
+    "decimal",
+    "double",
+    "float",
+    "single",
+    "number",
+    "numeric",
+    "money",
+)
+BOOL_TYPE_HINTS = ("bool", "boolean")
+DATE_TYPE_HINTS = ("date", "time", "datetime", "timestamp")
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
@@ -70,9 +89,12 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
    (когда dialog есть) — используй default (или соответствующий ключ из result).
 3) Иначе variable.value (default), даже без dialog.
 4) Если не фильтр — variable.value или null.
-5) Ничего не выдумывай сверх question, variable.value и dialog_results.
-6) Верни ТОЛЬКО JSON:
-{"resolved": {"Name": "value или null", "...": "..."},
+5) Типы: смотри variable.type (System.Int32 / Decimal / Boolean / DateTime / String).
+   Числа и bool в JSON пиши НАСТОЯЩИМИ типами (1, 3.5, true), не строками "1".
+   Строки и даты — строками.
+6) Ничего не выдумывай сверх question, variable.value и dialog_results.
+7) Верни ТОЛЬКО JSON:
+{"resolved": {"Name": value_or_null, "...": "..."},
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
 
@@ -221,6 +243,7 @@ async def execute_dialog_sources(
     dialog_names: list[str],
     all_sources: list[dict],
     resolved: dict[str, object],
+    types: dict[str, str] | None = None,
 ) -> list[dict]:
     """Найти sources по dialog name и выполнить их SQL через MCP."""
     if not dialog_names:
@@ -228,7 +251,7 @@ async def execute_dialog_sources(
     dialog_sources = sources_by_names(all_sources, dialog_names)
     return await execute_queries_mcp(
         session,
-        build_queries(dialog_sources, resolved),
+        build_queries(dialog_sources, resolved, types),
         label="dialog",
     )
 
@@ -528,56 +551,174 @@ def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: li
     return out, added
 
 
+def variable_types(variables: list[dict]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in variables:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        typ = item.get("type")
+        if isinstance(name, str) and name.strip() and isinstance(typ, str) and typ.strip():
+            out[name.strip().lower()] = typ.strip()
+    return out
+
+
+def type_kind(typ: str | None) -> str:
+    """bool | int | float | date | string."""
+    raw = (typ or "").strip().lower()
+    leaf = raw.rsplit(".", 1)[-1]
+    if any(h in leaf for h in BOOL_TYPE_HINTS) or any(h in raw for h in BOOL_TYPE_HINTS):
+        return "bool"
+    if any(h in leaf for h in DATE_TYPE_HINTS) or any(h in raw for h in DATE_TYPE_HINTS):
+        return "date"
+    if leaf in {"int16", "int32", "int64", "uint16", "uint32", "uint64", "byte", "sbyte"}:
+        return "int"
+    if leaf in {"decimal", "double", "single", "float"}:
+        return "float"
+    if any(h in leaf for h in NUMERIC_TYPE_HINTS) or any(h in raw for h in NUMERIC_TYPE_HINTS):
+        return "float" if any(h in leaf for h in ("decimal", "double", "float", "single", "money")) else "int"
+    return "string"
+
+
+def coerce_value(value: object, typ: str | None = None) -> object:
+    """Привести value к Python-типу по variable.type / эвристике."""
+    if value is None:
+        return None
+    kind = type_kind(typ)
+
+    if isinstance(value, bool) and kind in {"bool", "string"}:
+        return value if kind == "bool" else ("true" if value else "false")
+    if isinstance(value, bool) and kind in {"int", "float"}:
+        return int(value) if kind == "int" else float(value)
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if kind == "bool":
+            return bool(value)
+        if kind == "int":
+            return int(value)
+        if kind == "float":
+            return float(value)
+        if kind == "string":
+            return str(value)
+        return value
+
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text or text.lower() in {"null", "none"}:
+        return None
+
+    if kind == "bool" or (kind == "string" and text.lower() in BOOL_TRUE | BOOL_FALSE):
+        low = text.lower()
+        if low in BOOL_TRUE:
+            return True
+        if low in BOOL_FALSE:
+            return False
+        if kind == "bool":
+            return text
+
+    if kind in {"int", "float"} or (kind == "string" and (INT_RE.fullmatch(text) or FLOAT_RE.fullmatch(text))):
+        if INT_RE.fullmatch(text):
+            number: object = int(text)
+        elif FLOAT_RE.fullmatch(text):
+            number = float(text.replace(",", "."))
+        else:
+            return text
+        if kind == "int":
+            return int(number)  # type: ignore[arg-type]
+        if kind == "float":
+            return float(number)  # type: ignore[arg-type]
+        # string field but numeric text → keep numeric for SQL literal (без кавычек)
+        return number
+
+    return text
+
+
+def sql_literal(value: object, typ: str | None = None) -> str:
+    """SQL-литерал с учётом типа: числа/bool без кавычек, строки/даты в кавычках."""
+    coerced = coerce_value(value, typ)
+    if coerced is None:
+        return "NULL"
+    if isinstance(coerced, bool):
+        return "TRUE" if coerced else "FALSE"
+    if isinstance(coerced, int) and not isinstance(coerced, bool):
+        return str(coerced)
+    if isinstance(coerced, float):
+        return repr(coerced) if coerced != int(coerced) else str(int(coerced))
+    text = str(coerced)
+    # запасной путь: числовая строка без type
+    if INT_RE.fullmatch(text):
+        return text
+    if FLOAT_RE.fullmatch(text):
+        return text.replace(",", ".")
+    kind = type_kind(typ)
+    if kind == "date":
+        return "'" + text.replace("'", "''") + "'"
+    return "'" + text.replace("'", "''") + "'"
+
+
 def default_resolved(variables: list[dict], names: list[str]) -> dict[str, object]:
     by_key = {
         str(v["name"]).strip().lower(): v
         for v in variables
         if isinstance(v.get("name"), str) and str(v["name"]).strip()
     }
+    types = variable_types(variables)
     out: dict[str, object] = {}
     for name in names:
         item = by_key.get(name.lower())
         if item is None:
             out[name] = None
         else:
-            out[name] = item.get("value")
+            out[name] = coerce_value(item.get("value"), types.get(name.lower()))
     return out
 
 
-def parse_resolved(text: str, names: list[str], fallback: dict[str, object]) -> dict[str, object]:
+def parse_resolved(
+    text: str,
+    names: list[str],
+    fallback: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> dict[str, object]:
     data = parse_json_object(text)
     raw = data.get("resolved") if isinstance(data.get("resolved"), dict) else {}
     out: dict[str, object] = dict(fallback)
     by_name = {n.lower(): n for n in names}
+    types = types or {}
     for key, value in raw.items():
         if not isinstance(key, str):
             continue
         canonical = by_name.get(key.strip().lower())
         if not canonical:
             continue
-        out[canonical] = value
+        out[canonical] = coerce_value(value, types.get(canonical.lower()))
     return out
 
 
-def fill_sql(sql: str, resolved: dict[str, object]) -> str:
+def fill_sql(
+    sql: str,
+    resolved: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> str:
     by_key = {k.lower(): v for k, v in resolved.items()}
+    types = types or {}
 
     def repl(match: re.Match[str]) -> str:
-        if match.group(1).lower() not in by_key:
+        name = match.group(1)
+        key = name.lower()
+        if key not in by_key:
             return match.group(0)
-        value = by_key[match.group(1).lower()]
-        if value is None:
-            return "NULL"
-        if isinstance(value, bool):
-            return "TRUE" if value else "FALSE"
-        if isinstance(value, (int, float)):
-            return str(value)
-        return "'" + str(value).replace("'", "''") + "'"
+        return sql_literal(by_key[key], types.get(key))
 
     return BRACE_NAME.sub(repl, sql)
 
 
-def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict]:
+def build_queries(
+    sources: list[dict],
+    resolved: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> list[dict]:
     queries: list[dict] = []
     for source in sources:
         if not isinstance(source, dict):
@@ -588,7 +729,7 @@ def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict
         item = {
             "name": source.get("name"),
             "sql": sql,
-            "sql_filled": fill_sql(sql, resolved),
+            "sql_filled": fill_sql(sql, resolved, types),
         }
         queries.append({k: v for k, v in item.items() if v is not None})
     return queries
@@ -801,6 +942,7 @@ async def ask(body: Ask):
     )
 
     # defaults сначала — чтобы dialog SQL тоже мог подставить {Name}
+    types = variable_types(variables)
     resolved = default_resolved(variables, resolve_names)
 
     # 1) dialog.source SQL → MCP (список опций фильтра)
@@ -810,6 +952,7 @@ async def ask(body: Ask):
             dialog_names=dialog_names,
             all_sources=all_sources,
             resolved=resolved,
+            types=types,
         )
     trace_step("8. DIALOG SQL (MCP)", dialog_results)
 
@@ -824,6 +967,7 @@ async def ask(body: Ask):
             "dialog_source_names": dialog_names,
             "dialog_results": dialog_results,
             "defaults": resolved,
+            "types": types,
         }
         resolve_user = f"Input JSON:\n{json.dumps(resolve_payload, ensure_ascii=False, indent=2)}"
         trace_step("8. PROMPT RESOLVE", {"system": RESOLVE_SYSTEM, "user": resolve_user})
@@ -833,12 +977,12 @@ async def ask(body: Ask):
             raise HTTPException(504, "LLM timeout (resolve)") from exc
         except (httpx.HTTPError, RuntimeError) as exc:
             raise HTTPException(502, str(exc)) from exc
-        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
-        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved})
+        resolved = parse_resolved(resolve_raw, resolve_names, resolved, types)
+        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved, "types": types})
 
     # 3) основной SQL page sources (не dialog) с финальными значениями → MCP
     page_sources = sources_by_names(all_sources, page_source_names)
-    queries = build_queries(page_sources, resolved)
+    queries = build_queries(page_sources, resolved, types)
     trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
 
     async with app.state.lock:
