@@ -35,6 +35,27 @@ log = logging.getLogger("host")
 BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
 MAX_TOOL_CHARS = 24_000
+INT_RE = re.compile(r"^-?\d+$")
+FLOAT_RE = re.compile(r"^-?\d+[.,]\d+$")
+BOOL_TRUE = {"true", "1", "yes", "y", "on", "t"}
+BOOL_FALSE = {"false", "0", "no", "n", "off", "f"}
+NUMERIC_TYPE_HINTS = (
+    "int",
+    "long",
+    "short",
+    "byte",
+    "decimal",
+    "double",
+    "float",
+    "single",
+    "number",
+    "numeric",
+    "money",
+)
+BOOL_TYPE_HINTS = ("bool", "boolean")
+DATE_TYPE_HINTS = ("date", "time", "datetime", "timestamp")
+# Stimulsoft: StringList / List / String[] — список значений для IN ({Var})
+LIST_TYPE_HINTS = ("stringlist", "list", "[]", "ienumerable", "collection")
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
@@ -57,22 +78,23 @@ RESOLVE_SYSTEM = """Задача: подставить значения пере
 Дано:
 - question — вопрос пользователя
 - braces — имена {Name} из SQL sources
-- variables / filters — variables (filters = category Фильтр)
-- dialog_results — уже выполненный SQL dialog.source: [{name, sql_filled, ok, result}, ...]
-  result — строки опций фильтра (ключи/значения из БД)
+- variables / filters — у каждой есть name, type, value, dialog
+- dialog_results — SQL dialog.source: [{name, sql_filled, ok, result}, ...]
 
 Правила приоритета для каждого name из braces и filters:
-1) Если в question есть явное значение фильтра — возьми его.
-   Если у фильтра есть dialog_results: сопоставь вопрос со строками result
-   (по подписи/имени/ключу) и подставь реальное значение из result
-   (обычно ключ / id / код колонки keys_column, не выдуманный текст).
-2) Иначе если подходит default variable.value — и он есть в dialog_results
-   (когда dialog есть) — используй default (или соответствующий ключ из result).
-3) Иначе variable.value (default), даже без dialog.
+1) Тип = variable.type (System.Int32 / Decimal / Boolean / DateTime / String /
+   StringList / List / String[]). Соблюдай тип в JSON:
+   - числа и bool: 1, 3.5, true (не строки "1")
+   - строки/даты: "..."
+   - StringList / List: JSON-массив ["a","b"] или числовой [1,2]
+2) Если в question есть значение — возьми его.
+   При dialog_results: сопоставь со строками result и подставь ключ/id
+   (keys_column), не выдуманный текст. Для списка — несколько ключей.
+3) Иначе default variable.value (если есть в dialog — согласуй с result).
 4) Если не фильтр — variable.value или null.
 5) Ничего не выдумывай сверх question, variable.value и dialog_results.
 6) Верни ТОЛЬКО JSON:
-{"resolved": {"Name": "value или null", "...": "..."},
+{"resolved": {"Name": value_or_null_or_array, "...": "..."},
  "from": {"Name": "question"|"dialog"|"default"|"none", "...": "..."}}
 """
 
@@ -221,6 +243,7 @@ async def execute_dialog_sources(
     dialog_names: list[str],
     all_sources: list[dict],
     resolved: dict[str, object],
+    types: dict[str, str] | None = None,
 ) -> list[dict]:
     """Найти sources по dialog name и выполнить их SQL через MCP."""
     if not dialog_names:
@@ -228,7 +251,7 @@ async def execute_dialog_sources(
     dialog_sources = sources_by_names(all_sources, dialog_names)
     return await execute_queries_mcp(
         session,
-        build_queries(dialog_sources, resolved),
+        build_queries(dialog_sources, resolved, types),
         label="dialog",
     )
 
@@ -528,56 +551,260 @@ def merge_sources(existing: list[dict], all_sources: list[dict], extra_names: li
     return out, added
 
 
+def variable_types(variables: list[dict]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in variables:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        typ = item.get("type")
+        if isinstance(name, str) and name.strip() and isinstance(typ, str) and typ.strip():
+            out[name.strip().lower()] = typ.strip()
+    return out
+
+
+def is_list_type(typ: str | None) -> bool:
+    raw = (typ or "").strip().lower().replace("`", "")
+    if not raw:
+        return False
+    leaf = raw.rsplit(".", 1)[-1]
+    if "stringlist" in raw or "stringlist" in leaf:
+        return True
+    if leaf.endswith("[]") or "[]" in leaf:
+        return True
+    return any(h in leaf or h in raw for h in LIST_TYPE_HINTS if h != "[]")
+
+
+def list_element_kind(typ: str | None) -> str | None:
+    """Для StringList → string; Int32[] → int; голый List → None (тип из значения)."""
+    raw = (typ or "").strip().lower().replace("`", "")
+    leaf = raw.rsplit(".", 1)[-1]
+    if "stringlist" in raw or "stringlist" in leaf:
+        return "string"
+    if "string" in raw and ("list" in raw or "[]" in raw):
+        return "string"
+    if any(h in raw for h in BOOL_TYPE_HINTS):
+        return "bool"
+    if any(h in raw for h in DATE_TYPE_HINTS):
+        return "date"
+    if any(h in raw for h in ("decimal", "double", "float", "single", "money")):
+        return "float"
+    if any(h in raw for h in ("int", "long", "short", "byte", "uint", "number", "numeric")):
+        return "int"
+    if leaf in {"list", "ilist", "collection"} or raw in {"list", "ilist", "collection"}:
+        return None
+    return "string"
+
+
+def type_kind(typ: str | None) -> str:
+    """bool | int | float | date | string | list."""
+    if is_list_type(typ):
+        return "list"
+    raw = (typ or "").strip().lower()
+    leaf = raw.rsplit(".", 1)[-1]
+    if any(h in leaf for h in BOOL_TYPE_HINTS) or any(h in raw for h in BOOL_TYPE_HINTS):
+        return "bool"
+    if any(h in leaf for h in DATE_TYPE_HINTS) or any(h in raw for h in DATE_TYPE_HINTS):
+        return "date"
+    if leaf in {"int16", "int32", "int64", "uint16", "uint32", "uint64", "byte", "sbyte"}:
+        return "int"
+    if leaf in {"decimal", "double", "single", "float"}:
+        return "float"
+    if any(h in leaf for h in NUMERIC_TYPE_HINTS) or any(h in raw for h in NUMERIC_TYPE_HINTS):
+        return "float" if any(h in leaf for h in ("decimal", "double", "float", "single", "money")) else "int"
+    return "string"
+
+
+def _split_list_text(text: str) -> list[str]:
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except json.JSONDecodeError:
+            pass
+    parts = re.split(r"[,;|]", text)
+    return [p.strip().strip("'\"") for p in parts if p.strip().strip("'\"")]
+
+
+def coerce_value(value: object, typ: str | None = None) -> object:
+    """Привести value к Python-типу по variable.type (в т.ч. StringList)."""
+    if value is None:
+        return None
+    kind = type_kind(typ)
+
+    if kind == "list":
+        elem = list_element_kind(typ)
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            items = _split_list_text(value)
+        else:
+            items = [value]
+        out_list: list[object] = []
+        for item in items:
+            item_typ = elem if elem is not None else (
+                "int" if isinstance(item, int) and not isinstance(item, bool)
+                else "float" if isinstance(item, float)
+                else "bool" if isinstance(item, bool)
+                else "string"
+            )
+            coerced = coerce_value(item, item_typ)
+            if coerced is not None:
+                out_list.append(coerced)
+        return out_list
+
+    if isinstance(value, bool) and kind in {"bool", "string"}:
+        return value if kind == "bool" else ("true" if value else "false")
+    if isinstance(value, bool) and kind in {"int", "float"}:
+        return int(value) if kind == "int" else float(value)
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if kind == "bool":
+            return bool(value)
+        if kind == "int":
+            return int(value)
+        if kind == "float":
+            return float(value)
+        if kind == "string":
+            return str(value)
+        return value
+
+    if isinstance(value, list):
+        # LLM вернул массив, а type не list — возьмём первый / склеим
+        if not value:
+            return None
+        if kind == "string":
+            return ",".join(str(x) for x in value)
+        return coerce_value(value[0], typ)
+
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text or text.lower() in {"null", "none"}:
+        return None
+
+    if kind == "bool":
+        low = text.lower()
+        if low in BOOL_TRUE:
+            return True
+        if low in BOOL_FALSE:
+            return False
+        return text
+
+    if kind in {"int", "float"}:
+        if INT_RE.fullmatch(text):
+            number: object = int(text)
+        elif FLOAT_RE.fullmatch(text):
+            number = float(text.replace(",", "."))
+        else:
+            return text
+        return int(number) if kind == "int" else float(number)  # type: ignore[arg-type]
+
+    # string / date — не трогаем "y"/"n" как bool; числа оставляем строкой
+    return text
+
+
+def sql_literal(value: object, typ: str | None = None) -> str:
+    """SQL-литерал по типу: {Var} → значение; StringList → 'a','b' для IN (...)."""
+    coerced = coerce_value(value, typ)
+    if coerced is None:
+        return "NULL"
+    if isinstance(coerced, list):
+        if not coerced:
+            return "NULL"
+        elem_typ = list_element_kind(typ)
+        parts: list[str] = []
+        for item in coerced:
+            item_typ = elem_typ
+            if item_typ is None:
+                if isinstance(item, bool):
+                    item_typ = "bool"
+                elif isinstance(item, int):
+                    item_typ = "int"
+                elif isinstance(item, float):
+                    item_typ = "float"
+                else:
+                    item_typ = "string"
+            parts.append(sql_literal(item, item_typ))
+        return ",".join(parts)
+    if isinstance(coerced, bool):
+        return "TRUE" if coerced else "FALSE"
+    if isinstance(coerced, int) and not isinstance(coerced, bool):
+        return str(coerced)
+    if isinstance(coerced, float):
+        return repr(coerced) if coerced != int(coerced) else str(int(coerced))
+    text = str(coerced)
+    if INT_RE.fullmatch(text):
+        return text
+    if FLOAT_RE.fullmatch(text):
+        return text.replace(",", ".")
+    return "'" + text.replace("'", "''") + "'"
+
+
 def default_resolved(variables: list[dict], names: list[str]) -> dict[str, object]:
     by_key = {
         str(v["name"]).strip().lower(): v
         for v in variables
         if isinstance(v.get("name"), str) and str(v["name"]).strip()
     }
+    types = variable_types(variables)
     out: dict[str, object] = {}
     for name in names:
         item = by_key.get(name.lower())
         if item is None:
             out[name] = None
         else:
-            out[name] = item.get("value")
+            out[name] = coerce_value(item.get("value"), types.get(name.lower()))
     return out
 
 
-def parse_resolved(text: str, names: list[str], fallback: dict[str, object]) -> dict[str, object]:
+def parse_resolved(
+    text: str,
+    names: list[str],
+    fallback: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> dict[str, object]:
     data = parse_json_object(text)
     raw = data.get("resolved") if isinstance(data.get("resolved"), dict) else {}
     out: dict[str, object] = dict(fallback)
     by_name = {n.lower(): n for n in names}
+    types = types or {}
     for key, value in raw.items():
         if not isinstance(key, str):
             continue
         canonical = by_name.get(key.strip().lower())
         if not canonical:
             continue
-        out[canonical] = value
+        out[canonical] = coerce_value(value, types.get(canonical.lower()))
     return out
 
 
-def fill_sql(sql: str, resolved: dict[str, object]) -> str:
+def fill_sql(
+    sql: str,
+    resolved: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> str:
     by_key = {k.lower(): v for k, v in resolved.items()}
+    types = types or {}
 
     def repl(match: re.Match[str]) -> str:
-        if match.group(1).lower() not in by_key:
+        name = match.group(1)
+        key = name.lower()
+        if key not in by_key:
             return match.group(0)
-        value = by_key[match.group(1).lower()]
-        if value is None:
-            return "NULL"
-        if isinstance(value, bool):
-            return "TRUE" if value else "FALSE"
-        if isinstance(value, (int, float)):
-            return str(value)
-        return "'" + str(value).replace("'", "''") + "'"
+        return sql_literal(by_key[key], types.get(key))
 
     return BRACE_NAME.sub(repl, sql)
 
 
-def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict]:
+def build_queries(
+    sources: list[dict],
+    resolved: dict[str, object],
+    types: dict[str, str] | None = None,
+) -> list[dict]:
     queries: list[dict] = []
     for source in sources:
         if not isinstance(source, dict):
@@ -588,7 +815,7 @@ def build_queries(sources: list[dict], resolved: dict[str, object]) -> list[dict
         item = {
             "name": source.get("name"),
             "sql": sql,
-            "sql_filled": fill_sql(sql, resolved),
+            "sql_filled": fill_sql(sql, resolved, types),
         }
         queries.append({k: v for k, v in item.items() if v is not None})
     return queries
@@ -800,7 +1027,8 @@ async def ask(body: Ask):
         },
     )
 
-    # defaults сначала — чтобы dialog SQL тоже мог подставить {Name}
+    # defaults сначала — чтобы dialog SQL тоже мог подставить {Name} с учётом type
+    types = variable_types(variables)
     resolved = default_resolved(variables, resolve_names)
 
     # 1) dialog.source SQL → MCP (список опций фильтра)
@@ -810,10 +1038,11 @@ async def ask(body: Ask):
             dialog_names=dialog_names,
             all_sources=all_sources,
             resolved=resolved,
+            types=types,
         )
     trace_step("8. DIALOG SQL (MCP)", dialog_results)
 
-    # 2) LLM: вопрос / default / значение из dialog_results
+    # 2) LLM: вопрос / default / dialog_results + type
     resolve_raw = ""
     if filters or braces:
         resolve_payload = {
@@ -821,6 +1050,7 @@ async def ask(body: Ask):
             "braces": braces,
             "variables": variables,
             "filters": filters,
+            "types": types,
             "dialog_source_names": dialog_names,
             "dialog_results": dialog_results,
             "defaults": resolved,
@@ -833,13 +1063,13 @@ async def ask(body: Ask):
             raise HTTPException(504, "LLM timeout (resolve)") from exc
         except (httpx.HTTPError, RuntimeError) as exc:
             raise HTTPException(502, str(exc)) from exc
-        resolved = parse_resolved(resolve_raw, resolve_names, resolved)
-        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved})
+        resolved = parse_resolved(resolve_raw, resolve_names, resolved, types)
+        trace_step("9. LLM RESOLVE", {"raw": resolve_raw, "resolved": resolved, "types": types})
 
-    # 3) основной SQL page sources (не dialog) с финальными значениями → MCP
+    # 3) основной SQL page sources: {Name} → литерал по type → MCP
     page_sources = sources_by_names(all_sources, page_source_names)
-    queries = build_queries(page_sources, resolved)
-    trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
+    queries = build_queries(page_sources, resolved, types)
+    trace_step("9. RESOLVED + QUERIES", {"resolved": resolved, "types": types, "queries": queries})
 
     async with app.state.lock:
         sql_results = await execute_queries_mcp(app.state.session, queries, label="query")
