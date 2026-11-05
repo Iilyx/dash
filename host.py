@@ -4,20 +4,26 @@
 2) LLM ← pages: name из sources
 3) SQL sources → {Name} → variables; variable.dialog.source → ещё sources
 4) Фильтр ← вопрос / default → sql_filled
+5) SQL dialog.source → MCP execute_sql → dialog_results
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, Field
 
 from extract_mrt import catalog_from_report, load_mrt, write_page_packs
@@ -27,6 +33,7 @@ log = logging.getLogger("host")
 
 BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 FILTER_CATEGORIES = {"фильтр", "фильтры", "filter", "filters"}
+MAX_TOOL_CHARS = 24_000
 
 ROUTE_SYSTEM = 'Выбери ОДНУ page. Верни ТОЛЬКО JSON: {"pages":[<index>]}'
 
@@ -91,6 +98,121 @@ def path_of(raw: str) -> Path:
 def llm_url() -> str:
     base = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
     return base if base.endswith("/v1") else f"{base}/v1"
+
+
+def database_url() -> str:
+    configured = os.environ.get("DATABASE_URL", "").strip()
+    if configured:
+        return configured
+    user = os.environ.get("POSTGRES_USER", "").strip()
+    password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+    db = os.environ.get("POSTGRES_DB", "").strip()
+    port = os.environ.get("POSTGRES_PORT", "5432").strip() or "5432"
+    host = os.environ.get("POSTGRES_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if user and password and db:
+        return f"postgresql://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{db}"
+    return ""
+
+
+def redact_url(url: str) -> str:
+    return re.sub(r":([^:@/]+)@", r":***@", url)
+
+
+def mcp_database_uri() -> str:
+    url = database_url()
+    for host in ("127.0.0.1", "localhost"):
+        url = url.replace(f"@{host}:", "@host.docker.internal:")
+        url = url.replace(f"//{host}:", "//host.docker.internal:")
+    return url
+
+
+def postgres_mcp() -> StdioServerParameters:
+    docker = shutil.which("docker")
+    if docker is None:
+        raise RuntimeError("Нужен Docker для crystaldba/postgres-mcp")
+    if not database_url():
+        raise RuntimeError("Нужны DATABASE_URL или POSTGRES_USER/PASSWORD/DB")
+    uri = mcp_database_uri()
+    log.info("MCP: crystaldba/postgres-mcp restricted uri=%s", redact_url(uri))
+    return StdioServerParameters(
+        command=docker,
+        args=[
+            "run",
+            "-i",
+            "--rm",
+            "-e",
+            f"DATABASE_URI={uri}",
+            "crystaldba/postgres-mcp",
+            "--access-mode=restricted",
+        ],
+    )
+
+
+def render_tool_result(result) -> str:
+    parts: list[str] = []
+    for block in result.content or []:
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            text = block.get("text")
+        if text:
+            parts.append(text)
+    body = "\n".join(parts) if parts else str(result)
+    if getattr(result, "is_error", False):
+        body = f"SQL error: {body}"
+    if len(body) > MAX_TOOL_CHARS:
+        body = body[:MAX_TOOL_CHARS] + "\n...truncated"
+    return body
+
+
+async def mcp_execute_sql(session: ClientSession, sql: str) -> dict:
+    last_error = ""
+    for key in ("sql", "query"):
+        try:
+            result = await session.call_tool("execute_sql", {key: sql})
+            body = render_tool_result(result)
+            ok = not getattr(result, "is_error", False) and not body.startswith("SQL error:")
+            return {"ok": ok, "sql": sql, "result": body, "arg": key}
+        except Exception as exc:
+            last_error = str(exc)
+            log.warning("execute_sql arg=%s failed: %s", key, exc)
+    return {"ok": False, "sql": sql, "result": f"SQL error: {last_error}", "arg": None}
+
+
+async def execute_dialog_sources(
+    session: ClientSession | None,
+    *,
+    dialog_names: list[str],
+    all_sources: list[dict],
+    resolved: dict[str, object],
+) -> list[dict]:
+    """Найти sources по dialog name и выполнить их SQL через MCP."""
+    if not dialog_names:
+        return []
+    if session is None:
+        raise HTTPException(503, "MCP Postgres не запущен (нужны DATABASE_URL/POSTGRES_* + Docker)")
+    dialog_sources = sources_by_names(all_sources, dialog_names)
+    queries = build_queries(dialog_sources, resolved)
+    results: list[dict] = []
+    for item in queries:
+        sql = str(item.get("sql_filled") or item.get("sql") or "").strip()
+        name = item.get("name") or "dialog"
+        if not sql:
+            results.append(
+                {"name": name, "sql": item.get("sql"), "sql_filled": None, "ok": False, "result": "empty sql"}
+            )
+            continue
+        log.info("MCP dialog source=%s sql=%s", name, sql[:200])
+        executed = await mcp_execute_sql(session, sql)
+        results.append(
+            {
+                "name": name,
+                "sql": item.get("sql"),
+                "sql_filled": sql,
+                "ok": executed.get("ok"),
+                "result": executed.get("result"),
+            }
+        )
+    return results
 
 
 def ensure_catalog() -> None:
@@ -464,6 +586,7 @@ async def lifespan(app: FastAPI):
     key = os.environ.get("LLM_API_KEY", "").strip()
     if key:
         headers["Authorization"] = f"Bearer {key}"
+
     async with httpx.AsyncClient(
         base_url=llm_url(),
         headers=headers,
@@ -472,7 +595,28 @@ async def lifespan(app: FastAPI):
         app.state.llm = client
         app.state.model = model
         app.state.cards = page_cards()
-        log.info("Ready pages=%s", [(c["index"], c["page"]) for c in app.state.cards])
+        app.state.lock = asyncio.Lock()
+        app.state.session = None
+        app.state.tools = []
+
+        if database_url():
+            params = postgres_mcp()
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    app.state.session = session
+                    app.state.tools = [t.name for t in listed.tools]
+                    log.info(
+                        "Ready pages=%s mcp=%s db=%s",
+                        [(c["index"], c["page"]) for c in app.state.cards],
+                        app.state.tools,
+                        redact_url(database_url()),
+                    )
+                    yield
+                    return
+
+        log.info("Ready pages=%s (MCP off — нет DATABASE_URL/POSTGRES_*)", [(c["index"], c["page"]) for c in app.state.cards])
         yield
 
 
@@ -483,7 +627,13 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": app.state.model, "pages": app.state.cards}
+    return {
+        "ok": True,
+        "model": app.state.model,
+        "pages": app.state.cards,
+        "db": redact_url(database_url()) if database_url() else None,
+        "mcp_tools": getattr(app.state, "tools", []),
+    }
 
 
 def trace_path() -> Path:
@@ -654,8 +804,18 @@ async def ask(body: Ask):
 
     queries = build_queries(sources, resolved)
     trace_step("8. RESOLVED + QUERIES", {"resolved": resolved, "queries": queries})
+
+    # dialog.source SQL → MCP execute_sql
+    async with app.state.lock:
+        dialog_results = await execute_dialog_sources(
+            app.state.session,
+            dialog_names=dialog_names,
+            all_sources=all_sources,
+            resolved=resolved,
+        )
+    trace_step("9. DIALOG SQL (MCP)", dialog_results)
     trace_step(
-        "9. RESULT",
+        "10. RESULT",
         {
             "page_index": idx,
             "page_name": name,
@@ -665,6 +825,7 @@ async def ask(body: Ask):
             "variables": variables,
             "filters": filters,
             "dialog_source_names": dialog_names,
+            "dialog_results": dialog_results,
             "resolved": resolved,
             "queries": queries,
             "catalog": catalog,
@@ -676,13 +837,14 @@ async def ask(body: Ask):
     )
 
     log.info(
-        "ask page=%s index=%s sources=%s braces=%s filters=%s dialog=%s trace=%s",
+        "ask page=%s index=%s sources=%s braces=%s filters=%s dialog=%s dialog_ok=%s trace=%s",
         name,
         idx,
         source_names,
         braces,
         [f.get("name") for f in filters],
         dialog_names,
+        [r.get("ok") for r in dialog_results],
         trace,
     )
     return {
@@ -694,6 +856,7 @@ async def ask(body: Ask):
         "variables": variables,
         "filters": filters,
         "dialog_source_names": dialog_names,
+        "dialog_results": dialog_results,
         "resolved": resolved,
         "queries": queries,
         "catalog": catalog,
@@ -708,6 +871,8 @@ def main() -> None:
     load_env()
     if not os.environ.get("LLM_MODEL", "").strip():
         raise SystemExit("Задай LLM_MODEL в .env")
+    if not database_url():
+        log.warning("DATABASE_URL/POSTGRES_* не заданы — dialog SQL через MCP будет недоступен")
     uvicorn.run("host:app", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8090")))
 
 
