@@ -251,16 +251,27 @@ _OPENED_REPORT_JS = f"""
   try {{
     var dict = r.dictionary;
     var vars = dict && dict.variables;
-    if (!vars) return;
-    var count = vars.count || 0;
-    for (var i = 0; i < count; i++) {{
-      var v = vars.getByIndex ? vars.getByIndex(i) : null;
-      if (!v && vars.list) v = vars.list[i];
-      if (!v) continue;
-      // в 2026.x showOnParametersPanel ↔ requestFromUser
-      if (v.requestFromUser || v.showOnParametersPanel) {{
-        v.requestFromUser = true;
-        v.showOnParametersPanel = true;
+    if (vars) {{
+      var count = vars.count || 0;
+      for (var i = 0; i < count; i++) {{
+        var v = vars.getByIndex ? vars.getByIndex(i) : null;
+        if (!v && vars.list) v = vars.list[i];
+        if (!v) continue;
+        // в 2026.x showOnParametersPanel ↔ requestFromUser
+        if (v.requestFromUser || v.showOnParametersPanel) {{
+          v.requestFromUser = true;
+          v.showOnParametersPanel = true;
+        }}
+      }}
+    }}
+    // SQL DataSources — подключаться при открытии
+    var dss = dict && dict.dataSources;
+    if (dss) {{
+      var n = dss.count || 0;
+      for (var j = 0; j < n; j++) {{
+        var ds = dss.getByIndex ? dss.getByIndex(j) : (dss.list && dss.list[j]);
+        if (!ds) continue;
+        try {{ ds.connectOnStart = true; }} catch (e6) {{}}
       }}
     }}
   }} catch (e3) {{}}
@@ -720,6 +731,18 @@ def dashboard_debug(path: Path) -> dict:
         for v in variables
         if v.get("request_from_user") and v.get("show_on_parameters_panel") is not False
     ]
+    databases = catalog.get("databases") or []
+    sources = catalog.get("sources") or []
+    sql_sources = [
+        s
+        for s in sources
+        if isinstance(s, dict)
+        and (
+            str(s.get("type") or "").lower().find("sql") >= 0
+            or s.get("sql")
+            or s.get("database")
+        )
+    ]
     return {
         "ok": True,
         "path": str(path.resolve()),
@@ -731,6 +754,12 @@ def dashboard_debug(path: Path) -> dict:
         "show_on_parameters_panel_count": len(panel_vars),
         "all_variables_count": len(variables),
         "variables": variables,
+        "databases": databases,
+        "databases_count": len(databases),
+        "data_sources": sources,
+        "data_sources_count": len(sources),
+        "sql_sources": sql_sources,
+        "sql_sources_count": len(sql_sources),
         "filter_elements_on_canvas": filter_elements,
         "filter_elements_count": len(filter_elements),
         "hint": (
@@ -746,6 +775,10 @@ def dashboard_debug(path: Path) -> dict:
         "note_show_on_parameters_panel": (
             "Панель сверху = Panel. У DialogInfo → SelectionMode=First (без Value=0/*). "
             "Списки Keys/Values грузит Columns SQL. Пустые SQL-параметры смягчаем отдельно."
+        ),
+        "note_data_sources": (
+            "SQL DataSources ходят в Postgres через onBeginProcessData (viewer+report). "
+            "Нужны POSTGRES_* в .env и ConnectOnStart у источников."
         ),
     }
 
@@ -831,6 +864,36 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         meta["parameter_width"] = report.get("ParameterWidth")
 
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+
+    # DataSources: ConnectOnStart=true, чтобы dashboard реально ходил в SQL
+    connect_forced = 0
+    for source in numbered(dictionary.get("DataSources")):
+        if not isinstance(source, dict):
+            continue
+        ident = str(source.get("Ident") or "")
+        # SqlCommand может быть ключом даже с пустым телом (обезличка)
+        has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery"))
+        has_sql = bool(
+            source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery")
+        )
+        is_sql = (
+            "Sql" in ident
+            or has_sql
+            or has_sql_key
+            or bool(source.get("NameInSource"))
+            or bool(source.get("Connection"))
+        )
+        if not is_sql:
+            continue
+        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            connect_forced += 1
+            changed = True
+        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            connect_forced += 1
+            changed = True
+    meta["connect_on_start_forced"] = connect_forced
     rfu_forced = 0
     show_forced = 0
     columns_softened = 0
@@ -930,22 +993,25 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Connection string из .env (всегда); пустые params → дефолт/TRUE, никогда ''."""
+    """Подмена connection string для ВСЕХ SQL DataSources из .mrt; пустые params → не ''."""
     src = args.dataSource or "?"
+    connection = args.connection or "?"
+    command = getattr(args.command, "value", args.command)
     # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
     if PG_CONN:
         was = args.connectionString
         args.connectionString = PG_CONN
         print(
-            f"[viewer] DB force conn source={src} "
-            f"was={mask_pg_conn(was or '')!r} now={mask_pg_conn(PG_CONN)!r} "
+            f"[viewer] DB force connection={connection!r} source={src!r} "
+            f"command={command!r} was={mask_pg_conn(was or '')!r} "
+            f"now={mask_pg_conn(PG_CONN)!r} "
             f"database={getattr(args.database, 'value', args.database)!r}",
             flush=True,
         )
     else:
         print(
-            f"[viewer] DB MISSING .env — source={src} "
-            f"conn={mask_pg_conn(args.connectionString or '')!r}",
+            f"[viewer] DB MISSING .env — connection={connection!r} source={src!r} "
+            f"command={command!r} conn={mask_pg_conn(args.connectionString or '')!r}",
             flush=True,
         )
 
@@ -1061,6 +1127,7 @@ def viewer():
     sti.javascript.appendHead(_AFTER_INIT_HEAD)
     sti.onAfterInitialize += "__stiAfterInit"
     sti.onPrepareVariables += prepare_variables
+    # SQL DataSources: событие и на viewer, и на report (доки Stimulsoft)
     sti.onBeginProcessData += begin_process_data
     # после открытия .mrt — Panel + RequestParameters (полоса Submit)
     sti.onOpenedReport += _OPENED_REPORT_JS
@@ -1070,6 +1137,8 @@ def viewer():
 
     report = StiReport()
     report.onBeforeRender += _OPENED_REPORT_JS
+    report.onBeginProcessData += begin_process_data
+    report.onPrepareVariables += prepare_variables
     report.loadFile(url_for("serve_mrt", _external=True))
     sti.report = report
     return sti.getFrameworkResponse()
@@ -1086,6 +1155,19 @@ def main() -> None:
     print(f"RFU:     {info.get('request_from_user_count')} variables")
     print(f"panel:   {info.get('show_on_parameters_panel_count')} ShowOnParametersPanel")
     print(f"filters: {info.get('filter_elements_count')} canvas elements")
+    print(
+        f"sources: {info.get('data_sources_count')} "
+        f"(sql={info.get('sql_sources_count')}) "
+        f"db={info.get('databases_count')}"
+    )
+    if info.get("sql_sources"):
+        print(
+            "sql:",
+            [
+                f"{s.get('name')}→{s.get('database') or '?'}"
+                for s in info["sql_sources"][:12]
+            ],
+        )
     if info.get("show_on_parameters_panel_variables"):
         print(
             "panel names:",
