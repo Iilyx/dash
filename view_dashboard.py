@@ -166,9 +166,9 @@ PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else
 _sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
 SQL_LOG_PATH = path_of(_sql_log_raw)
 
-# RequestParameters=true → dashboard SQL только после Submit (не на init).
-# По умолчанию 1: без пустых фильтров на старте / interaction не стреляет зря.
-FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
+# RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
+# По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
+FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -547,81 +547,21 @@ def variable_has_dialog_list(variable: dict) -> bool:
     return init in {"columns", "items", "1"}
 
 
-def _datafilter_expression_defaults(report: dict) -> dict[str, str]:
-    """DataFilters: Value=\"{Patient}\", Value2=\"0\", IsExpression → Patient→0.
-
-    Drill-down/expression `{argument}` / `{Var}` при пустом Var должен брать Value2,
-    а не наш placeholder '_'.
-    """
-    out: dict[str, str] = {}
-
-    def walk(node: object) -> None:
-        if isinstance(node, dict):
-            filters = node.get("DataFilters")
-            if filters is not None:
-                for item in numbered(filters):
-                    if not isinstance(item, dict):
-                        continue
-                    val = str(item.get("Value") or "").strip()
-                    val2 = item.get("Value2")
-                    if val2 is None or val2 == "":
-                        continue
-                    m = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", val)
-                    if not m:
-                        continue
-                    # IsExpression или просто {Var}
-                    name = m.group(1)
-                    if name not in out:
-                        out[name] = str(val2)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(report)
-    return out
-
-
-# кэш Value2 из DataFilters текущего MRT
-_FILTER_EXPR_DEFAULTS: dict[str, str] | None = None
-
-
-def _filter_expr_defaults() -> dict[str, str]:
-    global _FILTER_EXPR_DEFAULTS
-    if _FILTER_EXPR_DEFAULTS is not None:
-        return _FILTER_EXPR_DEFAULTS
-    try:
-        _FILTER_EXPR_DEFAULTS = _datafilter_expression_defaults(load_mrt(MRT_PATH))
-    except Exception:
-        _FILTER_EXPR_DEFAULTS = {}
-    return _FILTER_EXPR_DEFAULTS
-
-
 def default_value_for_variable(variable: dict) -> str | None:
-    """Дефолт вместо ''. None = не ставить Value (DialogInfo выберет First).
-
-    Важно: DataFilters Value=\"{Patient}\" + Value2=\"0\" — пока DialogInfo
-    не подтянул First, пустой Patient даёт NameID='' → integer \"\".
-    Поэтому Value2 из expression-фильтров важнее DialogInfo.
-    """
+    """Дефолт вместо ''. None = не ставить Value (DialogInfo сам выберет First)."""
+    if variable_has_dialog_list(variable):
+        return None
     typ = str(variable.get("Type") or "")
     name = str(variable.get("Name") or "")
     t = typ.lower()
-    # expression / drill-down {Name} → Value2 (часто "0" для int Path)
-    expr_defaults = _filter_expr_defaults()
-    if name in expr_defaults:
-        return expr_defaults[name]
-    if variable_has_dialog_list(variable):
-        return None
     if "bool" in t:
         return "False"
     if "datetime" in t or t.endswith(".date") or t == "date":
         return "Today"
     if _type_looks_numeric(typ, name):
         return "0"
-    # НЕ '_': ломает {Var}→integer Path
-    return None
+    # без DialogInfo строковый placeholder; '' нельзя (PG int "")
+    return "0" if _type_looks_numeric(typ, name) else "_"
 
 
 def dashboard_debug(path: Path) -> dict:
@@ -875,18 +815,18 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
             columns_softened += 1
             changed = True
         if variable_has_dialog_list(variable):
+            # как в Stimulsoft-сэмплах: SelectionMode=First, без Value=0/*
             if variable.get("SelectionMode") not in ("First", "first", 1, "1"):
                 variable["SelectionMode"] = "First"
                 changed = True
-        if _is_empty(variable.get("Value")):
-            # Value2 из {Var} expression важнее пустого First (иначе int "")
+            if "Value" in variable and _is_empty(variable.get("Value")):
+                del variable["Value"]
+                defaults_set += 1
+                changed = True
+        elif _is_empty(variable.get("Value")):
             default = default_value_for_variable(variable)
             if default is not None:
                 variable["Value"] = default
-                defaults_set += 1
-                changed = True
-            elif variable_has_dialog_list(variable) and "Value" in variable:
-                del variable["Value"]
                 defaults_set += 1
                 changed = True
     meta["panel_candidates"] = candidates
@@ -932,15 +872,11 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         if not empty:
             selected[str(name)] = var.value
             continue
-        fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
-        # DialogInfo First — только если нет Value2 из expression DataFilters
-        default = default_value_for_variable(fake)
-        if default is None and name in dialog_list_names:
+        if name in dialog_list_names:
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
             continue
-        if default is None:
-            print(f"[viewer]   var {name}: empty → leave", flush=True)
-            continue
+        fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
+        default = default_value_for_variable(fake) or "0"
         if _type_looks_numeric(vtype, name) and "list" not in vtype.lower():
             try:
                 var.value = int(default)
@@ -949,7 +885,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         else:
             var.value = default
         selected[str(name)] = var.value
-        print(f"[viewer]   var {name}: empty → {var.value!r} (expr/Value2)", flush=True)
+        print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
 
     LAST_VARIABLES = selected
     _sql_log_add({"phase": "parameters", "params": selected})
@@ -1342,15 +1278,10 @@ def end_process_data(args: StiDataEventArgs) -> None:
 @app.get("/mrt")
 def serve_mrt():
     """Отдать .mrt с патчем панели фильтров."""
-    global _FILTER_EXPR_DEFAULTS
-    _FILTER_EXPR_DEFAULTS = None  # перечитать Value2 из DataFilters
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
     try:
-        report = json.loads(patched)
-        _refresh_sql_templates(report)
-        _FILTER_EXPR_DEFAULTS = _datafilter_expression_defaults(report)
-        meta["filter_expr_defaults"] = dict(_FILTER_EXPR_DEFAULTS)
+        _refresh_sql_templates(json.loads(patched))
     except Exception:
         _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
