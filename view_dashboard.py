@@ -1025,71 +1025,53 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
 
 
 def _format_sql_log_block(entry: dict) -> str:
-    """Человекочитаемый блок для sql_trace.txt."""
+    """Короткий лог: Шаг 1 / Шаг 2 / Шаг 3."""
     ts = entry.get("ts") or ""
     phase = entry.get("phase") or ""
-    step = entry.get("step") or ""
-    lines = [f"======== {ts} {step} {phase} ========"]
+    lines: list[str] = []
     if phase == "parameters":
-        lines.append("[1/3 PARAMETERS] выбранные с панели:")
+        lines.append(f"===== {ts} =====")
+        lines.append("Шаг 1. Параметры")
         selected = entry.get("selected") or {}
         if not selected:
-            lines.append("  (пусто)")
+            lines.append("(пусто)")
         else:
             for key, value in selected.items():
                 lines.append(f"  {key} = {value!r}")
     elif phase == "sql":
-        lines.append(
-            f"[2/3 SQL] source={entry.get('source')!r} "
-            f"connection={entry.get('connection')!r}"
+        lines.append("Шаг 2. SQL")
+        lines.append(f"  source: {entry.get('source')}")
+        # итоговый SQL — что реально уходит (filled или from_client)
+        final_sql = (
+            entry.get("query_filled")
+            or entry.get("query_from_client")
+            or entry.get("query")
+            or ""
         )
-        lines.append("panel_selected:")
-        for key, value in (entry.get("panel_selected") or {}).items():
-            lines.append(f"  {key} = {value!r}")
-        note = entry.get("template_note")
-        if note:
-            lines.append(f"note: {note}")
-        lines.append(f"mrt_path: {entry.get('mrt_path')}")
-        lines.append(
-            f"source lookup: event={entry.get('source')!r} "
-            f"mrt_name={entry.get('mrt_source_name')!r} "
-            f"mrt_params={entry.get('mrt_parameter_names')}"
-        )
-        lines.append(
-            f"same_as_client={entry.get('template_same_as_client')} "
-            f"has_@={entry.get('template_has_at')} "
-            f"@names={entry.get('template_at_names')} "
-            f"{{vars}}={entry.get('template_brace_names')}"
-        )
-        lines.append("--- A) SqlCommand ИЗ ФАЙЛА .mrt (не трогаем клиентом) ---")
-        lines.append(entry.get("query_template") or "(ПУСТО — source не найден в Dictionary)")
-        lines.append("--- B) queryString ОТ КЛИЕНТА (сюда Stimulsoft уже подставил значения) ---")
-        lines.append(entry.get("query_from_client") or "")
-        lines.append(
-            f"   client_already_filled={entry.get('client_already_filled')}"
-        )
-        lines.append("--- C) preview: подставили sql_parameters в A (только если в A есть @) ---")
-        lines.append(entry.get("query_filled") or "")
-        lines.append("--- sql_parameters (отдельно от текста A; то что пришло в handler) ---")
-        for key, meta in (entry.get("sql_parameters") or {}).items():
-            if isinstance(meta, dict):
-                val = meta.get("value_after", meta.get("value"))
-                lines.append(f"  @{key} = {val!r}")
-            else:
-                lines.append(f"  @{key} = {meta!r}")
+        lines.append("  sql:")
+        lines.append(final_sql)
+        params = entry.get("sql_parameters") or {}
+        if params:
+            lines.append("  params:")
+            for key, meta in params.items():
+                if isinstance(meta, dict):
+                    val = meta.get("value_after", meta.get("value"))
+                else:
+                    val = meta
+                lines.append(f"    @{key} = {val!r}")
     elif phase == "result":
-        lines.append(
-            f"[3/3 RESULT] source={entry.get('source')!r} "
-            f"success={entry.get('success')} rows={entry.get('rows')} "
-            f"notice={entry.get('notice')!r}"
-        )
-        if entry.get("query_filled"):
-            lines.append("query_filled:")
-            lines.append(str(entry.get("query_filled")))
-        if entry.get("sample") is not None:
-            lines.append(f"sample: {entry.get('sample')!r}")
+        ok = entry.get("success")
+        rows = entry.get("rows")
+        notice = entry.get("notice")
+        lines.append("Шаг 3. Результат")
+        lines.append(f"  source: {entry.get('source')}")
+        lines.append(f"  ok: {ok}")
+        lines.append(f"  rows: {rows}")
+        if notice:
+            lines.append(f"  error: {notice}")
+        lines.append("")  # пустая строка между запросами
     else:
-        lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+        return ""
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -1097,8 +1079,11 @@ def _format_sql_log_block(entry: dict) -> str:
 def _sql_log_write_file(entry: dict) -> None:
     try:
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        block = _format_sql_log_block(entry)
+        if not block:
+            return
         with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(_format_sql_log_block(entry))
+            fh.write(block)
     except Exception as exc:
         print(f"[viewer] sql log file write failed: {exc}", flush=True)
 
@@ -1109,8 +1094,25 @@ def _sql_log_add(entry: dict) -> None:
         **entry,
     }
     SQL_LOG.appendleft(entry)
-    phase = entry.get("phase") or entry.get("step") or "log"
-    print(f"[viewer][sql:{phase}] {entry}", flush=True)
+    phase = entry.get("phase") or "log"
+    # в консоль — коротко, без простыни
+    if phase == "parameters":
+        print(f"[viewer] Шаг 1. Параметры {entry.get('selected')}", flush=True)
+    elif phase == "sql":
+        q = (entry.get("query_filled") or entry.get("query_from_client") or "")[:200]
+        print(
+            f"[viewer] Шаг 2. SQL source={entry.get('source')!r} {q!r}",
+            flush=True,
+        )
+    elif phase == "result":
+        print(
+            f"[viewer] Шаг 3. Результат source={entry.get('source')!r} "
+            f"ok={entry.get('success')} rows={entry.get('rows')} "
+            f"error={entry.get('notice')!r}",
+            flush=True,
+        )
+    else:
+        print(f"[viewer][sql:{phase}] {entry}", flush=True)
     _sql_log_write_file(entry)
 
 
@@ -1128,19 +1130,16 @@ def _sql_brace_names(query: str) -> set[str]:
 
 
 def _reset_sql_trace_file() -> None:
-    """Новый сеанс — чистый файл, без старых запутанных записей."""
+    """Новый сеанс — чистый файл."""
     try:
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with SQL_LOG_PATH.open("w", encoding="utf-8") as fh:
             fh.write(
-                f"======== sql_trace session {datetime.now(timezone.utc).isoformat(timespec='seconds')} ========\n"
+                f"sql_trace {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
                 f"mrt: {MRT_PATH.resolve()}\n"
-                "A = SqlCommand из .mrt (как в файле)\n"
-                "B = queryString от клиента (часто уже с значениями)\n"
-                "C = preview подстановки @param в A\n"
-                "Если в A нет @param — в .mrt запрос без плейсхолдеров, смотри B.\n\n"
+                "Шаг 1 = параметры, Шаг 2 = SQL, Шаг 3 = результат\n\n"
             )
-        print(f"[viewer] sql_trace reset → {SQL_LOG_PATH.resolve()}", flush=True)
+        print(f"[viewer] sql_trace → {SQL_LOG_PATH.resolve()}", flush=True)
     except Exception as exc:
         print(f"[viewer] sql_trace reset failed: {exc}", flush=True)
 
