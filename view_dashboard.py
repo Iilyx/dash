@@ -57,6 +57,8 @@ from extract_mrt import (
 ROOT = Path(__file__).resolve().parent
 # Последние SQL/data-запросы к handler (видно в /debug → sql_log)
 SQL_LOG: deque[dict] = deque(maxlen=80)
+# Выбранные RFU с панели (onPrepareVariables) — для лога вместе с SQL
+LAST_VARIABLES: dict[str, object] = {}
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -960,12 +962,11 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Лог RFU. Пустые с DialogInfo не трогаем (SelectionMode=First подставит из списка).
-    Без DialogInfo — безопасный дефолт, не ''."""
+    """Лог выбранных параметров панели. Пустые с DialogInfo не трогаем (First)."""
+    global LAST_VARIABLES
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
-    # имена RFU с DialogInfo-списком — из текущего .mrt (сервер знает шаблон)
     dialog_list_names: set[str] = set()
     try:
         report = load_mrt(MRT_PATH)
@@ -978,6 +979,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
     except Exception as exc:
         print(f"[viewer] prepare_variables dialog map: {exc}", flush=True)
 
+    selected: dict[str, object] = {}
     for name, var in variables.items():
         vtype = var.type.value if getattr(var, "type", None) is not None else "?"
         empty = _is_empty(var.value)
@@ -987,9 +989,9 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
             flush=True,
         )
         if not empty:
+            selected[str(name)] = var.value
             continue
         if name in dialog_list_names:
-            # Stimulsoft выберет First после fillsDialogInfoItems — не затирать 0/*
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
             continue
         fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
@@ -1001,7 +1003,18 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
                 var.value = default
         else:
             var.value = default
+        selected[str(name)] = var.value
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
+
+    LAST_VARIABLES = selected
+    print(f"[viewer][1/3 PARAMETERS] selected={selected}", flush=True)
+    _sql_log_add(
+        {
+            "phase": "parameters",
+            "step": "1/3",
+            "selected": selected,
+        }
+    )
 
 
 def _sql_log_add(entry: dict) -> None:
@@ -1010,17 +1023,31 @@ def _sql_log_add(entry: dict) -> None:
         **entry,
     }
     SQL_LOG.appendleft(entry)
-    print(f"[viewer][sql] {entry}", flush=True)
+    phase = entry.get("phase") or entry.get("step") or "log"
+    print(f"[viewer][sql:{phase}] {entry}", flush=True)
+
+
+def _filled_sql_preview(query: str, params: dict) -> str:
+    """Как Stimulsoft подставит @param в SQL (только для лога)."""
+    if not query:
+        return ""
+    if not params:
+        return query
+    try:
+        from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
+
+        return StiSqlAdapter.applyQueryParameters(query, params, True)
+    except Exception as exc:
+        return f"{query}\n/* fill preview error: {exc} */"
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string для ВСЕХ SQL DataSources из .mrt; пустые params → не ''."""
+    """Подмена connection string; лог: параметры → заполненный SQL."""
     t0 = time.perf_counter()
     src = args.dataSource or "?"
     connection = args.connection or "?"
     command = getattr(args.command, "value", args.command)
     database = getattr(args.database, "value", args.database)
-    # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
     if PG_CONN:
         was = args.connectionString
         args.connectionString = PG_CONN
@@ -1038,12 +1065,12 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
-    query = args.queryString or ""
-    qpreview = query[:180].replace("\n", " ")
-    print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
+    query_raw = args.queryString or ""
+    query = query_raw
 
     params = args.parameters or {}
-    param_dump = {}
+    param_dump: dict[str, object] = {}
+    selected_sql: dict[str, object] = {}
     had_empty = False
     for name, param in params.items():
         param_dump[name] = {
@@ -1051,6 +1078,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "typeName": param.typeName,
             "value": param.value,
         }
+        selected_sql[name] = param.value
         print(
             f"[viewer]   @{name} typeGroup={param.typeGroup!r} "
             f"typeName={param.typeName!r} value={param.value!r}",
@@ -1069,6 +1097,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         else:
             param.value = "*"
         param_dump[name]["value_after"] = param.value
+        selected_sql[name] = param.value
         print(
             f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
             flush=True,
@@ -1082,30 +1111,46 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         if query != before:
             print(f"[viewer] softened inlined '' on {src}", flush=True)
 
-    if query != (args.queryString or ""):
+    if query != query_raw:
         args.queryString = query
-        print(
-            f"[viewer] SQL after soften q={(query[:180]).replace(chr(10), ' ')!r}",
-            flush=True,
-        )
+
+    # 1/3 — что выбрали (панель + sql params)
+    print(
+        f"[viewer][1/3 PARAMETERS] source={src!r} "
+        f"panel={LAST_VARIABLES} sql_params={selected_sql}",
+        flush=True,
+    )
+
+    # 2/3 — SQL шаблон и заполненный
+    filled = _filled_sql_preview(query, params)
+    print(
+        f"[viewer][2/3 SQL] source={src!r} connection={connection!r}\n"
+        f"  template: {query_raw[:500].replace(chr(10), ' ')}\n"
+        f"  filled:   {filled[:800].replace(chr(10), ' ')}",
+        flush=True,
+    )
 
     _sql_log_add(
         {
-            "phase": "begin",
+            "phase": "sql",
+            "step": "2/3",
             "connection": connection,
             "source": src,
             "command": command,
             "database": str(database),
             "pg_forced": bool(PG_CONN),
-            "query": (args.queryString or "")[:2000],
-            "parameters": param_dump,
+            "panel_selected": dict(LAST_VARIABLES),
+            "sql_parameters": param_dump,
+            "query_template": query_raw[:4000],
+            "query_filled": filled[:4000],
+            "query": (args.queryString or "")[:4000],
             "ms": round((time.perf_counter() - t0) * 1000, 1),
         }
     )
 
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """Лог результата SQL — чтобы было видно, ходили ли в базу."""
+    """3/3 — результат SQL."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     command = getattr(args.command, "value", args.command)
@@ -1113,26 +1158,47 @@ def end_process_data(args: StiDataEventArgs) -> None:
     success = getattr(result, "success", None) if result is not None else None
     notice = getattr(result, "notice", None) if result is not None else None
     rows = None
+    sample = None
     try:
         data = getattr(result, "data", None) if result is not None else None
         if data is not None:
             rows = len(data)
+            # первые строки для лога (если список)
+            if isinstance(data, list) and data:
+                sample = data[:3]
+            elif hasattr(data, "__getitem__") and rows:
+                try:
+                    sample = [data[i] for i in range(min(3, rows))]
+                except Exception:
+                    sample = None
     except Exception:
         rows = None
+    # SQL из предыдущего шага 2/3 для этого source
+    filled = None
+    for item in SQL_LOG:
+        if item.get("phase") == "sql" and item.get("source") == src:
+            filled = item.get("query_filled") or item.get("query")
+            break
     entry = {
-        "phase": "end",
+        "phase": "result",
+        "step": "3/3",
         "connection": connection,
         "source": src,
         "command": command,
         "success": success,
         "notice": notice,
         "rows": rows,
+        "sample": sample,
+        "query_filled": filled,
     }
     _sql_log_add(entry)
     print(
-        f"[viewer] SQL done source={src!r} success={success} rows={rows} notice={notice!r}",
+        f"[viewer][3/3 RESULT] source={src!r} success={success} rows={rows} "
+        f"notice={notice!r}",
         flush=True,
     )
+    if success is False and notice:
+        print(f"[viewer][3/3 RESULT] ERROR sql={filled!r}", flush=True)
 
 
 @app.get("/mrt")
@@ -1156,7 +1222,12 @@ def debug():
     info["database"] = probe_database()
     info["sql_log_count"] = len(SQL_LOG)
     info["sql_log"] = list(SQL_LOG)[:40]
+    info["last_variables"] = dict(LAST_VARIABLES)
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
+    info["note_sql_log"] = (
+        "sql_log шаги: phase=parameters (1/3 выбранные) → "
+        "sql (2/3 query_template + query_filled) → result (3/3 success/rows/notice)."
+    )
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
             "RequestParameters=true: dashboard SQL ждёт кнопку Submit на панели. "
@@ -1165,7 +1236,7 @@ def debug():
     elif not SQL_LOG:
         info["note_sql_log_empty"] = (
             "sql_log пуст — handler ещё не получил ExecuteQuery. "
-            "Открой / (не только /debug), проверь database.ok и консоль [viewer][sql]."
+            "Открой / (не только /debug), проверь database.ok и консоль [viewer]."
         )
     if info.get("filter_elements_count") == 0 and (
         info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
