@@ -951,14 +951,88 @@ def _unescape_sql(query: str) -> str:
     return query
 
 
+def _is_empty_param_value(value: object) -> bool:
+    """Пустой фильтр: '', None, {}, []."""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    if isinstance(value, (list, tuple, dict, set)) and len(value) == 0:
+        return True
+    return False
+
+
+def _looks_number_param(param) -> bool:
+    group = str(getattr(param, "typeGroup", "") or "").lower()
+    name = str(getattr(param, "typeName", "") or "").lower()
+    if group == "number":
+        return True
+    return any(
+        h in name
+        for h in (
+            "int",
+            "long",
+            "short",
+            "byte",
+            "decimal",
+            "double",
+            "float",
+            "single",
+            "numeric",
+            "money",
+        )
+    )
+
+
 def _sql_literal(param) -> str:
-    """Литерал для PG: числа как есть, строки в '...' с '' вместо \\'."""
+    """Только формат значения для @param. SQL вокруг не меняем.
+
+    number: 5 без кавычек; пусто/'{}'/'[]' → NULL (не '{}' в int).
+    string: 'text'; настоящий JSON '{}' остаётся строкой.
+    """
     value = getattr(param, "value", param)
     group = str(getattr(param, "typeGroup", "") or "").lower()
-    if value is None or (isinstance(value, str) and value == ""):
+    is_num = _looks_number_param(param) or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+
+    if _is_empty_param_value(value):
         return "NULL"
-    if group == "number" or isinstance(value, (int, float)) and not isinstance(value, bool):
+
+    # Stimulsoft: пустой number иногда приходит как '{}' / '[]'
+    if is_num and isinstance(value, str) and value.strip() in {"{}", "[]", "null", "NULL", "None"}:
+        return "NULL"
+
+    # список → 1,2,3 для IN (@Ids)
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            if _is_empty_param_value(item):
+                continue
+            if is_num or isinstance(item, (int, float)):
+                s = str(item).strip()
+                if re.fullmatch(r"-?\d+", s):
+                    parts.append(s)
+                else:
+                    try:
+                        float(s)
+                        parts.append(s)
+                    except ValueError:
+                        continue
+            else:
+                parts.append("'" + str(item).replace("'", "''") + "'")
+        return ", ".join(parts) if parts else "NULL"
+
+    if is_num:
+        if isinstance(value, str):
+            s = value.strip()
+            try:
+                float(s)
+            except ValueError:
+                return "NULL"
+            return s
         return str(value)
+
     if group == "datetime":
         return "'" + str(value).replace("'", "''") + "'"
     return "'" + str(value).replace("'", "''") + "'"
