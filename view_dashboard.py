@@ -7,9 +7,9 @@
 
 Чтобы переменная была на панели фильтров + Submit:
   1) RequestFromUser = true
-  2) ShowOnParametersPanel = true   ← «Show on Parameters Panel» в редакторе
-  3) Report.RequestParameters = true
-  4) ParametersDisplayMode = Panel|Dialog
+  2) Report.RequestParameters = true
+  3) ParametersDisplayMode = Dialog|Panel  (Dialog — модалка до рендера, надёжнее)
+  В JS 2026.x ShowOnParametersPanel = алиас RequestFromUser (отдельного флага нет).
 
 Canvas ComboBox/TreeView — другие фильтры (без Submit).
 
@@ -18,12 +18,13 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   # http://127.0.0.1:8040/  и  /debug
 
 FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true
-FORCE_PARAMETERS_PANEL=1 — ParametersDisplayMode=Panel
+FORCE_PARAMETERS_MODE=Dialog|Panel — по умолчанию Dialog
 FORCE_SHOW_ON_PARAMETERS_PANEL=1 — RFU → ShowOnParametersPanel=true
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import re
@@ -32,6 +33,8 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
+# Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
+import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
@@ -141,16 +144,36 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# По докам: RequestParameters + Panel → полоса параметров и кнопка Submit
+# По докам 2025.4+: RequestParameters + Dialog|Panel → параметры до рендера dashboard
 FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
     "1",
     "true",
     "yes",
 }
-FORCE_PARAMETERS_PANEL = os.environ.get(
-    "FORCE_PARAMETERS_PANEL",
-    os.environ.get("FORCE_PARAMETERS_DIALOG", "1"),  # старое имя
-).lower() in {"1", "true", "yes"}
+# Dialog заметнее Panel: модалка с Submit до данных (меньше шансов «съесть» SQL-ошибкой)
+_explicit = os.environ.get("FORCE_PARAMETERS_MODE", "").strip()
+if _explicit.lower() in {"0", "false", "no", "off"}:
+    FORCE_PARAMETERS_MODE = None
+elif _explicit.lower() == "panel":
+    FORCE_PARAMETERS_MODE = "Panel"
+elif _explicit.lower() == "dialog":
+    FORCE_PARAMETERS_MODE = "Dialog"
+elif _explicit:
+    FORCE_PARAMETERS_MODE = _explicit
+else:
+    # legacy FORCE_PARAMETERS_PANEL/DIALOG=1 → включить Dialog (не Panel!)
+    _legacy = (
+        os.environ.get("FORCE_PARAMETERS_PANEL")
+        or os.environ.get("FORCE_PARAMETERS_DIALOG")
+        or "1"
+    ).strip()
+    if _legacy.lower() in {"0", "false", "no", "off"}:
+        FORCE_PARAMETERS_MODE = None
+    elif _legacy.lower() == "panel":
+        FORCE_PARAMETERS_MODE = "Panel"
+    else:
+        FORCE_PARAMETERS_MODE = "Dialog"
+FORCE_PARAMETERS_PANEL = FORCE_PARAMETERS_MODE is not None  # совместимость /debug
 FORCE_SHOW_ON_PARAMETERS_PANEL = os.environ.get(
     "FORCE_SHOW_ON_PARAMETERS_PANEL", "1"
 ).lower() in {"1", "true", "yes"}
@@ -166,36 +189,37 @@ FORCE_DASHBOARD_TOOLBAR = os.environ.get("FORCE_DASHBOARD_TOOLBAR", "1").lower()
     "yes",
 }
 
-# JS: RequestParameters + Panel + ShowOnParametersPanel для RFU
-_OPENED_REPORT_JS = """
-(function () {
+# JS: RequestParameters + Dialog/Panel + RFU
+_OPENED_REPORT_JS = f"""
+(function () {{
   var r = args.report;
   if (!r) return;
   r.requestParameters = true;
-  try {
-    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.Panel;
-  } catch (e) {
-    try { r.parametersDisplayMode = 1; } catch (e2) {}
-  }
-  try { r.dashboardViewerSettings = 671; } catch (e4) {}
-  try {
+  try {{
+    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.{FORCE_PARAMETERS_MODE or "Dialog"};
+  }} catch (e) {{
+    try {{ r.parametersDisplayMode = {"0" if FORCE_PARAMETERS_MODE == "Dialog" else "1"}; }} catch (e2) {{}}
+  }}
+  try {{ r.dashboardViewerSettings = 671; }} catch (e4) {{}}
+  try {{
     var dict = r.dictionary;
     var vars = dict && dict.variables;
     if (!vars) return;
     var count = vars.count || 0;
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < count; i++) {{
       var v = vars.getByIndex ? vars.getByIndex(i) : null;
       if (!v && vars.list) v = vars.list[i];
       if (!v) continue;
-      // Show on Parameters Panel — главное для полосы фильтров
-      if (v.requestFromUser || v.showOnParametersPanel) {
+      // в 2026.x showOnParametersPanel ↔ requestFromUser
+      if (v.requestFromUser || v.showOnParametersPanel) {{
         v.requestFromUser = true;
         v.showOnParametersPanel = true;
-      }
-    }
-  } catch (e3) {}
-})();
+      }}
+    }}
+  }} catch (e3) {{}}
+}})();
 """.strip()
+
 # Раскрыть полосу Parameters + Submit только когда paramsVariables уже пришли.
 # Крестик на панели закрывает фильтры — прячем его и сразу открываем панель снова.
 _AFTER_INIT_HEAD = """
@@ -236,15 +260,7 @@ window.__stiForceParametersPanel = function () {
   var v = window.__stiFindViewer();
   if (!v || !v.controls) return false;
   var count = window.__stiCountParams(v);
-  var jo = v.jsObject || v;
-  // native API — показать панель из уже собранных variables
-  if (count > 0 && typeof jo.showParametersPanel === 'function') {
-    try {
-      jo.showParametersPanel(v.options.paramsVariables, jo);
-    } catch (e0) {}
-  }
   if (v.controls.buttons) {
-    // ResetAllFilters не нужен без canvas-фильтров
     if (v.controls.buttons.ResetAllFilters) {
       try { v.controls.buttons.ResetAllFilters.style.display = 'none'; } catch (e1) {}
     }
@@ -259,6 +275,15 @@ window.__stiForceParametersPanel = function () {
     console.log('[viewer] waiting paramsVariables…');
     return false;
   }
+  // Dialog: модалка parametersForm; Panel: полоса parametersPanel
+  try {
+    var form = v.controls.forms && v.controls.forms.parametersForm;
+    if (form && typeof form.changeVisibleState === 'function') {
+      form.changeVisibleState(true);
+      console.log('[viewer] parameters Dialog opened, params=', count);
+      return true;
+    }
+  } catch (e0) {}
   if (!v.controls.parametersPanel) return false;
   try {
     v.waitingToShowParameters = true;
@@ -266,7 +291,7 @@ window.__stiForceParametersPanel = function () {
     if (v.controls.buttons && v.controls.buttons.Parameters) {
       v.controls.buttons.Parameters.setSelected(true);
     }
-    console.log('[viewer] parameters panel opened, params=', count, v.options.paramsVariables);
+    console.log('[viewer] parameters Panel opened, params=', count, v.options.paramsVariables);
     return true;
   } catch (e) {
     console.warn('[viewer] open parameters panel', e);
@@ -294,6 +319,20 @@ window.__stiAfterInit = function (args) {
 """.strip()
 
 app = Flask(__name__)
+
+
+def package_versions() -> dict:
+    out = {}
+    for name in (
+        "stimulsoft-dashboards",
+        "stimulsoft-reports",
+        "stimulsoft-data-adapters",
+    ):
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
 
 
 def _is_empty(value: object) -> bool:
@@ -502,8 +541,14 @@ def dashboard_debug(path: Path) -> dict:
             "+ RequestParameters. Canvas ComboBox/TreeView ← filter_elements (без Submit)."
         ),
         "force_request_parameters": FORCE_REQUEST_PARAMETERS,
+        "force_parameters_mode": FORCE_PARAMETERS_MODE,
         "force_parameters_panel": FORCE_PARAMETERS_PANEL,
         "force_show_on_parameters_panel": FORCE_SHOW_ON_PARAMETERS_PANEL,
+        "stimulsoft_versions": package_versions(),
+        "note_show_on_parameters_panel": (
+            "В Stimulsoft JS 2026.x ShowOnParametersPanel — алиас RequestFromUser, "
+            "отдельного свойства нет. Панель = RFU + RequestParameters + Dialog/Panel."
+        ),
     }
 
 
@@ -547,10 +592,15 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         changed = True
     meta["request_parameters"] = bool(report.get("RequestParameters"))
 
-    if FORCE_PARAMETERS_PANEL:
+    if FORCE_PARAMETERS_MODE:
+        want = FORCE_PARAMETERS_MODE  # Dialog|Panel
         mode = report.get("ParametersDisplayMode")
-        if mode not in ("Panel", 1, "1"):
-            report["ParametersDisplayMode"] = "Panel"
+        ok = {
+            "Dialog": ("Dialog", 0, "0"),
+            "Panel": ("Panel", 1, "1"),
+        }.get(want, ("Dialog", 0, "0"))
+        if mode not in ok:
+            report["ParametersDisplayMode"] = want
             changed = True
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
     else:
@@ -737,7 +787,10 @@ def viewer():
 def main() -> None:
     info = dashboard_debug(MRT_PATH)
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
+    vers = package_versions()
     print(f"MRT:     {MRT_PATH.resolve()}")
+    print(f"sti:     {vers}")
+    print(f"mode:    ParametersDisplayMode={FORCE_PARAMETERS_MODE}")
     print(f"anon:    {info.get('anonymized')}")
     print(f"RFU:     {info.get('request_from_user_count')} variables")
     print(f"panel:   {info.get('show_on_parameters_panel_count')} ShowOnParametersPanel")
