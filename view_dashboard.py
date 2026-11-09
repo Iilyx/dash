@@ -448,51 +448,6 @@ def _is_number_param(param) -> bool:
     return any(h in group or h in name for h in _NUM_TYPE_HINTS)
 
 
-def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
-    if not query:
-        return query
-    pat = re.escape(name)
-    # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[@:]{pat}\s*::\s*\w+",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
-
-
 def mrt_looks_anonymized(path: Path) -> bool:
     """Обезличка: все строковые значения пустые."""
     raw = path.read_text(encoding="utf-8-sig")
@@ -1240,7 +1195,7 @@ def _should_log_sql_command(args: StiDataEventArgs) -> bool:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """SqlCommand из .mrt (@param) + фильтры; пустые → no-op/NULL (без integer \"\")."""
+    """SqlCommand из .mrt: только @Param → значение фильтра. Текст SQL не переписываем."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1258,20 +1213,14 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         query_from_client
     )
 
-    # клиент часто уже вырезал @param (часто пустыми '') — подставляем в шаблон .mrt
+    # шаблон .mrt с @param важнее уже «заполненного» client SQL
     used_template = bool(query_template and _sql_at_names(query_template))
     query = query_template if used_template else query_from_client
 
     raw_params = args.parameters or {}
     params = _merge_sql_params(raw_params)
 
-    for name, param in list(params.items()):
-        value = getattr(param, "value", param)
-        if _is_empty(value):
-            # только этот @Param → TRUE/NULL; литералы '' в SQL не трогаем
-            query = _soften_empty_param(query, str(name))
-
-    # @Param → значения фильтров (панель / args.parameters)
+    # только подстановка @Param → литерал (пустой → NULL). Без TRUE/rewrite условий.
     if params and _sql_at_names(query):
         query = _substitute_sql(query, params)
 
