@@ -46,9 +46,12 @@ SQL_LOG: deque[dict] = deque(maxlen=80)
 LAST_VARIABLES: dict[str, object] = {}
 # SqlCommand из .mrt (с @param). Клиент часто шлёт queryString уже без @.
 SOURCE_SQL_TEMPLATES: dict[str, str] = {}
+# Variable/param names, которые Interactive заполняет через {argument} (DrillDownParameters.Name)
+DRILLDOWN_VARS: set[str] = set()
 
 # Dashboard Interaction drill-down: {argument} / @argument — на верхнем уровне ещё нет
 _INTERACTIVE_ARG_NAMES = frozenset({"argument", "arguments"})
+_ARG_EXPR_RE = re.compile(r"\{arguments?\}", re.IGNORECASE)
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -438,6 +441,18 @@ def _is_interactive_arg_name(name: str) -> bool:
     return str(name or "").strip().lower() in _INTERACTIVE_ARG_NAMES
 
 
+def _is_drilldown_var(name: str) -> bool:
+    raw = str(name or "").strip()
+    if not raw:
+        return False
+    if _is_interactive_arg_name(raw):
+        return True
+    if raw in DRILLDOWN_VARS:
+        return True
+    lower = raw.lower()
+    return any(str(v).lower() == lower for v in DRILLDOWN_VARS)
+
+
 def _param_value(params: dict | None, name: str) -> object:
     if not params:
         return None
@@ -463,22 +478,82 @@ def _lookup_filter_value(params: dict | None, name: str) -> object:
     return val
 
 
-def _interactive_argument_pending(query: str, params: dict | None) -> bool:
-    """True = drill-down {argument} ещё не задан (верхний уровень дашборда)."""
-    q = query or ""
-    if re.search(r"\{arguments?\}", q, flags=re.IGNORECASE):
-        return True
-    # @argument в SQL / parameters без значения
-    for name in _INTERACTIVE_ARG_NAMES:
-        referenced = bool(
-            re.search(rf"@:?{name}\b", q, flags=re.IGNORECASE)
-            or (params and any(str(k).lower() == name for k in params))
-        )
-        if not referenced:
+def _sql_references_name(sql: str, name: str) -> bool:
+    if not sql or not name:
+        return False
+    pat = re.escape(name)
+    return bool(
+        re.search(rf"@:?{pat}\b", sql, flags=re.IGNORECASE)
+        or re.search(rf"\{{{pat}\}}", sql, flags=re.IGNORECASE)
+    )
+
+
+def _refresh_drilldown_vars(report: dict | None = None) -> set[str]:
+    """Имена variables/params, куда Interactive кладёт {argument}."""
+    global DRILLDOWN_VARS
+    found: set[str] = set(_INTERACTIVE_ARG_NAMES)
+    try:
+        if report is None:
+            report = load_mrt(MRT_PATH)
+    except Exception as exc:
+        print(f"[viewer] drilldown vars: {exc}", flush=True)
+        DRILLDOWN_VARS = found
+        return found
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            dd = node.get("DrillDownParameters")
+            if dd is not None:
+                for item in numbered(dd):
+                    if not isinstance(item, dict):
+                        continue
+                    expr = str(
+                        item.get("Expression") or item.get("Value") or ""
+                    )
+                    name = str(item.get("Name") or "").strip()
+                    if name and _ARG_EXPR_RE.search(expr):
+                        found.add(name)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(report)
+    DRILLDOWN_VARS = found
+    print(f"[viewer] drilldown vars (from {{argument}}): {sorted(found)}", flush=True)
+    return found
+
+
+def _drilldown_pending(
+    query_template: str,
+    query_from_client: str,
+    params: dict | None,
+) -> str | None:
+    """Если drill-down variable пуста и source от неё зависит — вернуть имя var."""
+    names = DRILLDOWN_VARS or set(_INTERACTIVE_ARG_NAMES)
+    for name in names:
+        if not _is_empty(_lookup_filter_value(params, name)):
             continue
-        if _is_empty(_lookup_filter_value(params, name)):
-            return True
-    return False
+        # явный {argument} / @argument / @Var из DrillDownParameters
+        if _sql_references_name(query_template, name) or _sql_references_name(
+            query_from_client, name
+        ):
+            return name
+        # клиент уже подставил '' вместо @Var: шаблон ссылается, в client SQL @ не осталось
+        if (
+            query_template
+            and _sql_references_name(query_template, name)
+            and not _sql_at_names(query_from_client)
+        ):
+            return name
+        if params and any(str(k).lower() == name.lower() for k in params):
+            return name
+    if _ARG_EXPR_RE.search(query_template or "") or _ARG_EXPR_RE.search(
+        query_from_client or ""
+    ):
+        return "argument"
+    return None
 
 
 def _skip_sql_result(notice: str) -> StiDataResult:
@@ -964,9 +1039,10 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         if not empty:
             selected[str(name)] = var.value
             continue
-        # {argument} drill-down — на верхнем уровне не подставляем дефолт
-        if _is_interactive_arg_name(str(name)):
-            print(f"[viewer]   var {name}: empty interactive argument → leave", flush=True)
+        # drill-down ({argument} → Variable) — на верхнем уровне без дефолта
+        if _is_drilldown_var(str(name)):
+            selected[str(name)] = None
+            print(f"[viewer]   var {name}: empty drill-down → leave pending", flush=True)
             continue
         if name in dialog_list_names:
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
@@ -1252,14 +1328,15 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         query_from_client
     )
     params = args.parameters or {}
+    if not DRILLDOWN_VARS:
+        _refresh_drilldown_vars()
 
-    # drill-down {argument}: на верхнем уровне не исполняем source
-    check_sql = query_template or query_from_client
-    if _interactive_argument_pending(check_sql, params) or _interactive_argument_pending(
-        query_from_client, params
-    ):
-        notice = "skip: interactive {argument} empty (not drilled down)"
-        args.result = _skip_sql_result(notice)
+    # drill-down {argument}→Variable: на верхнем уровне source не считаем
+    pending = _drilldown_pending(query_template, query_from_client, params)
+    if pending:
+        notice = f"skip: drill-down {{{pending}}} empty (not at nested level)"
+        skip = _skip_sql_result(notice)
+        args.result = skip
         args.queryString = "SELECT 1 WHERE FALSE"
         args.parameters = {}
         print(f"[viewer] SQL skip {src}: {notice}", flush=True)
@@ -1271,6 +1348,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
                 "command": cmd,
                 "skipped": True,
                 "reason": notice,
+                "drilldown_vars": sorted(DRILLDOWN_VARS),
                 "params": dict(LAST_VARIABLES),
                 "sql_params": _params_dict(params),
                 "sql_template": query_template,
@@ -1279,14 +1357,16 @@ def begin_process_data(args: StiDataEventArgs) -> None:
                 "sql_substituted": args.queryString,
             }
         )
-        return
+        # вернуть result из event: notice=skip → short-circuit в handler patch
+        return skip
 
     # подстановка только если в SQL ещё есть @param (иначе клиент уже посчитал)
     if params and _sql_at_names(query):
         for name, param in params.items():
             if not _is_empty(param.value):
                 continue
-            # пустой interactive argument сюда не дойдёт (skipped выше)
+            if _is_drilldown_var(str(name)):
+                continue
             query = _soften_empty_param(query, name)
             if _is_number_param(param) or _type_looks_numeric(
                 str(param.typeName or ""), name
@@ -1347,9 +1427,12 @@ def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
     try:
-        _refresh_sql_templates(json.loads(patched))
+        report = json.loads(patched)
+        _refresh_sql_templates(report)
+        _refresh_drilldown_vars(report)
     except Exception:
         _refresh_sql_templates()
+        _refresh_drilldown_vars()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
     resp = Response(patched, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
@@ -1469,14 +1552,58 @@ def _install_sql_unescape_hooks() -> None:
     print("[viewer] SQL unescape hooks on applyQueryParameters/executeNative", flush=True)
 
 
+def _install_drilldown_skip_hook() -> None:
+    """Stimulsoft после beginProcessData всегда зовёт PG — перехватить skip: без execute."""
+    from stimulsoft_data_adapters.classes.StiBaseHandler import StiBaseHandler
+
+    if getattr(StiBaseHandler, "_dash_drilldown_skip", False):
+        return
+
+    orig = StiBaseHandler._StiBaseHandler__getDataAdapterResult
+
+    def _patched(self):
+        args = StiDataEventArgs(self.request)
+        result = self.onBeginProcessData.getResult(args)
+        if result is not None and not result.success:
+            return result
+        notice = getattr(result, "notice", None) if result is not None else None
+        if notice and str(notice).startswith("skip:"):
+            out = args.result if getattr(args, "result", None) is not None else result
+            print(f"[viewer] handler short-circuit: {notice}", flush=True)
+            return out if out is not None else _skip_sql_result(str(notice))
+        # begin уже вызван — подставим no-op begin и догоним остальной orig
+        saved = list(self.onBeginProcessData.callbacks)
+
+        def _replay(a: StiDataEventArgs):
+            # перенести side-effects из первого вызова
+            a.connectionString = args.connectionString
+            a.queryString = args.queryString
+            a.parameters = args.parameters
+            a.result = args.result
+            return result
+
+        self.onBeginProcessData.callbacks = [_replay]
+        try:
+            return orig(self)
+        finally:
+            self.onBeginProcessData.callbacks = saved
+
+    StiBaseHandler._StiBaseHandler__getDataAdapterResult = _patched
+    StiBaseHandler._dash_drilldown_skip = True
+    print("[viewer] drill-down skip short-circuit on data handler", flush=True)
+
+
 def main() -> None:
     info = dashboard_debug(MRT_PATH)
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
     _install_sql_unescape_hooks()
+    _install_drilldown_skip_hook()
+    _refresh_drilldown_vars()
     _reset_sql_trace_file()
     print(f"MRT:     {MRT_PATH.resolve()}")
     print(f"params:  {SQL_LOG_PATH.resolve()}")
     print(f"panel:   {FORCE_PARAMETERS_MODE} / RFU={info.get('request_from_user_count')}")
+    print(f"drill:   {sorted(DRILLDOWN_VARS)}")
     db = probe_database()
     print(f"DB:      ok={db.get('ok')} {db.get('pg_conn_masked') or ''}")
     if db.get("error"):
