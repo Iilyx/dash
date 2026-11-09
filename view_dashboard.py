@@ -599,23 +599,28 @@ def _filter_expr_defaults() -> dict[str, str]:
 
 
 def default_value_for_variable(variable: dict) -> str | None:
-    """Дефолт вместо ''. None = не ставить Value (DialogInfo/Value2 сами)."""
-    if variable_has_dialog_list(variable):
-        return None
+    """Дефолт вместо ''. None = не ставить Value (DialogInfo выберет First).
+
+    Важно: DataFilters Value=\"{Patient}\" + Value2=\"0\" — пока DialogInfo
+    не подтянул First, пустой Patient даёт NameID='' → integer \"\".
+    Поэтому Value2 из expression-фильтров важнее DialogInfo.
+    """
     typ = str(variable.get("Type") or "")
     name = str(variable.get("Name") or "")
     t = typ.lower()
-    # expression DataFilters {Name} → Value2 (часто "0" для int Path)
+    # expression / drill-down {Name} → Value2 (часто "0" для int Path)
     expr_defaults = _filter_expr_defaults()
     if name in expr_defaults:
         return expr_defaults[name]
+    if variable_has_dialog_list(variable):
+        return None
     if "bool" in t:
         return "False"
     if "datetime" in t or t.endswith(".date") or t == "date":
         return "Today"
     if _type_looks_numeric(typ, name):
         return "0"
-    # НЕ '_': ломает {Patient}→NameID integer. Пусто → Stimulsoft Value2.
+    # НЕ '_': ломает {Var}→integer Path
     return None
 
 
@@ -870,18 +875,18 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
             columns_softened += 1
             changed = True
         if variable_has_dialog_list(variable):
-            # как в Stimulsoft-сэмплах: SelectionMode=First, без Value=0/*
             if variable.get("SelectionMode") not in ("First", "first", 1, "1"):
                 variable["SelectionMode"] = "First"
                 changed = True
-            if "Value" in variable and _is_empty(variable.get("Value")):
-                del variable["Value"]
-                defaults_set += 1
-                changed = True
-        elif _is_empty(variable.get("Value")):
+        if _is_empty(variable.get("Value")):
+            # Value2 из {Var} expression важнее пустого First (иначе int "")
             default = default_value_for_variable(variable)
             if default is not None:
                 variable["Value"] = default
+                defaults_set += 1
+                changed = True
+            elif variable_has_dialog_list(variable) and "Value" in variable:
+                del variable["Value"]
                 defaults_set += 1
                 changed = True
     meta["panel_candidates"] = candidates
@@ -927,14 +932,14 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         if not empty:
             selected[str(name)] = var.value
             continue
-        if name in dialog_list_names:
+        fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
+        # DialogInfo First — только если нет Value2 из expression DataFilters
+        default = default_value_for_variable(fake)
+        if default is None and name in dialog_list_names:
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
             continue
-        fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
-        default = default_value_for_variable(fake)
         if default is None:
-            # expression {Var} + Value2 в DataFilters; не подставляем '_'
-            print(f"[viewer]   var {name}: empty → leave (expression/Value2)", flush=True)
+            print(f"[viewer]   var {name}: empty → leave", flush=True)
             continue
         if _type_looks_numeric(vtype, name) and "list" not in vtype.lower():
             try:
@@ -944,7 +949,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         else:
             var.value = default
         selected[str(name)] = var.value
-        print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
+        print(f"[viewer]   var {name}: empty → {var.value!r} (expr/Value2)", flush=True)
 
     LAST_VARIABLES = selected
     _sql_log_add({"phase": "parameters", "params": selected})
