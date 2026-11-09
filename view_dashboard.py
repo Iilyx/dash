@@ -26,6 +26,7 @@ from urllib.parse import quote_plus, urlparse
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
 from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
+from stimulsoft_data_adapters.classes.StiDataResult import StiDataResult
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -45,6 +46,9 @@ SQL_LOG: deque[dict] = deque(maxlen=80)
 LAST_VARIABLES: dict[str, object] = {}
 # SqlCommand из .mrt (с @param). Клиент часто шлёт queryString уже без @.
 SOURCE_SQL_TEMPLATES: dict[str, str] = {}
+
+# Dashboard Interaction drill-down: {argument} / @argument — на верхнем уровне ещё нет
+_INTERACTIVE_ARG_NAMES = frozenset({"argument", "arguments"})
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -423,11 +427,68 @@ def package_versions() -> dict:
 def _is_empty(value: object) -> bool:
     if value is None:
         return True
-    if isinstance(value, str) and value.strip() == "":
+    if isinstance(value, str) and value.strip() in {"", "{}", "[]", "null", "NULL", "None"}:
         return True
-    if isinstance(value, (list, tuple, dict)) and len(value) == 0:
+    if isinstance(value, (list, tuple, dict, set)) and len(value) == 0:
         return True
     return False
+
+
+def _is_interactive_arg_name(name: str) -> bool:
+    return str(name or "").strip().lower() in _INTERACTIVE_ARG_NAMES
+
+
+def _param_value(params: dict | None, name: str) -> object:
+    if not params:
+        return None
+    if name in params:
+        return getattr(params[name], "value", params[name])
+    lower = name.lower()
+    for key, param in params.items():
+        if str(key).lower() == lower:
+            return getattr(param, "value", param)
+    return None
+
+
+def _lookup_filter_value(params: dict | None, name: str) -> object:
+    val = _param_value(params, name)
+    if not _is_empty(val):
+        return val
+    if name in LAST_VARIABLES:
+        return LAST_VARIABLES[name]
+    lower = name.lower()
+    for key, value in LAST_VARIABLES.items():
+        if str(key).lower() == lower:
+            return value
+    return val
+
+
+def _interactive_argument_pending(query: str, params: dict | None) -> bool:
+    """True = drill-down {argument} ещё не задан (верхний уровень дашборда)."""
+    q = query or ""
+    if re.search(r"\{arguments?\}", q, flags=re.IGNORECASE):
+        return True
+    # @argument в SQL / parameters без значения
+    for name in _INTERACTIVE_ARG_NAMES:
+        referenced = bool(
+            re.search(rf"@:?{name}\b", q, flags=re.IGNORECASE)
+            or (params and any(str(k).lower() == name for k in params))
+        )
+        if not referenced:
+            continue
+        if _is_empty(_lookup_filter_value(params, name)):
+            return True
+    return False
+
+
+def _skip_sql_result(notice: str) -> StiDataResult:
+    """Пустой успешный ответ — source не исполняем (не тот уровень drill-down)."""
+    result = StiDataResult.getSuccess(notice)
+    result.columns = []
+    result.types = []
+    result.rows = []
+    result.count = 0
+    return result
 
 
 def _is_number_param(param) -> bool:
@@ -903,6 +964,10 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         if not empty:
             selected[str(name)] = var.value
             continue
+        # {argument} drill-down — на верхнем уровне не подставляем дефолт
+        if _is_interactive_arg_name(str(name)):
+            print(f"[viewer]   var {name}: empty interactive argument → leave", flush=True)
+            continue
         if name in dialog_list_names:
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
             continue
@@ -1186,13 +1251,42 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
-
     params = args.parameters or {}
+
+    # drill-down {argument}: на верхнем уровне не исполняем source
+    check_sql = query_template or query_from_client
+    if _interactive_argument_pending(check_sql, params) or _interactive_argument_pending(
+        query_from_client, params
+    ):
+        notice = "skip: interactive {argument} empty (not drilled down)"
+        args.result = _skip_sql_result(notice)
+        args.queryString = "SELECT 1 WHERE FALSE"
+        args.parameters = {}
+        print(f"[viewer] SQL skip {src}: {notice}", flush=True)
+        _sql_log_add(
+            {
+                "phase": "sql",
+                "source": src,
+                "connection": connection,
+                "command": cmd,
+                "skipped": True,
+                "reason": notice,
+                "params": dict(LAST_VARIABLES),
+                "sql_params": _params_dict(params),
+                "sql_template": query_template,
+                "sql_from_client": query_from_client,
+                "sql_sent": args.queryString,
+                "sql_substituted": args.queryString,
+            }
+        )
+        return
+
     # подстановка только если в SQL ещё есть @param (иначе клиент уже посчитал)
     if params and _sql_at_names(query):
         for name, param in params.items():
             if not _is_empty(param.value):
                 continue
+            # пустой interactive argument сюда не дойдёт (skipped выше)
             query = _soften_empty_param(query, name)
             if _is_number_param(param) or _type_looks_numeric(
                 str(param.typeName or ""), name
