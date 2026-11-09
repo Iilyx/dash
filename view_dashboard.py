@@ -190,6 +190,10 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
+# Файл: параметры → заполненный SQL → результат (append)
+_sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.txt").strip() or "sql_trace.txt"
+SQL_LOG_PATH = path_of(_sql_log_raw)
+
 # RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
 # По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
 FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
@@ -1017,6 +1021,65 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
     )
 
 
+def _format_sql_log_block(entry: dict) -> str:
+    """Человекочитаемый блок для sql_trace.txt."""
+    ts = entry.get("ts") or ""
+    phase = entry.get("phase") or ""
+    step = entry.get("step") or ""
+    lines = [f"======== {ts} {step} {phase} ========"]
+    if phase == "parameters":
+        lines.append("[1/3 PARAMETERS] выбранные с панели:")
+        selected = entry.get("selected") or {}
+        if not selected:
+            lines.append("  (пусто)")
+        else:
+            for key, value in selected.items():
+                lines.append(f"  {key} = {value!r}")
+    elif phase == "sql":
+        lines.append(
+            f"[2/3 SQL] source={entry.get('source')!r} "
+            f"connection={entry.get('connection')!r}"
+        )
+        lines.append("panel_selected:")
+        for key, value in (entry.get("panel_selected") or {}).items():
+            lines.append(f"  {key} = {value!r}")
+        lines.append("sql_parameters:")
+        for key, meta in (entry.get("sql_parameters") or {}).items():
+            if isinstance(meta, dict):
+                val = meta.get("value_after", meta.get("value"))
+                lines.append(f"  @{key} = {val!r}")
+            else:
+                lines.append(f"  @{key} = {meta!r}")
+        lines.append("query_template:")
+        lines.append(entry.get("query_template") or entry.get("query") or "")
+        lines.append("query_filled:")
+        lines.append(entry.get("query_filled") or "")
+    elif phase == "result":
+        lines.append(
+            f"[3/3 RESULT] source={entry.get('source')!r} "
+            f"success={entry.get('success')} rows={entry.get('rows')} "
+            f"notice={entry.get('notice')!r}"
+        )
+        if entry.get("query_filled"):
+            lines.append("query_filled:")
+            lines.append(str(entry.get("query_filled")))
+        if entry.get("sample") is not None:
+            lines.append(f"sample: {entry.get('sample')!r}")
+    else:
+        lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _sql_log_write_file(entry: dict) -> None:
+    try:
+        SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(_format_sql_log_block(entry))
+    except Exception as exc:
+        print(f"[viewer] sql log file write failed: {exc}", flush=True)
+
+
 def _sql_log_add(entry: dict) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1025,6 +1088,7 @@ def _sql_log_add(entry: dict) -> None:
     SQL_LOG.appendleft(entry)
     phase = entry.get("phase") or entry.get("step") or "log"
     print(f"[viewer][sql:{phase}] {entry}", flush=True)
+    _sql_log_write_file(entry)
 
 
 def _filled_sql_preview(query: str, params: dict) -> str:
@@ -1222,11 +1286,12 @@ def debug():
     info["database"] = probe_database()
     info["sql_log_count"] = len(SQL_LOG)
     info["sql_log"] = list(SQL_LOG)[:40]
+    info["sql_log_path"] = str(SQL_LOG_PATH.resolve())
     info["last_variables"] = dict(LAST_VARIABLES)
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     info["note_sql_log"] = (
-        "sql_log шаги: phase=parameters (1/3 выбранные) → "
-        "sql (2/3 query_template + query_filled) → result (3/3 success/rows/notice)."
+        "Пишется в файл SQL_LOG_PATH (по умолчанию sql_trace.txt) и в /debug.sql_log. "
+        "Шаги: parameters (1/3) → sql (2/3 template+filled) → result (3/3)."
     )
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
@@ -1307,6 +1372,7 @@ def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
     vers = package_versions()
     print(f"MRT:     {MRT_PATH.resolve()}")
+    print(f"sql_log: {SQL_LOG_PATH.resolve()}")
     print(f"sti:     {vers}")
     print(f"mode:    ParametersDisplayMode={FORCE_PARAMETERS_MODE}")
     print(f"anon:    {info.get('anonymized')}")

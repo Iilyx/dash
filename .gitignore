@@ -8,6 +8,7 @@ catalog.json
 catalog_pages/
 ask_trace.txt
 sql_filled.txt
+sql_trace.txt
 page.txt
 data/
 init/
