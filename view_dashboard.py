@@ -448,6 +448,92 @@ def _is_number_param(param) -> bool:
     return any(h in group or h in name for h in _NUM_TYPE_HINTS)
 
 
+def _soften_empty_param(query: str, name: str) -> str:
+    """Пустой фильтр: только вхождения @Param → TRUE/NULL. Остальной SqlCommand не трогаем."""
+    if not query:
+        return query
+    pat = re.escape(name)
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[@:]{pat}\s*::\s*\w+",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
+
+
+def _soften_inlined_empty_literals(query: str) -> str:
+    """Клиент уже вшил '' вместо пустого фильтра — убрать до PG (integer \"\").
+
+    Только сравнения/касты, не coalesce(x,'') и не SELECT ''.
+    """
+    if not query or "''" not in query:
+        return query
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    # col = '' от пустого фильтра
+    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    return query
+
+
 def mrt_looks_anonymized(path: Path) -> bool:
     """Обезличка: все строковые значения пустые."""
     raw = path.read_text(encoding="utf-8-sig")
@@ -1220,9 +1306,20 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     raw_params = args.parameters or {}
     params = _merge_sql_params(raw_params)
 
-    # только подстановка @Param → литерал (пустой → NULL). Без TRUE/rewrite условий.
+    # пустые параметры фильтров → TRUE/NULL на месте @Param
+    had_empty = False
+    for name, param in list(params.items()):
+        if _is_empty(getattr(param, "value", param)):
+            had_empty = True
+            query = _soften_empty_param(query, str(name))
+
+    # заполненные @Param → литерал (пустой → NULL)
     if params and _sql_at_names(query):
         query = _substitute_sql(query, params)
+
+    # клиент уже подставил '' вместо пустого фильтра — иначе PG: integer ""
+    if had_empty or "''" in (query or ""):
+        query = _soften_inlined_empty_literals(query)
 
     query = _unescape_sql(query)
     args.queryString = query
