@@ -492,48 +492,6 @@ def _soften_empty_param(query: str, name: str) -> str:
     return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
 
 
-def _soften_inlined_empty_literals(query: str) -> str:
-    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
-    if not query or "''" not in query:
-        return query
-    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
-    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
-    query = re.sub(r"=\s*''", " = NULL", query)
-    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
-    return query
-
-
 def mrt_looks_anonymized(path: Path) -> bool:
     """Обезличка: все строковые значения пустые."""
     raw = path.read_text(encoding="utf-8-sig")
@@ -1262,11 +1220,10 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     )
 
     params = args.parameters or {}
-    had_empty = False
     for name, param in params.items():
         if not _is_empty(param.value):
             continue
-        had_empty = True
+        # только пустой @Param → TRUE/NULL; литералы '' в SqlCommand не трогаем
         query = _soften_empty_param(query, name)
         if _is_number_param(param) or _type_looks_numeric(
             str(param.typeName or ""), name
@@ -1275,11 +1232,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             param.value = 0
         else:
             param.value = "*"
-
-    if had_empty or "''" in (query or ""):
-        query = _soften_inlined_empty_literals(query)
-        if "''" in query:
-            query = query.replace("''", "NULL")
 
     # сами подставляем @param (PG), Stimulsoft больше не трогает parameters
     if params and _sql_at_names(query):
