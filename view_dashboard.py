@@ -1515,7 +1515,7 @@ def debug():
             "После смены фильтров всё равно нужен Submit; "
             "для первого запроса с выбором поставь FORCE_REQUEST_PARAMETERS=1."
         )
-    elif not SQL_LOG:
+    if not SQL_LOG:
         info["note_sql_log_empty"] = (
             "sql_log пуст — handler ещё не получил ExecuteQuery. "
             "Открой / (не только /debug), проверь database.ok и консоль [viewer][sql]."
