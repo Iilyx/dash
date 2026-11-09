@@ -173,6 +173,50 @@ _OPENED_REPORT_JS = """
 })();
 """.strip()
 
+# Раскрыть полосу Parameters + Submit (id viewer → window.jsViewer)
+_AFTER_INIT_HEAD = """
+<script>
+window.__stiForceParametersPanel = function () {
+  var names = ['jsViewer', 'jsStiViewer', 'viewer'];
+  var v = null;
+  for (var i = 0; i < names.length; i++) {
+    if (window[names[i]] && window[names[i]].controls) {
+      v = window[names[i]];
+      break;
+    }
+  }
+  if (!v) {
+    for (var k in window) {
+      if (k.indexOf('js') === 0 && window[k] && window[k].controls && window[k].controls.parametersPanel) {
+        v = window[k];
+        break;
+      }
+    }
+  }
+  if (!v || !v.controls || !v.controls.parametersPanel) return false;
+  try {
+    v.waitingToShowParameters = true;
+    v.controls.parametersPanel.changeVisibleState(true);
+    if (v.controls.buttons && v.controls.buttons.Parameters) {
+      v.controls.buttons.Parameters.setSelected(true);
+    }
+    console.log('[viewer] parameters panel opened');
+    return true;
+  } catch (e) {
+    console.warn('[viewer] open parameters panel', e);
+    return false;
+  }
+};
+window.__stiAfterInit = function (args) {
+  var tries = 0;
+  var timer = setInterval(function () {
+    tries += 1;
+    if (window.__stiForceParametersPanel() || tries > 60) clearInterval(timer);
+  }, 300);
+};
+</script>
+""".strip()
+
 app = Flask(__name__)
 
 
@@ -443,10 +487,13 @@ def debug():
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     sti = StiViewer()
+    sti.id = "viewer"
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
     sti.options.toolbar.visible = True
     sti.options.toolbar.showParametersButton = True
+    sti.javascript.appendHead(_AFTER_INIT_HEAD)
+    sti.onAfterInitialize += "__stiAfterInit"
     sti.onPrepareVariables += prepare_variables
     sti.onBeginProcessData += begin_process_data
     # после открытия .mrt — Panel + RequestParameters (полоса Submit)
