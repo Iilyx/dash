@@ -40,6 +40,7 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
+from stimulsoft_data_adapters.enums import StiDatabaseType
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -52,6 +53,42 @@ from extract_mrt import (
     load_mrt,
     numbered,
     repair_mrt_json,
+)
+
+_FILE_DB_IDENTS = (
+    "Excel",
+    "Csv",
+    "JSON",
+    "Xml",
+    "File",
+    "DBase",
+    "Gis",
+    "Firebase",
+    "GoogleSheets",
+    "AzureBlob",
+    "AzureTable",
+)
+_FILE_DB_TYPES = {
+    StiDatabaseType.XML,
+    StiDatabaseType.JSON,
+    StiDatabaseType.CSV,
+    "XML",
+    "JSON",
+    "CSV",
+}
+_SQL_DB_IDENT_HINTS = (
+    "Sql",
+    "Postgre",
+    "MySql",
+    "Maria",
+    "Oracle",
+    "Firebird",
+    "Odbc",
+    "ClickHouse",
+    "Redshift",
+    "DB2",
+    "Informix",
+    "Snowflake",
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -783,8 +820,9 @@ def dashboard_debug(path: Path) -> dict:
             "Списки Keys/Values грузит Columns SQL. Пустые SQL-параметры смягчаем отдельно."
         ),
         "note_data_sources": (
-            "SQL DataSources ходят в Postgres через onBeginProcessData (viewer+report). "
-            "Нужны POSTGRES_* в .env и ConnectOnStart у источников."
+            "SQL DataSources → PostgreSQL через patch Ident/NameInSource + "
+            "onBeginProcessData (database=PostgreSQL, connection из .env). "
+            "Смотри mrt_patch.source_issues и sql_log."
         ),
     }
 
@@ -795,6 +833,207 @@ def mrt_has_request_from_user(report: dict) -> bool:
         if isinstance(variable, dict) and variable_is_parameters_panel_candidate(variable):
             return True
     return False
+
+
+def _is_file_database(ident: str) -> bool:
+    return any(h in (ident or "") for h in _FILE_DB_IDENTS)
+
+
+def _source_looks_sql(source: dict) -> bool:
+    if not isinstance(source, dict):
+        return False
+    ident = str(source.get("Ident") or "")
+    if any(h in ident for h in _FILE_DB_IDENTS) or "DataTable" in ident:
+        return False
+    has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery", "Parameters"))
+    has_sql = bool(source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery"))
+    return (
+        "Sql" in ident
+        or "Postgre" in ident
+        or has_sql
+        or has_sql_key
+        or bool(source.get("NameInSource"))
+        or bool(source.get("Connection"))
+    )
+
+
+def _patch_postgres_dictionary(dictionary: dict) -> dict:
+    """Ident/NameInSource → PostgreSQL, иначе handler: Unknown database type / нет ExecuteQuery."""
+    meta = {
+        "db_ident_forced": 0,
+        "db_named": 0,
+        "source_ident_forced": 0,
+        "name_in_source_forced": 0,
+        "connect_on_start_forced": 0,
+        "primary_connection": None,
+        "changed": False,
+    }
+    if not isinstance(dictionary, dict) or not PG_CONN:
+        return meta
+
+    sql_dbs: list[dict] = []
+    for db in numbered(dictionary.get("Databases")):
+        if not isinstance(db, dict):
+            continue
+        ident = str(db.get("Ident") or "")
+        if _is_file_database(ident):
+            continue
+        looks_sql = (
+            not ident
+            or any(h in ident for h in _SQL_DB_IDENT_HINTS)
+            or "ConnectionString" in db
+            or bool(db.get("ConnectionString"))
+        )
+        if not looks_sql:
+            continue
+        if ident != "StiPostgreSQLDatabase":
+            db["Ident"] = "StiPostgreSQLDatabase"
+            meta["db_ident_forced"] += 1
+            meta["changed"] = True
+        # Клиенту нужен Recognizable PostgreSQL connection string; пароль подставит handler
+        if not (db.get("ConnectionString") or "").strip():
+            url = database_url()
+            parsed = urlparse(url) if url else None
+            host = (parsed.hostname if parsed else None) or "127.0.0.1"
+            port = (parsed.port if parsed else None) or 5432
+            database = (
+                parsed.path.lstrip("/").split("?", 1)[0] if parsed and parsed.path else "app"
+            )
+            db["ConnectionString"] = (
+                f"Host={host}; Port={port}; Database={database}; User Id=; Password=;"
+            )
+            meta["changed"] = True
+        if db.get("ConnectionStringEncrypted"):
+            db["ConnectionStringEncrypted"] = ""
+            meta["changed"] = True
+        sql_dbs.append(db)
+
+    primary = next(
+        ((db.get("Name") or "").strip() for db in sql_dbs if (db.get("Name") or "").strip()),
+        "",
+    )
+    if sql_dbs and not primary:
+        primary = "Connection"
+        sql_dbs[0]["Name"] = primary
+        if not (sql_dbs[0].get("Alias") or "").strip():
+            sql_dbs[0]["Alias"] = primary
+        meta["db_named"] += 1
+        meta["changed"] = True
+    meta["primary_connection"] = primary or None
+    db_names = {
+        (db.get("Name") or "").strip()
+        for db in sql_dbs
+        if (db.get("Name") or "").strip()
+    }
+
+    # Если SQL-источники есть, а Databases пуст — создаём Connection
+    sql_sources = [
+        s for s in numbered(dictionary.get("DataSources")) if _source_looks_sql(s)
+    ]
+    if sql_sources and not sql_dbs:
+        primary = "Connection"
+        databases = dictionary.get("Databases")
+        if not isinstance(databases, dict):
+            databases = {}
+            dictionary["Databases"] = databases
+        next_key = str(len(databases))
+        databases[next_key] = {
+            "Ident": "StiPostgreSQLDatabase",
+            "Name": primary,
+            "Alias": primary,
+            "ConnectionString": "",
+        }
+        sql_dbs = [databases[next_key]]
+        db_names = {primary}
+        meta["primary_connection"] = primary
+        meta["db_ident_forced"] += 1
+        meta["db_named"] += 1
+        meta["changed"] = True
+
+    for source in sql_sources:
+        ident = str(source.get("Ident") or "")
+        if ident != "StiPostgreSQLSource":
+            source["Ident"] = "StiPostgreSQLSource"
+            meta["source_ident_forced"] += 1
+            meta["changed"] = True
+        nis = (source.get("NameInSource") or "").strip()
+        if primary and (not nis or (db_names and nis not in db_names and len(db_names) == 1)):
+            if nis != primary:
+                source["NameInSource"] = primary
+                meta["name_in_source_forced"] += 1
+                meta["changed"] = True
+        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            meta["connect_on_start_forced"] += 1
+            meta["changed"] = True
+        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            meta["connect_on_start_forced"] += 1
+            meta["changed"] = True
+
+    return meta
+
+
+def analyze_source_issues(report: dict) -> dict:
+    """Диагностика Dictionary: пустой Ident, битый NameInSource, пустой SqlCommand."""
+    dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+    dbs = [d for d in numbered(dictionary.get("Databases")) if isinstance(d, dict)]
+    sources = [s for s in numbered(dictionary.get("DataSources")) if isinstance(s, dict)]
+    db_names = {(d.get("Name") or "").strip() for d in dbs if (d.get("Name") or "").strip()}
+    issues: list[str] = []
+    sql_sources = []
+    for src in sources:
+        if not _source_looks_sql(src):
+            continue
+        name = (src.get("Name") or "").strip() or "(unnamed)"
+        ident = str(src.get("Ident") or "")
+        nis = (src.get("NameInSource") or "").strip()
+        sql = (src.get("SqlCommand") or src.get("Query") or src.get("SqlQuery") or "").strip()
+        entry = {
+            "name": name,
+            "ident": ident or None,
+            "name_in_source": nis or None,
+            "has_sql": bool(sql),
+            "sql_preview": sql[:160] if sql else None,
+            "connect_on_start": src.get("ConnectOnStart"),
+        }
+        sql_sources.append(entry)
+        if not ident:
+            issues.append(f"{name}: пустой Ident (нужен StiPostgreSQLSource)")
+        elif "Postgre" not in ident and "Sql" not in ident:
+            issues.append(f"{name}: Ident={ident!r} — не SQL/PostgreSQL")
+        if not nis:
+            issues.append(f"{name}: пустой NameInSource (имя Databases.Name)")
+        elif db_names and nis not in db_names:
+            issues.append(
+                f"{name}: NameInSource={nis!r} не совпадает с Databases {sorted(db_names)}"
+            )
+        if not sql:
+            issues.append(f"{name}: пустой SqlCommand")
+    for db in dbs:
+        dname = (db.get("Name") or "").strip() or "(unnamed)"
+        ident = str(db.get("Ident") or "")
+        if _is_file_database(ident):
+            continue
+        if not ident:
+            issues.append(f"Database {dname}: пустой Ident (нужен StiPostgreSQLDatabase)")
+        elif "Postgre" not in ident and any(h in ident for h in _SQL_DB_IDENT_HINTS):
+            issues.append(f"Database {dname}: Ident={ident!r} — не PostgreSQL")
+        if not (db.get("Name") or "").strip():
+            issues.append(f"Database: пустое Name (источники не привяжутся)")
+    return {
+        "databases": [
+            {
+                "name": (d.get("Name") or "") or None,
+                "ident": (d.get("Ident") or "") or None,
+                "has_connection_string": bool(d.get("ConnectionString")),
+            }
+            for d in dbs
+        ],
+        "sql_sources": sql_sources,
+        "issues": issues,
+        "ok": len(issues) == 0 and bool(sql_sources),
+    }
 
 
 def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
@@ -876,36 +1115,24 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         meta["parameter_width"] = report.get("ParameterWidth")
 
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+    if not isinstance(report.get("Dictionary"), dict):
+        report["Dictionary"] = dictionary
 
-    # DataSources: ConnectOnStart=true, чтобы dashboard реально ходил в SQL
-    connect_forced = 0
-    for source in numbered(dictionary.get("DataSources")):
-        if not isinstance(source, dict):
-            continue
-        ident = str(source.get("Ident") or "")
-        # SqlCommand может быть ключом даже с пустым телом (обезличка)
-        has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery"))
-        has_sql = bool(
-            source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery")
-        )
-        is_sql = (
-            "Sql" in ident
-            or has_sql
-            or has_sql_key
-            or bool(source.get("NameInSource"))
-            or bool(source.get("Connection"))
-        )
-        if not is_sql:
-            continue
-        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            connect_forced += 1
-            changed = True
-        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            connect_forced += 1
-            changed = True
-    meta["connect_on_start_forced"] = connect_forced
+    # Databases/DataSources → StiPostgreSQL* + NameInSource + ConnectOnStart
+    pg_meta = _patch_postgres_dictionary(dictionary)
+    if pg_meta.get("changed"):
+        changed = True
+    meta.update(
+        {
+            "connect_on_start_forced": pg_meta.get("connect_on_start_forced", 0),
+            "db_ident_forced": pg_meta.get("db_ident_forced", 0),
+            "db_named": pg_meta.get("db_named", 0),
+            "source_ident_forced": pg_meta.get("source_ident_forced", 0),
+            "name_in_source_forced": pg_meta.get("name_in_source_forced", 0),
+            "primary_connection": pg_meta.get("primary_connection"),
+        }
+    )
+    meta["source_issues"] = analyze_source_issues(report)
     rfu_forced = 0
     show_forced = 0
     columns_softened = 0
@@ -1013,28 +1240,42 @@ def _sql_log_add(entry: dict) -> None:
     print(f"[viewer][sql] {entry}", flush=True)
 
 
+def _database_type_value(database) -> object:
+    return getattr(database, "value", database)
+
+
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string для ВСЕХ SQL DataSources из .mrt; пустые params → не ''."""
+    """PostgreSQL adapter + connection из .env; пустые params → не ''."""
     t0 = time.perf_counter()
     src = args.dataSource or "?"
     connection = args.connection or "?"
     command = getattr(args.command, "value", args.command)
-    database = getattr(args.database, "value", args.database)
-    # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
-    if PG_CONN:
+    database = _database_type_value(args.database)
+    db_forced = False
+    # Важно: пустой/чужой Ident → Unknown database type. Форсим PostgreSQL до getDataAdapter.
+    if PG_CONN and database not in _FILE_DB_TYPES and _database_type_value(database) not in (
+        "XML",
+        "JSON",
+        "CSV",
+    ):
         was = args.connectionString
         args.connectionString = PG_CONN
+        if args.database != StiDatabaseType.POSTGRESQL:
+            args.database = StiDatabaseType.POSTGRESQL
+            db_forced = True
+        database = _database_type_value(args.database)
         print(
             f"[viewer] DB force connection={connection!r} source={src!r} "
             f"command={command!r} was={mask_pg_conn(was or '')!r} "
             f"now={mask_pg_conn(PG_CONN)!r} "
-            f"database={database!r}",
+            f"database={database!r} db_forced={db_forced}",
             flush=True,
         )
     else:
         print(
-            f"[viewer] DB MISSING .env — connection={connection!r} source={src!r} "
-            f"command={command!r} conn={mask_pg_conn(args.connectionString or '')!r}",
+            f"[viewer] DB skip/missing — connection={connection!r} source={src!r} "
+            f"command={command!r} database={database!r} "
+            f"conn={mask_pg_conn(args.connectionString or '')!r} pg={bool(PG_CONN)}",
             flush=True,
         )
 
@@ -1097,6 +1338,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "command": command,
             "database": str(database),
             "pg_forced": bool(PG_CONN),
+            "database_forced": db_forced,
             "query": (args.queryString or "")[:2000],
             "parameters": param_dump,
             "ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -1166,6 +1408,19 @@ def debug():
         info["note_sql_log_empty"] = (
             "sql_log пуст — handler ещё не получил ExecuteQuery. "
             "Открой / (не только /debug), проверь database.ok и консоль [viewer][sql]."
+        )
+    source_issues = (meta.get("source_issues") or {}).get("issues") or []
+    if source_issues:
+        info["source_problems"] = source_issues
+        info["note_source_problems"] = (
+            "Проблемы Dictionary после patch — пустой SqlCommand/Ident/NameInSource. "
+            "Обезличенный test.mrt SQL не выполнит; нужен полный .mrt (MRT_PATH)."
+        )
+    db_probe = info.get("database") or {}
+    if not db_probe.get("ok"):
+        info["note_database"] = (
+            "Postgres из .env недоступен — источники упадут на connect. "
+            f"error={db_probe.get('error')}"
         )
     if info.get("filter_elements_count") == 0 and (
         info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
