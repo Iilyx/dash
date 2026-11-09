@@ -493,43 +493,49 @@ def _soften_empty_param(query: str, name: str) -> str:
     return re.sub(rf"@{pat}\b", "NULL", query, flags=re.IGNORECASE)
 
 
+_EMPTY_NUM_CAST = r"(int|integer|bigint|smallint|numeric|decimal|float|real|double)"
+
+
 def _soften_inlined_empty_literals(query: str) -> str:
-    """Только опасные '' от пустого фильтра (int \"\"). Не трогаем coalesce/литералы в SELECT."""
-    if not query or "''" not in query:
+    """Пустой фильтр уже вшит как '' или \"\" (после unescape) — no-op до PG int \"\"."""
+    if not query:
         return query
-    # CategoryID = ''::int / = '' → no-op; не трогаем <> '' и голые ''
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    # только сравнение col = '' (пустой фильтр), не любое ''
-    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    if "''" not in query and '""' not in query:
+        return query
+    # '' и "" (часто из \"\" после unescape кавычек)
+    for lit in ("''", '""'):
+        query = re.sub(
+            rf"[\w.\"`\[\]]+?\s*=\s*{re.escape(lit)}\s*::\s*{_EMPTY_NUM_CAST}\b",
+            "TRUE",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            rf"{re.escape(lit)}\s*::\s*{_EMPTY_NUM_CAST}\b",
+            "NULL",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            rf"CAST\s*\(\s*{re.escape(lit)}\s+AS\s+{_EMPTY_NUM_CAST}\s*\)",
+            "NULL",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*{re.escape(lit)}\s*\)",
+            "TRUE",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*{re.escape(lit)}\s*\)",
+            "TRUE",
+            query,
+            flags=re.IGNORECASE,
+        )
+        # только col = '' / col = "" — не трогаем coalesce(x,'') и <> ''
+        query = re.sub(rf"[\w.\"`\[\]]+?\s*=\s*{re.escape(lit)}", "TRUE", query)
     return query
 
 
@@ -1192,11 +1198,19 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         if not _is_empty(param.value):
             continue
         had_empty = True
-        # убрать @Param из query до applyQueryParameters (иначе вшьёт '' / 0 / *)
+        # убрать @Param до applyQueryParameters (иначе Stimulsoft вшьёт '' → int "")
         query = _soften_empty_param(query, name)
+        # safety: если @ остался, не давать вшить ''
+        if _is_number_param(param) or _type_looks_numeric(
+            str(param.typeName or ""), name
+        ):
+            param.typeGroup = "number"
+            param.value = 0
+        else:
+            param.value = "*"
 
-    # клиент уже подставил '' вместо @Param — чиним только если фильтр пустой
-    if had_empty and "''" in (query or ""):
+    # клиент уже вшил пустой фильтр как '' / "" (в т.ч. после unescape \"\")
+    if had_empty or "''" in query or '""' in query:
         query = _soften_inlined_empty_literals(query)
 
     if query != query_from_client:
