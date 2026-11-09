@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Viewer Stimulsoft Dashboards.PYTHON для .mrt + Postgres.
 
-Сейчас цель простая:
-  - открыть дашборд
-  - показать панель фильтров (Parameters Panel)
-  - писать выбранные параметры в sql_trace.txt
-  - SQL/результаты разберём отдельно позже
+  - открыть дашборд + панель фильтров (Parameters Panel)
+  - передать выбранные фильтры в SQL
+  - писать в sql_trace.txt: параметры и SQL с подстановкой
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
@@ -27,6 +25,7 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
+from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -999,26 +998,85 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
     _sql_log_add({"phase": "parameters", "selected": selected})
 
 
-def _format_params_log_block(entry: dict) -> str:
-    """Пока пишем в файл только выбранные параметры."""
-    if entry.get("phase") != "parameters":
+def _params_dict(params: dict | None) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for name, param in (params or {}).items():
+        out[str(name)] = getattr(param, "value", param)
+    return out
+
+
+def _substitute_sql(query: str, params: dict | None) -> str:
+    """Как Stimulsoft: @Param → литерал из values."""
+    if not query:
         return ""
+    try:
+        return StiSqlAdapter.applyQueryParameters(query, params or {}, escape=True)
+    except Exception as exc:
+        return f"{query}\n-- substitute error: {exc}"
+
+
+def _format_log_block(entry: dict) -> str:
+    """Блок для sql_trace.txt: параметры панели и/или SQL с подстановкой."""
+    phase = entry.get("phase")
     ts = entry.get("ts") or ""
-    lines = [f"===== {ts} =====", "Параметры:"]
-    selected = entry.get("selected") or {}
-    if not selected:
-        lines.append("  (пусто)")
-    else:
-        for key, value in selected.items():
-            lines.append(f"  {key} = {value!r}")
-    lines.append("")
-    return "\n".join(lines) + "\n"
+    if phase == "parameters":
+        lines = [f"===== {ts} =====", "Параметры (фильтры):"]
+        selected = entry.get("selected") or {}
+        if not selected:
+            lines.append("  (пусто)")
+        else:
+            for key, value in selected.items():
+                lines.append(f"  {key} = {value!r}")
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    if phase == "sql":
+        lines = [
+            f"===== {ts} =====",
+            f"SQL source={entry.get('source') or '?'} "
+            f"connection={entry.get('connection') or '?'} "
+            f"command={entry.get('command') or '?'}",
+        ]
+        panel = entry.get("panel_params") or {}
+        if panel:
+            lines.append("Параметры (фильтры):")
+            for key, value in panel.items():
+                lines.append(f"  {key} = {value!r}")
+        sql_params = entry.get("sql_params") or {}
+        lines.append("Параметры SQL:")
+        if not sql_params:
+            lines.append("  (нет)")
+        else:
+            for key, value in sql_params.items():
+                lines.append(f"  @{key} = {value!r}")
+        lines.append("SQL исходный:")
+        lines.append(entry.get("sql_raw") or "(пусто)")
+        lines.append("SQL с подстановкой:")
+        lines.append(entry.get("sql_substituted") or "(пусто)")
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    if phase == "result":
+        lines = [
+            f"===== {ts} =====",
+            f"Результат source={entry.get('source') or '?'}:",
+        ]
+        if entry.get("error"):
+            lines.append(f"  error: {entry.get('error')}")
+        else:
+            lines.append(
+                f"  ok rows={entry.get('rows')} cols={entry.get('columns')}"
+            )
+        lines.append("")
+        return "\n".join(lines) + "\n"
+
+    return ""
 
 
 def _sql_log_write_file(entry: dict) -> None:
-    """В sql_trace.txt — только параметры (SQL/результат пока не логируем)."""
+    """Append параметров / SQL / результата в sql_trace.txt."""
     try:
-        block = _format_params_log_block(entry)
+        block = _format_log_block(entry)
         if not block:
             return
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1034,9 +1092,27 @@ def _sql_log_add(entry: dict) -> None:
         **entry,
     }
     SQL_LOG.appendleft(entry)
-    # в файл — только parameters; sql/result пока пропускаем
-    if entry.get("phase") == "parameters":
+    phase = entry.get("phase")
+    if phase == "parameters":
         print(f"[viewer] Параметры {entry.get('selected')}", flush=True)
+    elif phase == "sql":
+        print(
+            f"[viewer] SQL {entry.get('source')}: "
+            f"{(entry.get('sql_substituted') or '')[:120]!r}",
+            flush=True,
+        )
+    elif phase == "result":
+        if entry.get("error"):
+            print(
+                f"[viewer] SQL result {entry.get('source')} ERROR: {entry.get('error')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[viewer] SQL result {entry.get('source')} rows={entry.get('rows')}",
+                flush=True,
+            )
+    if phase in {"parameters", "sql", "result"}:
         _sql_log_write_file(entry)
 
 
@@ -1048,15 +1124,20 @@ def _reset_sql_trace_file() -> None:
             fh.write(
                 f"sql_trace {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
                 f"mrt: {MRT_PATH.resolve()}\n"
-                "пока только параметры\n\n"
+                "формат: параметры фильтров → SQL исходный → SQL с подстановкой → результат\n\n"
             )
         print(f"[viewer] sql_trace → {SQL_LOG_PATH.resolve()}", flush=True)
     except Exception as exc:
         print(f"[viewer] sql_trace reset failed: {exc}", flush=True)
 
 
+def _should_log_sql_command(args: StiDataEventArgs) -> bool:
+    cmd = getattr(args.command, "value", None) or str(args.command or "")
+    return cmd in {"ExecuteQuery", "Execute", "GetData"} or bool(args.queryString)
+
+
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string; пустые params смягчаем. Лог SQL пока отключён."""
+    """Подмена connection string; пустые params → no-op; лог SQL с подстановкой."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1092,10 +1173,44 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if query != query_from_client:
         args.queryString = query
 
+    if not _should_log_sql_command(args):
+        return
+
+    sql_params = _params_dict(params)
+    substituted = _substitute_sql(query, params)
+    _sql_log_add(
+        {
+            "phase": "sql",
+            "source": src,
+            "connection": connection,
+            "command": getattr(args.command, "value", None) or str(args.command or ""),
+            "panel_params": dict(LAST_VARIABLES),
+            "sql_params": sql_params,
+            "sql_raw": query,
+            "sql_substituted": substituted,
+        }
+    )
+
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """Пока без лога результата — только чтобы handler отработал."""
-    return
+    """Краткий результат запроса в sql_trace.txt."""
+    if not _should_log_sql_command(args):
+        return
+    src = args.dataSource or "?"
+    result = args.result
+    entry: dict = {"phase": "result", "source": src}
+    if result is None:
+        entry["rows"] = None
+        entry["columns"] = None
+    elif getattr(result, "success", True) is False:
+        entry["error"] = getattr(result, "notice", None) or str(result)
+    else:
+        cols = getattr(result, "columns", None) or []
+        rows = getattr(result, "rows", None)
+        count = getattr(result, "count", None)
+        entry["columns"] = list(cols) if cols else []
+        entry["rows"] = count if count is not None else (len(rows) if rows is not None else 0)
+    _sql_log_add(entry)
 
 
 @app.get("/mrt")
@@ -1123,7 +1238,7 @@ def debug():
     info["last_variables"] = dict(LAST_VARIABLES)
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     info["note_sql_log"] = (
-        "Пока в sql_trace.txt пишем только выбранные параметры. SQL/результат — позже."
+        "sql_trace.txt: параметры фильтров → SQL исходный → SQL с подстановкой → результат."
     )
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
