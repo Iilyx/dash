@@ -3,7 +3,7 @@
 
   - открыть дашборд + панель фильтров (Parameters Panel)
   - передать выбранные фильтры в SQL
-  - писать в sql_trace.txt: параметры и SQL с подстановкой
+  - писать в sql_trace JSON: params, sql_template(.mrt), sql_from_client, sql_substituted
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
@@ -43,6 +43,8 @@ from extract_mrt import (
 ROOT = Path(__file__).resolve().parent
 SQL_LOG: deque[dict] = deque(maxlen=80)
 LAST_VARIABLES: dict[str, object] = {}
+# SqlCommand из .mrt (с @param). Клиент часто шлёт queryString уже без @.
+SOURCE_SQL_TEMPLATES: dict[str, str] = {}
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -175,7 +177,7 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
 # Файл: параметры → заполненный SQL → результат (append)
-_sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.txt").strip() or "sql_trace.txt"
+_sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
 SQL_LOG_PATH = path_of(_sql_log_raw)
 
 # RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
@@ -995,7 +997,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
 
     LAST_VARIABLES = selected
-    _sql_log_add({"phase": "parameters", "selected": selected})
+    _sql_log_add({"phase": "parameters", "params": selected})
 
 
 def _params_dict(params: dict | None) -> dict[str, object]:
@@ -1005,83 +1007,83 @@ def _params_dict(params: dict | None) -> dict[str, object]:
     return out
 
 
+def _sql_at_names(query: str) -> set[str]:
+    if not query:
+        return set()
+    return {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
+
+
 def _substitute_sql(query: str, params: dict | None) -> str:
     """Как Stimulsoft: @Param → литерал из values."""
     if not query:
         return ""
+    if not params or not _sql_at_names(query):
+        return query
     try:
         return StiSqlAdapter.applyQueryParameters(query, params or {}, escape=True)
     except Exception as exc:
         return f"{query}\n-- substitute error: {exc}"
 
 
-def _format_log_block(entry: dict) -> str:
-    """Блок для sql_trace.txt: параметры панели и/или SQL с подстановкой."""
-    phase = entry.get("phase")
-    ts = entry.get("ts") or ""
-    if phase == "parameters":
-        lines = [f"===== {ts} =====", "Параметры (фильтры):"]
-        selected = entry.get("selected") or {}
-        if not selected:
-            lines.append("  (пусто)")
-        else:
-            for key, value in selected.items():
-                lines.append(f"  {key} = {value!r}")
-        lines.append("")
-        return "\n".join(lines) + "\n"
+def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
+    """Запомнить SqlCommand с @param из .mrt (клиент шлёт query уже заполненным)."""
+    global SOURCE_SQL_TEMPLATES
+    try:
+        if report is None:
+            report = load_mrt(MRT_PATH)
+    except Exception as exc:
+        print(f"[viewer] sql templates: {exc}", flush=True)
+        return SOURCE_SQL_TEMPLATES
+    dictionary = report.get("Dictionary") if isinstance(report, dict) else {}
+    templates: dict[str, str] = {}
+    for source in numbered((dictionary or {}).get("DataSources")):
+        if not isinstance(source, dict):
+            continue
+        name = (source.get("Name") or "").strip()
+        sql = str(
+            source.get("SqlCommand")
+            or source.get("Query")
+            or source.get("SqlQuery")
+            or ""
+        ).strip()
+        if name and sql:
+            templates[name] = sql
+    SOURCE_SQL_TEMPLATES = templates
+    print(f"[viewer] sql templates loaded: {len(templates)}", flush=True)
+    return templates
 
-    if phase == "sql":
-        lines = [
-            f"===== {ts} =====",
-            f"SQL source={entry.get('source') or '?'} "
-            f"connection={entry.get('connection') or '?'} "
-            f"command={entry.get('command') or '?'}",
-        ]
-        panel = entry.get("panel_params") or {}
-        if panel:
-            lines.append("Параметры (фильтры):")
-            for key, value in panel.items():
-                lines.append(f"  {key} = {value!r}")
-        sql_params = entry.get("sql_params") or {}
-        lines.append("Параметры SQL:")
-        if not sql_params:
-            lines.append("  (нет)")
-        else:
-            for key, value in sql_params.items():
-                lines.append(f"  @{key} = {value!r}")
-        lines.append("SQL исходный:")
-        lines.append(entry.get("sql_raw") or "(пусто)")
-        lines.append("SQL с подстановкой:")
-        lines.append(entry.get("sql_substituted") or "(пусто)")
-        lines.append("")
-        return "\n".join(lines) + "\n"
 
-    if phase == "result":
-        lines = [
-            f"===== {ts} =====",
-            f"Результат source={entry.get('source') or '?'}:",
-        ]
-        if entry.get("error"):
-            lines.append(f"  error: {entry.get('error')}")
-        else:
-            lines.append(
-                f"  ok rows={entry.get('rows')} cols={entry.get('columns')}"
-            )
-        lines.append("")
-        return "\n".join(lines) + "\n"
-
+def _lookup_sql_template(data_source: str | None) -> str:
+    if not data_source:
+        return ""
+    if not SOURCE_SQL_TEMPLATES:
+        _refresh_sql_templates()
+    if data_source in SOURCE_SQL_TEMPLATES:
+        return SOURCE_SQL_TEMPLATES[data_source]
+    lower = data_source.lower()
+    for name, sql in SOURCE_SQL_TEMPLATES.items():
+        if name.lower() == lower:
+            return sql
     return ""
 
 
+def _json_safe(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
 def _sql_log_write_file(entry: dict) -> None:
-    """Append параметров / SQL / результата в sql_trace.txt."""
+    """Append одного JSON-события в sql_trace (JSON Lines)."""
     try:
-        block = _format_log_block(entry)
-        if not block:
-            return
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(block)
+            fh.write(json.dumps(_json_safe(entry), ensure_ascii=False, indent=2))
+            fh.write("\n")
     except Exception as exc:
         print(f"[viewer] sql log file write failed: {exc}", flush=True)
 
@@ -1094,11 +1096,12 @@ def _sql_log_add(entry: dict) -> None:
     SQL_LOG.appendleft(entry)
     phase = entry.get("phase")
     if phase == "parameters":
-        print(f"[viewer] Параметры {entry.get('selected')}", flush=True)
+        print(f"[viewer] Параметры {entry.get('params')}", flush=True)
     elif phase == "sql":
         print(
-            f"[viewer] SQL {entry.get('source')}: "
-            f"{(entry.get('sql_substituted') or '')[:120]!r}",
+            f"[viewer] SQL {entry.get('source')} "
+            f"filled={entry.get('client_already_filled')} "
+            f"sub={(entry.get('sql_substituted') or '')[:100]!r}",
             flush=True,
         )
     elif phase == "result":
@@ -1117,15 +1120,21 @@ def _sql_log_add(entry: dict) -> None:
 
 
 def _reset_sql_trace_file() -> None:
-    """Новый сеанс — чистый файл."""
+    """Новый сеанс — чистый JSONL."""
     try:
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        header = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "phase": "session",
+            "mrt": str(MRT_PATH.resolve()),
+            "format": (
+                "JSONL: params → sql_template(.mrt @param) → "
+                "sql_from_client → sql_substituted → result"
+            ),
+        }
         with SQL_LOG_PATH.open("w", encoding="utf-8") as fh:
-            fh.write(
-                f"sql_trace {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
-                f"mrt: {MRT_PATH.resolve()}\n"
-                "формат: параметры фильтров → SQL исходный → SQL с подстановкой → результат\n\n"
-            )
+            fh.write(json.dumps(header, ensure_ascii=False, indent=2))
+            fh.write("\n")
         print(f"[viewer] sql_trace → {SQL_LOG_PATH.resolve()}", flush=True)
     except Exception as exc:
         print(f"[viewer] sql_trace reset failed: {exc}", flush=True)
@@ -1137,7 +1146,7 @@ def _should_log_sql_command(args: StiDataEventArgs) -> bool:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string; пустые params → no-op; лог SQL с подстановкой."""
+    """Подмена connection string; пустые params → no-op; лог JSON: шаблон .mrt + SQL."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1148,8 +1157,14 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
+    # клиент часто шлёт SQL уже без @param
     query_from_client = args.queryString or ""
     query = query_from_client
+    query_template = _lookup_sql_template(src) or ""
+    client_already_filled = bool(query_from_client) and not _sql_at_names(
+        query_from_client
+    )
+
     params = args.parameters or {}
     had_empty = False
     for name, param in params.items():
@@ -1176,24 +1191,30 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if not _should_log_sql_command(args):
         return
 
-    sql_params = _params_dict(params)
-    substituted = _substitute_sql(query, params)
+    # подстановку делаем по шаблону .mrt, если в нём ещё есть @param
+    fill_base = query_template if _sql_at_names(query_template) else query
+    substituted = _substitute_sql(fill_base, params)
+    if fill_base == query and not _sql_at_names(fill_base):
+        substituted = query
+
     _sql_log_add(
         {
             "phase": "sql",
             "source": src,
             "connection": connection,
             "command": getattr(args.command, "value", None) or str(args.command or ""),
-            "panel_params": dict(LAST_VARIABLES),
-            "sql_params": sql_params,
-            "sql_raw": query,
+            "client_already_filled": client_already_filled,
+            "params": dict(LAST_VARIABLES),
+            "sql_params": _params_dict(params),
+            "sql_template": query_template,
+            "sql_from_client": query_from_client,
             "sql_substituted": substituted,
         }
     )
 
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """Краткий результат запроса в sql_trace.txt."""
+    """Результат запроса — JSON в sql_trace."""
     if not _should_log_sql_command(args):
         return
     src = args.dataSource or "?"
@@ -1218,6 +1239,10 @@ def serve_mrt():
     """Отдать .mrt с патчем панели фильтров."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
+    try:
+        _refresh_sql_templates(json.loads(patched))
+    except Exception:
+        _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
     resp = Response(patched, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
@@ -1238,7 +1263,8 @@ def debug():
     info["last_variables"] = dict(LAST_VARIABLES)
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     info["note_sql_log"] = (
-        "sql_trace.txt: параметры фильтров → SQL исходный → SQL с подстановкой → результат."
+        "sql_trace JSONL: params → sql_template(.mrt @param) → "
+        "sql_from_client → sql_substituted → result."
     )
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
