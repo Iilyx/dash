@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
-"""Отдельный viewer Stimulsoft Dashboards.PYTHON для .mrt.
+"""Viewer Stimulsoft Dashboards.PYTHON для .mrt + Postgres.
 
-Документация Stimulsoft (панель параметров = «панель фильтров»):
-  https://www.stimulsoft.com/en/documentation/online/user-manual/data_data_dictionary_variables.htm
-  https://stimulsoft.github.io/Stimulsoft.Reports.Dashboards.Programming.Manual/Reports_and_Dashboards_for_Python/Web_Viewer/Work_with_Parameters
-
-Чтобы переменная была на панели фильтров + Submit:
-  1) RequestFromUser = true
-  2) Report.RequestParameters = true
-  3) ParametersDisplayMode = Panel|Dialog  (Panel — полоса сверху; Dialog — окно)
-  В JS 2026.x ShowOnParametersPanel = алиас RequestFromUser (отдельного флага нет).
-  DialogInfo Columns: список значений грузится SQL (пустые int смягчаем, не режем Columns).
-
-Canvas ComboBox/TreeView — другие фильтры (без Submit).
+Сейчас цель простая:
+  - открыть дашборд
+  - показать панель фильтров (Parameters Panel)
+  - писать выбранные параметры в sql_trace.txt
+  - SQL/результаты разберём отдельно позже
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
-  # http://127.0.0.1:8040/  и  /debug
-
-FORCE_REQUEST_PARAMETERS=0 — не ждать Submit (сразу грузить SQL DataSources)
-FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
-FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns
 """
 
 from __future__ import annotations
@@ -30,7 +18,6 @@ import json
 import os
 import re
 import sys
-import time
 import webbrowser
 from collections import deque
 from datetime import datetime, timezone
@@ -55,13 +42,8 @@ from extract_mrt import (
 )
 
 ROOT = Path(__file__).resolve().parent
-# Последние SQL/data-запросы к handler (видно в /debug → sql_log)
 SQL_LOG: deque[dict] = deque(maxlen=80)
-# Выбранные RFU с панели (onPrepareVariables) — для лога вместе с SQL
 LAST_VARIABLES: dict[str, object] = {}
-# SqlCommand из .mrt (ключ — Name и Alias источника)
-SOURCE_SQL_TEMPLATES: dict[str, str] = {}
-SOURCE_SQL_META: dict[str, dict] = {}
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -1014,74 +996,32 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
 
     LAST_VARIABLES = selected
-    print(f"[viewer][1/3 PARAMETERS] selected={selected}", flush=True)
-    _sql_log_add(
-        {
-            "phase": "parameters",
-            "step": "1/3",
-            "selected": selected,
-        }
-    )
+    _sql_log_add({"phase": "parameters", "selected": selected})
 
 
-def _format_sql_log_block(entry: dict) -> str:
-    """Короткий лог: Шаг 1 / Шаг 2 / Шаг 3."""
-    ts = entry.get("ts") or ""
-    phase = entry.get("phase") or ""
-    lines: list[str] = []
-    if phase == "parameters":
-        lines.append(f"===== {ts} =====")
-        lines.append("Шаг 1. Параметры")
-        selected = entry.get("selected") or {}
-        if not selected:
-            lines.append("(пусто)")
-        else:
-            for key, value in selected.items():
-                lines.append(f"  {key} = {value!r}")
-    elif phase == "sql":
-        lines.append("Шаг 2. SQL")
-        lines.append(f"  source: {entry.get('source')}")
-        # итоговый SQL — что реально уходит (filled или from_client)
-        final_sql = (
-            entry.get("query_filled")
-            or entry.get("query_from_client")
-            or entry.get("query")
-            or ""
-        )
-        lines.append("  sql:")
-        lines.append(final_sql)
-        params = entry.get("sql_parameters") or {}
-        if params:
-            lines.append("  params:")
-            for key, meta in params.items():
-                if isinstance(meta, dict):
-                    val = meta.get("value_after", meta.get("value"))
-                else:
-                    val = meta
-                lines.append(f"    @{key} = {val!r}")
-    elif phase == "result":
-        ok = entry.get("success")
-        rows = entry.get("rows")
-        notice = entry.get("notice")
-        lines.append("Шаг 3. Результат")
-        lines.append(f"  source: {entry.get('source')}")
-        lines.append(f"  ok: {ok}")
-        lines.append(f"  rows: {rows}")
-        if notice:
-            lines.append(f"  error: {notice}")
-        lines.append("")  # пустая строка между запросами
-    else:
+def _format_params_log_block(entry: dict) -> str:
+    """Пока пишем в файл только выбранные параметры."""
+    if entry.get("phase") != "parameters":
         return ""
+    ts = entry.get("ts") or ""
+    lines = [f"===== {ts} =====", "Параметры:"]
+    selected = entry.get("selected") or {}
+    if not selected:
+        lines.append("  (пусто)")
+    else:
+        for key, value in selected.items():
+            lines.append(f"  {key} = {value!r}")
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
 def _sql_log_write_file(entry: dict) -> None:
+    """В sql_trace.txt — только параметры (SQL/результат пока не логируем)."""
     try:
-        SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        block = _format_sql_log_block(entry)
+        block = _format_params_log_block(entry)
         if not block:
             return
+        SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(block)
     except Exception as exc:
@@ -1094,39 +1034,10 @@ def _sql_log_add(entry: dict) -> None:
         **entry,
     }
     SQL_LOG.appendleft(entry)
-    phase = entry.get("phase") or "log"
-    # в консоль — коротко, без простыни
-    if phase == "parameters":
-        print(f"[viewer] Шаг 1. Параметры {entry.get('selected')}", flush=True)
-    elif phase == "sql":
-        q = (entry.get("query_filled") or entry.get("query_from_client") or "")[:200]
-        print(
-            f"[viewer] Шаг 2. SQL source={entry.get('source')!r} {q!r}",
-            flush=True,
-        )
-    elif phase == "result":
-        print(
-            f"[viewer] Шаг 3. Результат source={entry.get('source')!r} "
-            f"ok={entry.get('success')} rows={entry.get('rows')} "
-            f"error={entry.get('notice')!r}",
-            flush=True,
-        )
-    else:
-        print(f"[viewer][sql:{phase}] {entry}", flush=True)
-    _sql_log_write_file(entry)
-
-
-def _sql_at_names(query: str) -> set[str]:
-    if not query:
-        return set()
-    return {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
-
-
-def _sql_brace_names(query: str) -> set[str]:
-    """Stimulsoft-выражения {Variable} в тексте SQL."""
-    if not query:
-        return set()
-    return {m.group(1) for m in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", query)}
+    # в файл — только parameters; sql/result пока пропускаем
+    if entry.get("phase") == "parameters":
+        print(f"[viewer] Параметры {entry.get('selected')}", flush=True)
+        _sql_log_write_file(entry)
 
 
 def _reset_sql_trace_file() -> None:
@@ -1137,202 +1048,33 @@ def _reset_sql_trace_file() -> None:
             fh.write(
                 f"sql_trace {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
                 f"mrt: {MRT_PATH.resolve()}\n"
-                "Шаг 1 = параметры, Шаг 2 = SQL, Шаг 3 = результат\n\n"
+                "пока только параметры\n\n"
             )
         print(f"[viewer] sql_trace → {SQL_LOG_PATH.resolve()}", flush=True)
     except Exception as exc:
         print(f"[viewer] sql_trace reset failed: {exc}", flush=True)
 
 
-def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
-    """Запомнить SqlCommand из .mrt по Name и Alias (клиент шлёт query уже заполненным)."""
-    global SOURCE_SQL_TEMPLATES, SOURCE_SQL_META
-    try:
-        if report is None:
-            report = load_mrt(MRT_PATH)
-    except Exception as exc:
-        print(f"[viewer] sql templates: {exc}", flush=True)
-        return SOURCE_SQL_TEMPLATES
-    dictionary = report.get("Dictionary") if isinstance(report, dict) else {}
-    templates: dict[str, str] = {}
-    meta: dict[str, dict] = {}
-    for source in numbered((dictionary or {}).get("DataSources")):
-        if not isinstance(source, dict):
-            continue
-        name = (source.get("Name") or "").strip()
-        alias = (source.get("Alias") or "").strip()
-        sql = str(
-            source.get("SqlCommand")
-            or source.get("Query")
-            or source.get("SqlQuery")
-            or ""
-        ).strip()
-        if not sql:
-            continue
-        param_names = []
-        for p in numbered(source.get("Parameters")):
-            if isinstance(p, dict) and p.get("Name"):
-                param_names.append(str(p.get("Name")))
-        info = {
-            "name": name or None,
-            "alias": alias or None,
-            "sql": sql,
-            "at_names": sorted(_sql_at_names(sql)),
-            "parameter_names": param_names,
-        }
-        for key in {name, alias, name.lower() if name else "", alias.lower() if alias else ""}:
-            if not key:
-                continue
-            templates[key] = sql
-            meta[key] = info
-    SOURCE_SQL_TEMPLATES = templates
-    SOURCE_SQL_META = meta
-    print(
-        f"[viewer] sql templates loaded: {len({t for t in templates})} keys, "
-        f"unique sql={len({id(v) for v in templates.values()})}",
-        flush=True,
-    )
-    return templates
-
-
-def _lookup_sql_template(data_source: str | None) -> str:
-    if not data_source:
-        return ""
-    if not SOURCE_SQL_TEMPLATES:
-        _refresh_sql_templates()
-    if data_source in SOURCE_SQL_TEMPLATES:
-        return SOURCE_SQL_TEMPLATES[data_source]
-    lower = data_source.lower()
-    if lower in SOURCE_SQL_TEMPLATES:
-        return SOURCE_SQL_TEMPLATES[lower]
-    for name, sql in SOURCE_SQL_TEMPLATES.items():
-        if name.lower() == lower:
-            return sql
-    return ""
-
-
-def _lookup_sql_meta(data_source: str | None) -> dict:
-    if not data_source:
-        return {}
-    if not SOURCE_SQL_META:
-        _refresh_sql_templates()
-    if data_source in SOURCE_SQL_META:
-        return SOURCE_SQL_META[data_source]
-    lower = data_source.lower()
-    if lower in SOURCE_SQL_META:
-        return SOURCE_SQL_META[lower]
-    for name, info in SOURCE_SQL_META.items():
-        if name.lower() == lower:
-            return info
-    return {}
-
-
-def _filled_sql_preview(query: str, params: dict) -> str:
-    """Как Stimulsoft подставит @param в SQL (только для лога)."""
-    if not query:
-        return ""
-    if not params or not _sql_at_names(query):
-        return query
-    try:
-        from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
-
-        return StiSqlAdapter.applyQueryParameters(query, params, True)
-    except Exception as exc:
-        return f"{query}\n/* fill preview error: {exc} */"
-
-
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string; лог: параметры → шаблон из .mrt → заполненный SQL."""
-    t0 = time.perf_counter()
+    """Подмена connection string; пустые params смягчаем. Лог SQL пока отключён."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
-    command = getattr(args.command, "value", args.command)
-    database = getattr(args.database, "value", args.database)
     if PG_CONN:
-        was = args.connectionString
         args.connectionString = PG_CONN
-        print(
-            f"[viewer] DB force connection={connection!r} source={src!r} "
-            f"command={command!r} was={mask_pg_conn(was or '')!r} "
-            f"now={mask_pg_conn(PG_CONN)!r} "
-            f"database={database!r}",
-            flush=True,
-        )
     else:
         print(
-            f"[viewer] DB MISSING .env — connection={connection!r} source={src!r} "
-            f"command={command!r} conn={mask_pg_conn(args.connectionString or '')!r}",
+            f"[viewer] DB MISSING .env — source={src!r} connection={connection!r}",
             flush=True,
         )
 
-    # то, что прислал клиент (часто уже без @param — значения вшиты)
     query_from_client = args.queryString or ""
     query = query_from_client
-    # шаблон ТОЛЬКО из .mrt (никогда не подменяем клиентским SQL)
-    mrt_meta = _lookup_sql_meta(src)
-    query_template = (mrt_meta.get("sql") if mrt_meta else None) or _lookup_sql_template(
-        src
-    ) or ""
-    template_at = sorted(_sql_at_names(query_template)) if query_template else []
-    template_braces = sorted(_sql_brace_names(query_template)) if query_template else []
-    client_already_filled = bool(query_from_client) and not _sql_at_names(
-        query_from_client
-    )
-    same_as_client = bool(
-        query_template
-        and query_from_client
-        and query_template.strip() == query_from_client.strip()
-    )
-    available_keys = sorted({k for k in SOURCE_SQL_TEMPLATES if k})[:40]
-    if not query_template:
-        template_note = (
-            f"для source={src!r} в .mrt НЕ найден SqlCommand. "
-            f"Доступные Name/Alias: {available_keys}. "
-            "Блок A пустой — заполненный SQL только в B (от клиента)."
-        )
-    elif same_as_client:
-        template_note = (
-            "A == B: текст в .mrt совпадает с тем, что прислал клиент. "
-            "Либо в SqlCommand уже литералы (нет @param), либо клиент не менял запрос."
-        )
-    elif not template_at and not template_braces:
-        template_note = (
-            "в A (SqlCommand из .mrt) НЕТ @param и нет {Variable}. "
-            "Запрос в файле уже с литералами или без фильтров. "
-            "sql_parameters ниже — это то, что клиент прислал ОТДЕЛЬНО; "
-            "они могли НЕ попасть в текст A. Смотри B — что реально ушло в PG."
-        )
-    elif template_at and client_already_filled:
-        template_note = (
-            "нормально: A = шаблон с @param из .mrt; B = клиент уже подставил значения."
-        )
-    elif template_braces and not template_at:
-        template_note = (
-            "в A есть {Variable}, но нет @param — Stimulsoft-выражения в SQL."
-        )
-    else:
-        template_note = "см. A/B/C ниже."
-
     params = args.parameters or {}
-    param_dump: dict[str, object] = {}
-    selected_sql: dict[str, object] = {}
     had_empty = False
     for name, param in params.items():
-        param_dump[name] = {
-            "typeGroup": param.typeGroup,
-            "typeName": param.typeName,
-            "value": param.value,
-        }
-        selected_sql[name] = param.value
-        print(
-            f"[viewer]   @{name} typeGroup={param.typeGroup!r} "
-            f"typeName={param.typeName!r} value={param.value!r}",
-            flush=True,
-        )
         if not _is_empty(param.value):
             continue
         had_empty = True
-        kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
         query = _soften_empty_param(query, name)
         if _is_number_param(param) or _type_looks_numeric(
             str(param.typeName or ""), name
@@ -1341,136 +1083,26 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             param.value = 0
         else:
             param.value = "*"
-        param_dump[name]["value_after"] = param.value
-        selected_sql[name] = param.value
-        print(
-            f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
-            flush=True,
-        )
 
     if had_empty or "''" in (query or ""):
-        before = query
         query = _soften_inlined_empty_literals(query)
         if "''" in query:
             query = query.replace("''", "NULL")
-        if query != before:
-            print(f"[viewer] softened inlined '' on {src}", flush=True)
 
     if query != query_from_client:
         args.queryString = query
 
-    # 1/3 — что выбрали (панель + sql params)
-    print(
-        f"[viewer][1/3 PARAMETERS] source={src!r} "
-        f"panel={LAST_VARIABLES} sql_params={selected_sql}",
-        flush=True,
-    )
-
-    # 2/3 — A .mrt / B клиент / C filled preview
-    if template_at:
-        filled = _filled_sql_preview(query_template, params)
-    else:
-        filled = query  # нечего подставлять в шаблон — уйдёт то, что после soften
-    print(
-        f"[viewer][2/3 SQL] source={src!r} connection={connection!r}\n"
-        f"  note: {template_note}\n"
-        f"  A .mrt:      {(query_template or '(нет)')[:400].replace(chr(10), ' ')}\n"
-        f"  B client:    {query_from_client[:400].replace(chr(10), ' ')}\n"
-        f"  C filled:    {filled[:400].replace(chr(10), ' ')}",
-        flush=True,
-    )
-
-    _sql_log_add(
-        {
-            "phase": "sql",
-            "step": "2/3",
-            "connection": connection,
-            "source": src,
-            "command": command,
-            "database": str(database),
-            "pg_forced": bool(PG_CONN),
-            "client_already_filled": client_already_filled,
-            "template_same_as_client": same_as_client,
-            "template_has_at": bool(template_at),
-            "template_at_names": template_at,
-            "template_brace_names": template_braces,
-            "template_note": template_note,
-            "mrt_path": str(MRT_PATH.resolve()),
-            "mrt_source_name": (mrt_meta or {}).get("name"),
-            "mrt_parameter_names": (mrt_meta or {}).get("parameter_names") or [],
-            "lookup_keys_sample": available_keys,
-            "panel_selected": dict(LAST_VARIABLES),
-            "sql_parameters": param_dump,
-            "query_template": (query_template or "")[:4000],
-            "query_from_client": query_from_client[:4000],
-            "query_filled": filled[:4000],
-            "query": (args.queryString or "")[:4000],
-            "ms": round((time.perf_counter() - t0) * 1000, 1),
-        }
-    )
-
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """3/3 — результат SQL."""
-    src = args.dataSource or "?"
-    connection = args.connection or "?"
-    command = getattr(args.command, "value", args.command)
-    result = args.result
-    success = getattr(result, "success", None) if result is not None else None
-    notice = getattr(result, "notice", None) if result is not None else None
-    rows = None
-    sample = None
-    try:
-        data = getattr(result, "data", None) if result is not None else None
-        if data is not None:
-            rows = len(data)
-            # первые строки для лога (если список)
-            if isinstance(data, list) and data:
-                sample = data[:3]
-            elif hasattr(data, "__getitem__") and rows:
-                try:
-                    sample = [data[i] for i in range(min(3, rows))]
-                except Exception:
-                    sample = None
-    except Exception:
-        rows = None
-    # SQL из предыдущего шага 2/3 для этого source
-    filled = None
-    for item in SQL_LOG:
-        if item.get("phase") == "sql" and item.get("source") == src:
-            filled = item.get("query_filled") or item.get("query")
-            break
-    entry = {
-        "phase": "result",
-        "step": "3/3",
-        "connection": connection,
-        "source": src,
-        "command": command,
-        "success": success,
-        "notice": notice,
-        "rows": rows,
-        "sample": sample,
-        "query_filled": filled,
-    }
-    _sql_log_add(entry)
-    print(
-        f"[viewer][3/3 RESULT] source={src!r} success={success} rows={rows} "
-        f"notice={notice!r}",
-        flush=True,
-    )
-    if success is False and notice:
-        print(f"[viewer][3/3 RESULT] ERROR sql={filled!r}", flush=True)
+    """Пока без лога результата — только чтобы handler отработал."""
+    return
 
 
 @app.get("/mrt")
 def serve_mrt():
-    """Отдать .mrt с RequestParameters/Dialog — иначе viewer без Submit."""
+    """Отдать .mrt с патчем панели фильтров."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
-    try:
-        _refresh_sql_templates(json.loads(patched))
-    except Exception:
-        _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
     resp = Response(patched, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
@@ -1491,8 +1123,7 @@ def debug():
     info["last_variables"] = dict(LAST_VARIABLES)
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     info["note_sql_log"] = (
-        "Пишется в файл SQL_LOG_PATH (по умолчанию sql_trace.txt) и в /debug.sql_log. "
-        "Шаги: parameters (1/3) → sql (2/3 template+filled) → result (3/3)."
+        "Пока в sql_trace.txt пишем только выбранные параметры. SQL/результат — позже."
     )
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
@@ -1571,69 +1202,17 @@ def viewer():
 def main() -> None:
     info = dashboard_debug(MRT_PATH)
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    vers = package_versions()
     _reset_sql_trace_file()
-    _refresh_sql_templates()
     print(f"MRT:     {MRT_PATH.resolve()}")
-    print(f"sql_log: {SQL_LOG_PATH.resolve()}")
-    print(f"sti:     {vers}")
-    print(f"mode:    ParametersDisplayMode={FORCE_PARAMETERS_MODE}")
-    print(f"anon:    {info.get('anonymized')}")
-    print(f"RFU:     {info.get('request_from_user_count')} variables")
-    print(f"panel:   {info.get('show_on_parameters_panel_count')} ShowOnParametersPanel")
-    print(f"filters: {info.get('filter_elements_count')} canvas elements")
-    print(
-        f"sources: {info.get('data_sources_count')} "
-        f"(sql={info.get('sql_sources_count')}) "
-        f"db={info.get('databases_count')}"
-    )
-    if info.get("sql_sources"):
-        print(
-            "sql:",
-            [
-                f"{s.get('name')}→{s.get('database') or '?'}"
-                for s in info["sql_sources"][:12]
-            ],
-        )
-    if info.get("show_on_parameters_panel_variables"):
-        print(
-            "panel names:",
-            [v.get("name") for v in info["show_on_parameters_panel_variables"]],
-        )
-    elif info.get("request_from_user_variables"):
-        print(
-            "RFU names:",
-            [v.get("name") for v in info["request_from_user_variables"]],
-        )
-    if info.get("filter_elements_on_canvas"):
-        print(
-            "canvas:",
-            [
-                f"{e.get('type')}:{e.get('name')}"
-                for e in info["filter_elements_on_canvas"]
-            ],
-        )
+    print(f"params:  {SQL_LOG_PATH.resolve()}")
+    print(f"panel:   {FORCE_PARAMETERS_MODE} / RFU={info.get('request_from_user_count')}")
     db = probe_database()
-    print(f"DB:      configured={db.get('configured')} ok={db.get('ok')}")
-    print(f"DB conn: {db.get('pg_conn_masked') or '(empty)'}")
+    print(f"DB:      ok={db.get('ok')} {db.get('pg_conn_masked') or ''}")
     if db.get("error"):
         print(f"DB ERR:  {db.get('error')}", flush=True)
-    elif db.get("ok"):
-        print(f"DB user: {db.get('user')} @ {db.get('database')}", flush=True)
     print(f"Open:    {url}")
-    print(f"Debug:   {url}debug")
-    if not db.get("configured"):
-        print(
-            "WARNING: нет Postgres в .env — DialogInfo Columns и SQL не смогут "
-            "подтянуть данные. Задай POSTGRES_* или DATABASE_URL.",
-            flush=True,
-        )
     if info.get("anonymized"):
-        print(
-            "WARNING: .mrt обезличен (пустые строки) — фильтров не будет. "
-            "Запусти: python view_dashboard.py /path/to/full.mrt",
-            flush=True,
-        )
+        print("WARNING: .mrt обезличен — нужен полный файл (MRT_PATH)", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
