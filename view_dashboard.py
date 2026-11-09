@@ -18,7 +18,8 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=0 — не ждать Submit (сразу грузить SQL DataSources)
+FORCE_REQUEST_PARAMETERS=1 — ждать Submit (передать выбранные фильтры в SQL)
+FORCE_ALLOW_SQL_PARAMETER=1 — AllowUseAsSqlParameter у RFU (иначе @param пустой)
 FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
 FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns
 """
@@ -40,6 +41,7 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
+from stimulsoft_data_adapters.classes.StiParameter import StiParameter
 from stimulsoft_data_adapters.enums import StiDatabaseType
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
@@ -54,6 +56,9 @@ from extract_mrt import (
     numbered,
     repair_mrt_json,
 )
+
+# Последние значения RFU с onPrepareVariables → подмешиваем в SQL @params
+LAST_VARIABLES: dict[str, object] = {}
 
 _FILE_DB_IDENTS = (
     "Excel",
@@ -225,9 +230,15 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
-# По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
-FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
+# RequestParameters=true → SQL после Submit (с выбранными фильтрами).
+# По умолчанию 1: иначе первый запрос уходит с пустыми @param (soften→TRUE),
+# и кажется, что выбранное «не передаётся» в источники.
+FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+FORCE_ALLOW_SQL_PARAMETER = os.environ.get("FORCE_ALLOW_SQL_PARAMETER", "1").lower() in {
     "1",
     "true",
     "yes",
@@ -810,6 +821,7 @@ def dashboard_debug(path: Path) -> dict:
             "+ RequestParameters. Canvas ComboBox/TreeView ← filter_elements (без Submit)."
         ),
         "force_request_parameters": FORCE_REQUEST_PARAMETERS,
+        "force_allow_sql_parameter": FORCE_ALLOW_SQL_PARAMETER,
         "force_parameters_mode": FORCE_PARAMETERS_MODE,
         "force_parameters_panel": FORCE_PARAMETERS_PANEL,
         "force_show_on_parameters_panel": FORCE_SHOW_ON_PARAMETERS_PANEL,
@@ -822,7 +834,8 @@ def dashboard_debug(path: Path) -> dict:
         "note_data_sources": (
             "SQL DataSources → PostgreSQL через patch Ident/NameInSource + "
             "onBeginProcessData (database=PostgreSQL, connection из .env). "
-            "Смотри mrt_patch.source_issues и sql_log."
+            "Фильтры: AllowUseAsSqlParameter + Submit (RequestParameters) + "
+            "inject из onPrepareVariables. Смотри sql_log.parameters / injected_from_variables."
         ),
     }
 
@@ -833,6 +846,77 @@ def mrt_has_request_from_user(report: dict) -> bool:
         if isinstance(variable, dict) and variable_is_parameters_panel_candidate(variable):
             return True
     return False
+
+
+def _sql_at_names(query: str) -> set[str]:
+    if not query:
+        return set()
+    return {m.group(1) for m in re.finditer(r"[@:]([A-Za-z_][A-Za-z0-9_]*)", query)}
+
+
+def _collect_sql_at_names(dictionary: dict) -> set[str]:
+    names: set[str] = set()
+    for source in numbered(dictionary.get("DataSources")):
+        if not isinstance(source, dict):
+            continue
+        sql = (
+            source.get("SqlCommand")
+            or source.get("Query")
+            or source.get("SqlQuery")
+            or ""
+        )
+        names |= _sql_at_names(str(sql))
+    return names
+
+
+def _param_type_group_for_value(value: object, name: str = "") -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if _type_looks_numeric("", name) and not isinstance(value, (list, dict)):
+        return "number"
+    return "string"
+
+
+def _inject_variables_into_sql_params(args: StiDataEventArgs, query: str) -> list[str]:
+    """Подставить значения RFU в args.parameters, если клиент прислал пустые/@без param."""
+    injected: list[str] = []
+    if not LAST_VARIABLES:
+        return injected
+    params = args.parameters
+    if params is None:
+        params = {}
+        args.parameters = params
+    at_lower = {n.lower(): n for n in _sql_at_names(query)}
+    params_lower = {str(k).lower(): k for k in params}
+    for var_name, value in LAST_VARIABLES.items():
+        if _is_empty(value):
+            continue
+        key_lower = var_name.lower()
+        in_query = key_lower in at_lower
+        param_key = params_lower.get(key_lower)
+        if not in_query and param_key is None:
+            continue
+        existing = params.get(param_key) if param_key is not None else None
+        if existing is not None and not _is_empty(existing.value):
+            continue
+        group = _param_type_group_for_value(value, var_name)
+        if existing is None:
+            use_name = at_lower.get(key_lower, var_name)
+            params[use_name] = StiParameter(use_name, 0, group, group, 0, value)
+            injected.append(use_name)
+        else:
+            if not existing.typeGroup:
+                existing.typeGroup = group
+            existing.value = value
+            injected.append(str(param_key))
+        print(
+            f"[viewer] inject @{injected[-1]}={value!r} from prepare_variables "
+            f"into {args.dataSource!r}",
+            flush=True,
+        )
+    return injected
 
 
 def _is_file_database(ident: str) -> bool:
@@ -1135,13 +1219,24 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     meta["source_issues"] = analyze_source_issues(report)
     rfu_forced = 0
     show_forced = 0
+    sql_param_forced = 0
     columns_softened = 0
     defaults_set = 0
     candidates = 0
+    sql_at = _collect_sql_at_names(dictionary)
     for variable in numbered(dictionary.get("Variables")):
         if not isinstance(variable, dict):
             continue
-        if not variable_is_parameters_panel_candidate(variable):
+        name = str(variable.get("Name") or "")
+        is_panel = variable_is_parameters_panel_candidate(variable)
+        used_in_sql = bool(name) and name.lower() in {n.lower() for n in sql_at}
+        # AllowUseAsSqlParameter — иначе движок не кладёт переменную в @param источника
+        if FORCE_ALLOW_SQL_PARAMETER and (is_panel or used_in_sql):
+            if not flag_true(variable.get("AllowUseAsSqlParameter")):
+                variable["AllowUseAsSqlParameter"] = True
+                sql_param_forced += 1
+                changed = True
+        if not is_panel:
             continue
         candidates += 1
         if not flag_true(variable.get("RequestFromUser")):
@@ -1176,6 +1271,8 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     meta["panel_candidates"] = candidates
     meta["rfu_forced"] = rfu_forced
     meta["show_on_panel_forced"] = show_forced
+    meta["allow_sql_parameter_forced"] = sql_param_forced
+    meta["sql_at_names"] = sorted(sql_at)
     meta["columns_dialog_softened"] = columns_softened
     meta["empty_defaults_set"] = defaults_set
     meta["has_request_from_user"] = candidates > 0 or meta["has_request_from_user"]
@@ -1187,12 +1284,11 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Лог RFU. Пустые с DialogInfo не трогаем (SelectionMode=First подставит из списка).
-    Без DialogInfo — безопасный дефолт, не ''."""
+    """Лог RFU + кэш значений для SQL. Пустые с DialogInfo не трогаем (First)."""
+    global LAST_VARIABLES
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
-    # имена RFU с DialogInfo-списком — из текущего .mrt (сервер знает шаблон)
     dialog_list_names: set[str] = set()
     try:
         report = load_mrt(MRT_PATH)
@@ -1205,6 +1301,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
     except Exception as exc:
         print(f"[viewer] prepare_variables dialog map: {exc}", flush=True)
 
+    cached: dict[str, object] = {}
     for name, var in variables.items():
         vtype = var.type.value if getattr(var, "type", None) is not None else "?"
         empty = _is_empty(var.value)
@@ -1214,6 +1311,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
             flush=True,
         )
         if not empty:
+            cached[str(name)] = var.value
             continue
         if name in dialog_list_names:
             # Stimulsoft выберет First после fillsDialogInfoItems — не затирать 0/*
@@ -1228,7 +1326,10 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
                 var.value = default
         else:
             var.value = default
+        cached[str(name)] = var.value
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
+    LAST_VARIABLES = cached
+    print(f"[viewer] cached variables for SQL: {cached}", flush=True)
 
 
 def _sql_log_add(entry: dict) -> None:
@@ -1282,6 +1383,8 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     query = args.queryString or ""
     qpreview = query[:180].replace("\n", " ")
     print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
+
+    injected = _inject_variables_into_sql_params(args, query)
 
     params = args.parameters or {}
     param_dump = {}
@@ -1339,6 +1442,8 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "database": str(database),
             "pg_forced": bool(PG_CONN),
             "database_forced": db_forced,
+            "injected_from_variables": injected,
+            "last_variables": {k: LAST_VARIABLES.get(k) for k in list(LAST_VARIABLES)[:40]},
             "query": (args.queryString or "")[:2000],
             "parameters": param_dump,
             "ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -1401,8 +1506,14 @@ def debug():
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
-            "RequestParameters=true: dashboard SQL ждёт кнопку Submit на панели. "
-            "Поставь FORCE_REQUEST_PARAMETERS=0 чтобы грузить DataSources сразу."
+            "RequestParameters=true: выбери фильтры и нажми Submit — "
+            "тогда значения уйдут в SQL @param источников."
+        )
+    else:
+        info["note_request_parameters"] = (
+            "RequestParameters=false: первый SQL может уйти с пустыми @param. "
+            "После смены фильтров всё равно нужен Submit; "
+            "для первого запроса с выбором поставь FORCE_REQUEST_PARAMETERS=1."
         )
     elif not SQL_LOG:
         info["note_sql_log_empty"] = (
