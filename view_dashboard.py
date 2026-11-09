@@ -15,16 +15,54 @@ MRT_PATH / VIEWER_HOST / VIEWER_PORT / DATABASE_URL|POSTGRES_* — из .env
 from __future__ import annotations
 
 import os
+import re
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 from flask import Flask, request, send_from_directory, url_for
-from stimulsoft_reports.events import StiDataEventArgs
+from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
+from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
 
 ROOT = Path(__file__).resolve().parent
+
+# typeGroup / typeName → числовой параметр (иначе '' уходит в SQL как строка)
+_NUM_TYPE_HINTS = (
+    "number",
+    "int",
+    "long",
+    "short",
+    "byte",
+    "decimal",
+    "double",
+    "float",
+    "single",
+    "money",
+    "numeric",
+)
+
+# Типы переменных-фильтров, где пусто = «не выбрано», а не ''
+_NUMERIC_VAR_TYPES = {
+    StiVariableType.BYTE,
+    StiVariableType.DECIMAL,
+    StiVariableType.DOUBLE,
+    StiVariableType.INT,
+    StiVariableType.INT16,
+    StiVariableType.SHORT,
+    StiVariableType.INT32,
+    StiVariableType.INT64,
+    StiVariableType.LONG,
+    StiVariableType.SBYTE,
+    StiVariableType.SINGLE,
+    StiVariableType.UINT16,
+    StiVariableType.USHORT,
+    StiVariableType.UINT,
+    StiVariableType.UINT32,
+    StiVariableType.UINT64,
+    StiVariableType.ULONG,
+}
 
 
 def load_env() -> None:
@@ -89,10 +127,91 @@ PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else
 app = Flask(__name__)
 
 
+def _is_empty(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    if isinstance(value, (list, tuple, dict)) and len(value) == 0:
+        return True
+    return False
+
+
+def _is_number_param(param) -> bool:
+    group = str(getattr(param, "typeGroup", "") or "").lower()
+    name = str(getattr(param, "typeName", "") or "").lower()
+    if group == "number":
+        return True
+    return any(h in group or h in name for h in _NUM_TYPE_HINTS)
+
+
+def _soften_empty_param(query: str, name: str) -> str:
+    """Фильтр не выбран → убрать условие, а не подставлять '' / NULL.
+
+    CategoryID = @Category  →  TRUE
+    CategoryID IN (@Category) → TRUE
+    оставшиеся @Category → NULL
+    """
+    if not query:
+        return query
+    pat = re.escape(name)
+    # col IN (@Param) / col in (@Param)
+    query = re.sub(
+        rf"[\w.\"`]+?\s+IN\s*\(\s*@{pat}\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    # col = @Param / col=@Param
+    query = re.sub(
+        rf"[\w.\"`]+?\s*=\s*@{pat}\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    # всё остальное
+    return re.sub(rf"@{pat}\b", "NULL", query, flags=re.IGNORECASE)
+
+
+def prepare_variables(args: StiVariablesEventArgs) -> None:
+    """Пустые переменные фильтров: не оставлять '' для Int/List."""
+    variables = args.variables or {}
+    for name, var in variables.items():
+        if not _is_empty(var.value):
+            continue
+        vtype = var.type
+        if vtype in _NUMERIC_VAR_TYPES:
+            # None → дальше SQL-параметр тоже увидит пустоту и soften'ится
+            var.value = None
+            print(f"[viewer] filter var {name} ({vtype.value}) empty → None", flush=True)
+        elif vtype is not None and str(vtype.value).endswith("List"):
+            var.value = []
+            print(f"[viewer] filter var {name} ({vtype.value}) empty → []", flush=True)
+
+
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подставить connection string из .env вместо зашитого в .mrt."""
+    """Connection string из .env; пустые фильтры/@Param не слать как ''."""
     if PG_CONN and args.connectionString is not None:
         args.connectionString = PG_CONN
+
+    params = args.parameters or {}
+    if not params:
+        return
+
+    # Дашборд с фильтрами: пока ничего не выбрано, Stimulsoft часто шлёт "".
+    # PG: invalid input syntax for type integer ""
+    query = args.queryString or ""
+    for name, param in params.items():
+        if not _is_empty(param.value):
+            continue
+        kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
+        query = _soften_empty_param(query, name)
+        param.value = None
+        src = args.dataSource or "?"
+        print(f"[viewer] empty filter @{name} ({kind}) on {src} → no-op", flush=True)
+
+    if query != (args.queryString or ""):
+        args.queryString = query
 
 
 @app.get("/mrt")
@@ -110,6 +229,8 @@ def serve_mrt():
 def viewer():
     sti = StiViewer()
     sti.options.appearance.fullScreenMode = True
+    # фильтры/variables → defaults; SQL @Param → не ''
+    sti.onPrepareVariables += prepare_variables
     sti.onBeginProcessData += begin_process_data
 
     if sti.processRequest(request):
