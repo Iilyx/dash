@@ -25,7 +25,6 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
-from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -1014,32 +1013,89 @@ def _sql_at_names(query: str) -> set[str]:
 
 
 def _unescape_sql(query: str) -> str:
-    """JSON-экранирование в SQL: \\\" → \", \\n → перевод строки (до выполнения)."""
-    if not query:
+    """Убрать JS/JSON-экранирование из SQL до PG.
+
+    c.\\\"fff\\\" → c.\"fff\"
+    \\'fff\\' → 'fff'
+    \\n → перевод строки; голый \\\\ убираем.
+    """
+    if not query or "\\" not in query:
         return query
-    if not any(tok in query for tok in ("\\n", "\\r", "\\t", '\\"', "\\'", "\\\\")):
-        return query
-    return (
-        query.replace("\\\\", "\0")
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace('\\"', '"')
-        .replace("\\'", "'")
-        .replace("\0", "\\")
-    )
+    esc = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "'": "'"}
+    for _ in range(8):
+        if "\\" not in query:
+            break
+        out: list[str] = []
+        i = 0
+        n = len(query)
+        while i < n:
+            ch = query[i]
+            if ch != "\\" or i + 1 >= n:
+                out.append(ch)
+                i += 1
+                continue
+            nxt = query[i + 1]
+            # \\\\n / \\\\r / \\\\t (двойной слеш + буква)
+            if nxt == "\\" and i + 2 < n and query[i + 2] in esc:
+                out.append(esc[query[i + 2]])
+                i += 3
+                continue
+            # \" \' \n \r \t
+            if nxt in esc:
+                out.append(esc[nxt])
+                i += 2
+                continue
+            # голый \\ — убрать оба слеша
+            if nxt == "\\":
+                i += 2
+                continue
+            # неизвестное \X — выкинуть слеш, оставить символ
+            out.append(nxt)
+            i += 2
+        new_query = "".join(out)
+        if new_query == query:
+            break
+        query = new_query
+    return query
+
+
+def _sql_literal(param) -> str:
+    """Литерал для PG: числа как есть, строки в '...' с '' вместо \\'."""
+    value = getattr(param, "value", param)
+    group = str(getattr(param, "typeGroup", "") or "").lower()
+    if value is None or (isinstance(value, str) and value == ""):
+        return "NULL"
+    if group == "number" or isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if group == "datetime":
+        return "'" + str(value).replace("'", "''") + "'"
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _substitute_sql(query: str, params: dict | None) -> str:
-    """Как Stimulsoft: @Param → литерал из values."""
-    if not query:
-        return ""
-    if not params or not _sql_at_names(query):
-        return query
-    try:
-        return StiSqlAdapter.applyQueryParameters(query, params or {}, escape=True)
-    except Exception as exc:
-        return f"{query}\n-- substitute error: {exc}"
+    """Подстановка @Param без Stimulsoft JS-escape (иначе в SQL остаются \\ и \\')."""
+    if not query or not params or not _sql_at_names(query):
+        return query or ""
+    result = ""
+    rest = query
+    lower_map = {str(k).lower(): v for k, v in params.items()}
+    while True:
+        at = rest.find("@")
+        if at < 0:
+            result += rest
+            break
+        result += rest[:at]
+        rest = rest[at + 1 :]
+        name = ""
+        while rest and (rest[0].isalnum() or rest[0] == "_"):
+            name += rest[0]
+            rest = rest[1:]
+        item = lower_map.get(name.lower()) if name else None
+        if item is None:
+            result += "@" + name
+        else:
+            result += _sql_literal(item)
+    return result
 
 
 def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
@@ -1207,17 +1263,19 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         if "''" in query:
             query = query.replace("''", "NULL")
 
-    if query != query_from_client:
-        args.queryString = query
+    # сами подставляем @param без JS-escape, иначе Stimulsoft снова вшьёт \\ и \'
+    if params and _sql_at_names(query):
+        query = _substitute_sql(query, params)
+        query = _unescape_sql(query)
+        try:
+            args.parameters = {}
+        except Exception:
+            pass
+
+    args.queryString = query
 
     if not _should_log_sql_command(args):
         return
-
-    # preview: то, что уйдёт в PG после unescape/soften + оставшиеся @param
-    fill_base = query_template if _sql_at_names(query_template) else query
-    substituted = _substitute_sql(fill_base, params)
-    if fill_base == query and not _sql_at_names(fill_base):
-        substituted = query
 
     _sql_log_add(
         {
@@ -1231,7 +1289,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "sql_template": query_template,
             "sql_from_client": query_from_client,
             "sql_sent": query,
-            "sql_substituted": substituted,
+            "sql_substituted": query,
         }
     )
 
