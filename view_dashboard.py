@@ -1013,6 +1013,23 @@ def _sql_at_names(query: str) -> set[str]:
     return {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
 
 
+def _unescape_sql(query: str) -> str:
+    """JSON-экранирование в SQL: \\\" → \", \\n → перевод строки (до выполнения)."""
+    if not query:
+        return query
+    if not any(tok in query for tok in ("\\n", "\\r", "\\t", '\\"', "\\'", "\\\\")):
+        return query
+    return (
+        query.replace("\\\\", "\0")
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\'", "'")
+        .replace("\0", "\\")
+    )
+
+
 def _substitute_sql(query: str, params: dict | None) -> str:
     """Как Stimulsoft: @Param → литерал из values."""
     if not query:
@@ -1040,11 +1057,13 @@ def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
         if not isinstance(source, dict):
             continue
         name = (source.get("Name") or "").strip()
-        sql = str(
-            source.get("SqlCommand")
-            or source.get("Query")
-            or source.get("SqlQuery")
-            or ""
+        sql = _unescape_sql(
+            str(
+                source.get("SqlCommand")
+                or source.get("Query")
+                or source.get("SqlQuery")
+                or ""
+            )
         ).strip()
         if name and sql:
             templates[name] = sql
@@ -1157,13 +1176,16 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
-    # клиент часто шлёт SQL уже без @param
-    query_from_client = args.queryString or ""
+    # клиент часто шлёт SQL уже без @param + с \" / \\n
+    raw_from_client = args.queryString or ""
+    query_from_client = _unescape_sql(raw_from_client)
     query = query_from_client
-    query_template = _lookup_sql_template(src) or ""
+    query_template = _unescape_sql(_lookup_sql_template(src) or "")
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
+    if query_from_client != raw_from_client:
+        args.queryString = query_from_client
 
     params = args.parameters or {}
     had_empty = False
@@ -1191,7 +1213,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if not _should_log_sql_command(args):
         return
 
-    # подстановку делаем по шаблону .mrt, если в нём ещё есть @param
+    # preview: то, что уйдёт в PG после unescape/soften + оставшиеся @param
     fill_base = query_template if _sql_at_names(query_template) else query
     substituted = _substitute_sql(fill_base, params)
     if fill_base == query and not _sql_at_names(fill_base):
@@ -1208,6 +1230,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "sql_params": _params_dict(params),
             "sql_template": query_template,
             "sql_from_client": query_from_client,
+            "sql_sent": query,
             "sql_substituted": substituted,
         }
     )
