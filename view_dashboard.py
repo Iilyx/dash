@@ -192,46 +192,78 @@ _OPENED_REPORT_JS = """
 })();
 """.strip()
 
-# Раскрыть полосу Parameters + Submit (id viewer → window.jsViewer)
+# Раскрыть полосу Parameters + Submit только когда paramsVariables уже пришли.
+# Крестик на панели закрывает фильтры — прячем его и сразу открываем панель снова.
 _AFTER_INIT_HEAD = """
+<style>
+  /* не давать свернуть панель параметров крестиком */
+  .stiJsViewerParametersPanel [title="Close"],
+  .stiJsViewerParametersPanel [title="Закрыть"],
+  .stiJsViewerParametersPanel .stiJsViewerClearButton,
+  .stiJsViewerParametersPanel button[name="Close"],
+  .stiJsViewerParametersPanel .stiJsViewerButtonClose {
+    display: none !important;
+  }
+</style>
 <script>
-window.__stiForceParametersPanel = function () {
+window.__stiFindViewer = function () {
   var names = ['jsViewer', 'jsStiViewer', 'viewer'];
-  var v = null;
   for (var i = 0; i < names.length; i++) {
-    if (window[names[i]] && window[names[i]].controls) {
-      v = window[names[i]];
-      break;
+    if (window[names[i]] && window[names[i]].controls) return window[names[i]];
+  }
+  for (var k in window) {
+    if (k.indexOf('js') === 0 && window[k] && window[k].controls && window[k].options) {
+      return window[k];
     }
   }
-  if (!v) {
-    for (var k in window) {
-      if (k.indexOf('js') === 0 && window[k] && window[k].controls && window[k].controls.parametersPanel) {
-        v = window[k];
-        break;
-      }
-    }
+  return null;
+};
+window.__stiCountParams = function (v) {
+  var pv = v && v.options && v.options.paramsVariables;
+  if (!pv) return 0;
+  var n = 0;
+  for (var key in pv) {
+    // isCategory=true — папка в словаре, не поле фильтра
+    if (pv[key] && pv[key].isCategory !== true) n++;
   }
-  if (!v || !v.controls || !v.controls.parametersPanel) return false;
+  return n;
+};
+window.__stiForceParametersPanel = function () {
+  var v = window.__stiFindViewer();
+  if (!v || !v.controls) return false;
+  var count = window.__stiCountParams(v);
+  if (count < 1) return false;
+  if (!v.controls.parametersPanel) return false;
   try {
     v.waitingToShowParameters = true;
     v.controls.parametersPanel.changeVisibleState(true);
     if (v.controls.buttons && v.controls.buttons.Parameters) {
       v.controls.buttons.Parameters.setSelected(true);
+      v.controls.buttons.Parameters.setEnabled(true);
     }
-    console.log('[viewer] parameters panel opened');
+    console.log('[viewer] parameters panel opened, params=', count);
     return true;
   } catch (e) {
     console.warn('[viewer] open parameters panel', e);
     return false;
   }
 };
+window.__stiKeepParametersPanel = function () {
+  var v = window.__stiFindViewer();
+  if (!v || !v.controls || !v.controls.parametersPanel) return;
+  if (!v.controls.parametersPanel.visible) {
+    window.__stiForceParametersPanel();
+  }
+};
 window.__stiAfterInit = function (args) {
   var tries = 0;
   var timer = setInterval(function () {
     tries += 1;
-    if (window.__stiForceParametersPanel() || tries > 60) clearInterval(timer);
-  }, 300);
+    if (window.__stiForceParametersPanel() || tries > 80) {
+      clearInterval(timer);
+      setInterval(window.__stiKeepParametersPanel, 1000);
+    }
+  }, 250);
 };
 </script>
 """.strip()
