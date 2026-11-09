@@ -166,9 +166,9 @@ PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else
 _sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
 SQL_LOG_PATH = path_of(_sql_log_raw)
 
-# RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
-# По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
-FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
+# RequestParameters=true → dashboard SQL только после Submit (не на init).
+# По умолчанию 1: без пустых фильтров на старте / interaction не стреляет зря.
+FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
     "1",
     "true",
     "yes",
