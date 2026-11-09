@@ -430,12 +430,11 @@ def package_versions() -> dict:
 
 
 def _is_empty(value: object) -> bool:
-    """Пустой фильтр: None / '' / {} / [] / '{}' / '[]'."""
     if value is None:
         return True
-    if isinstance(value, str) and value.strip() in {"", "{}", "[]", "null", "NULL", "None"}:
+    if isinstance(value, str) and value.strip() == "":
         return True
-    if isinstance(value, (list, tuple, dict, set)) and len(value) == 0:
+    if isinstance(value, (list, tuple, dict)) and len(value) == 0:
         return True
     return False
 
@@ -494,7 +493,7 @@ def _soften_empty_param(query: str, name: str) -> str:
 
 
 def _soften_inlined_empty_literals(query: str) -> str:
-    """Только опасные '' от пустого фильтра (int \"\"). Не трогаем coalesce/SELECT ''."""
+    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
     if not query or "''" not in query:
         return query
     # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
@@ -528,8 +527,11 @@ def _soften_inlined_empty_literals(query: str) -> str:
         query,
         flags=re.IGNORECASE,
     )
-    # только сравнение col = '' (пустой фильтр), не любое ''
-    return re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
+    query = re.sub(r"=\s*''", " = NULL", query)
+    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
+    return query
 
 
 def mrt_looks_anonymized(path: Path) -> bool:
@@ -1059,63 +1061,16 @@ def _unescape_sql(query: str) -> str:
 
 
 def _sql_literal(param) -> str:
-    """Литерал для PG: числа как есть, строки в '...'. Пустой number/'{}' → NULL."""
+    """Литерал для PG: числа как есть, строки в '...' с '' вместо \\'."""
     value = getattr(param, "value", param)
     group = str(getattr(param, "typeGroup", "") or "").lower()
-    type_name = str(getattr(param, "typeName", "") or "")
-    is_num = (
-        group == "number"
-        or (isinstance(value, (int, float)) and not isinstance(value, bool))
-        or _type_looks_numeric(type_name)
-        or (
-            hasattr(param, "typeGroup")
-            and _is_number_param(param)
-        )
-    )
-
-    if _is_empty(value):
+    if value is None or (isinstance(value, str) and value == ""):
         return "NULL"
-
-    if isinstance(value, (list, tuple)):
-        parts: list[str] = []
-        for item in value:
-            if _is_empty(item):
-                continue
-            if is_num or isinstance(item, (int, float)):
-                s = str(item).strip()
-                if re.fullmatch(r"-?\d+(\.\d+)?", s):
-                    parts.append(s)
-            else:
-                parts.append("'" + str(item).replace("'", "''") + "'")
-        return ", ".join(parts) if parts else "NULL"
-
-    if is_num:
-        if isinstance(value, str):
-            s = value.strip()
-            try:
-                float(s)
-            except ValueError:
-                return "NULL"
-            return s
+    if group == "number" or isinstance(value, (int, float)) and not isinstance(value, bool):
         return str(value)
-
     if group == "datetime":
         return "'" + str(value).replace("'", "''") + "'"
     return "'" + str(value).replace("'", "''") + "'"
-
-
-def _merge_sql_params(args_params: dict | None) -> dict:
-    """args.parameters + LAST_VARIABLES (панель), чтобы подставить выбранные фильтры."""
-    merged: dict[str, object] = {}
-    for name, param in (args_params or {}).items():
-        merged[str(name)] = param
-    for name, value in LAST_VARIABLES.items():
-        key = str(name)
-        cur = merged.get(key)
-        cur_val = getattr(cur, "value", cur) if cur is not None else None
-        if cur is None or _is_empty(cur_val):
-            merged[key] = value
-    return merged
 
 
 def _substitute_sql(query: str, params: dict | None) -> str:
@@ -1286,7 +1241,7 @@ def _should_log_sql_command(args: StiDataEventArgs) -> bool:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Connection + подстановка фильтров на шаблон .mrt (@param). Пустые → no-op/NULL."""
+    """Подмена connection string; пустые params → no-op; лог JSON: шаблон .mrt + SQL."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1297,37 +1252,38 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
+    # клиент часто шлёт SQL уже без @param + с \" / \\n
     raw_from_client = args.queryString or ""
     query_from_client = _unescape_sql(raw_from_client)
+    query = query_from_client
     query_template = _unescape_sql(_lookup_sql_template(src) or "")
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
 
-    # клиент часто уже вырезал @param (часто пустыми '') — берём шаблон из .mrt
-    used_template = bool(query_template and _sql_at_names(query_template))
-    query = query_template if used_template else query_from_client
-
-    raw_params = args.parameters or {}
-    params = _merge_sql_params(raw_params)
-
+    params = args.parameters or {}
     had_empty = False
-    for name, param in list(params.items()):
-        value = getattr(param, "value", param)
-        if not _is_empty(value):
+    for name, param in params.items():
+        if not _is_empty(param.value):
             continue
         had_empty = True
-        # убрать @Name → TRUE/NULL; value не подменяем на 0/'*' (ломает подстановку)
-        query = _soften_empty_param(query, str(name))
+        query = _soften_empty_param(query, name)
+        if _is_number_param(param) or _type_looks_numeric(
+            str(param.typeName or ""), name
+        ):
+            param.typeGroup = "number"
+            param.value = 0
+        else:
+            param.value = "*"
 
-    # сами подставляем оставшиеся @param (значения с панели)
+    if had_empty or "''" in (query or ""):
+        query = _soften_inlined_empty_literals(query)
+        if "''" in query:
+            query = query.replace("''", "NULL")
+
+    # сами подставляем @param (PG), Stimulsoft больше не трогает parameters
     if params and _sql_at_names(query):
         query = _substitute_sql(query, params)
-
-    # клиент уже вшил '' вместо пустого @param — чиним только сравнения, не весь SQL
-    if (had_empty or not used_template) and "''" in (query or ""):
-        query = _soften_inlined_empty_literals(query)
-
     query = _unescape_sql(query)
     args.queryString = query
     args.parameters = {}
@@ -1342,12 +1298,9 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "connection": connection,
             "command": getattr(args.command, "value", None) or str(args.command or ""),
             "client_already_filled": client_already_filled,
-            "used_mrt_template": used_template,
             "had_backslash_in_raw": "\\" in raw_from_client,
             "params": dict(LAST_VARIABLES),
-            "sql_params": _params_dict(raw_params) or {
-                str(k): getattr(v, "value", v) for k, v in params.items()
-            },
+            "sql_params": _params_dict(params),
             "sql_template": query_template,
             "sql_from_client": query_from_client,
             "sql_sent": query,
