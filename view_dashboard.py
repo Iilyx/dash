@@ -183,6 +183,8 @@ FORCE_SHOW_ON_PARAMETERS_PANEL = os.environ.get(
 FORCE_SKIP_COLUMNS_PRELOAD = os.environ.get(
     "FORCE_SKIP_COLUMNS_PRELOAD", "0"
 ).lower() in {"1", "true", "yes"}
+# ширина полей на панели параметров (px); 0 в .mrt = дефолт Stimulsoft ~200
+PARAMETER_WIDTH = int(os.environ.get("PARAMETER_WIDTH", "280") or "280")
 
 # StiDashboardViewerSettings (биты):
 # ShowToolBar=1 Refresh=2 Open=4 FullScreen=8 Menu=16 Edit=32
@@ -207,6 +209,7 @@ _OPENED_REPORT_JS = f"""
     try {{ r.parametersDisplayMode = {"0" if FORCE_PARAMETERS_MODE == "Dialog" else "1"}; }} catch (e2) {{}}
   }}
   try {{ r.dashboardViewerSettings = 671; }} catch (e4) {{}}
+  try {{ r.parameterWidth = {PARAMETER_WIDTH}; }} catch (e5) {{}}
   try {{
     var dict = r.dictionary;
     var vars = dict && dict.variables;
@@ -228,100 +231,137 @@ _OPENED_REPORT_JS = f"""
 
 # Раскрыть полосу Parameters + Submit только когда paramsVariables уже пришли.
 # Крестик на панели закрывает фильтры — прячем его и сразу открываем панель снова.
-_AFTER_INIT_HEAD = """
+_AFTER_INIT_HEAD = f"""
 <style>
   /* не давать свернуть панель параметров крестиком */
   .stiJsViewerParametersPanel [title="Close"],
   .stiJsViewerParametersPanel [title="Закрыть"],
   .stiJsViewerParametersPanel .stiJsViewerClearButton,
   .stiJsViewerParametersPanel button[name="Close"],
-  .stiJsViewerParametersPanel .stiJsViewerButtonClose {
+  .stiJsViewerParametersPanel .stiJsViewerButtonClose {{
     display: none !important;
-  }
+  }}
+  /* расширить поля фильтров на полосе Parameters */
+  .stiJsViewerParametersPanel input[type="text"],
+  .stiJsViewerParametersPanel input:not([type]),
+  .stiJsViewerParametersPanel select,
+  .stiJsViewerParametersPanel textarea,
+  .stiJsViewerParametersPanel .stiJsViewerTextBox,
+  .stiJsViewerParametersPanel .stiJsViewerDropDownList,
+  .stiJsViewerParametersPanel td > div {{
+    min-width: {PARAMETER_WIDTH}px !important;
+    width: {PARAMETER_WIDTH}px !important;
+    max-width: none !important;
+    box-sizing: border-box !important;
+  }}
+  .stiJsViewerParametersPanel {{
+    min-height: 72px !important;
+  }}
+  .stiJsViewerParametersPanel label,
+  .stiJsViewerParametersPanel .stiJsViewerParametersPanelDescription {{
+    font-size: 13px !important;
+  }}
 </style>
 <script>
-window.__stiFindViewer = function () {
+window.__stiFindViewer = function () {{
   var names = ['jsViewer', 'jsStiViewer', 'viewer'];
-  for (var i = 0; i < names.length; i++) {
+  for (var i = 0; i < names.length; i++) {{
     if (window[names[i]] && window[names[i]].controls) return window[names[i]];
-  }
-  for (var k in window) {
-    if (k.indexOf('js') === 0 && window[k] && window[k].controls && window[k].options) {
+  }}
+  for (var k in window) {{
+    if (k.indexOf('js') === 0 && window[k] && window[k].controls && window[k].options) {{
       return window[k];
-    }
-  }
+    }}
+  }}
   return null;
-};
-window.__stiCountParams = function (v) {
+}};
+window.__stiCountParams = function (v) {{
   var pv = v && v.options && v.options.paramsVariables;
   if (!pv) return 0;
   var n = 0;
-  for (var key in pv) {
+  for (var key in pv) {{
     // isCategory=true — папка в словаре, не поле фильтра
     if (pv[key] && pv[key].isCategory !== true) n++;
-  }
+  }}
   return n;
-};
-window.__stiForceParametersPanel = function () {
+}};
+window.__stiWidenParameterFields = function (v) {{
+  try {{
+    if (v && v.options) v.options.currentParameterWidth = {PARAMETER_WIDTH};
+  }} catch (e) {{}}
+  var root = v && v.controls && v.controls.parametersPanel;
+  if (!root) return;
+  var nodes = root.querySelectorAll('input, select, textarea, .stiJsViewerTextBox');
+  for (var i = 0; i < nodes.length; i++) {{
+    try {{
+      nodes[i].style.minWidth = '{PARAMETER_WIDTH}px';
+      nodes[i].style.width = '{PARAMETER_WIDTH}px';
+    }} catch (e2) {{}}
+  }}
+}};
+window.__stiForceParametersPanel = function () {{
   var v = window.__stiFindViewer();
   if (!v || !v.controls) return false;
   var count = window.__stiCountParams(v);
-  if (v.controls.buttons) {
-    if (v.controls.buttons.ResetAllFilters) {
-      try { v.controls.buttons.ResetAllFilters.style.display = 'none'; } catch (e1) {}
-    }
-    if (v.controls.buttons.Parameters) {
-      try {
+  if (v.controls.buttons) {{
+    if (v.controls.buttons.ResetAllFilters) {{
+      try {{ v.controls.buttons.ResetAllFilters.style.display = 'none'; }} catch (e1) {{}}
+    }}
+    if (v.controls.buttons.Parameters) {{
+      try {{
         v.controls.buttons.Parameters.setEnabled(count > 0);
         v.controls.buttons.Parameters.style.display = '';
-      } catch (e2) {}
-    }
-  }
-  if (count < 1) {
+      }} catch (e2) {{}}
+    }}
+  }}
+  if (count < 1) {{
     console.log('[viewer] waiting paramsVariables…');
     return false;
-  }
+  }}
   // Сначала полоса сверху (Panel); Dialog-окно — только если полосы нет
-  if (v.controls.parametersPanel) {
-    try {
+  if (v.controls.parametersPanel) {{
+    try {{
       v.waitingToShowParameters = true;
       v.controls.parametersPanel.changeVisibleState(true);
-      if (v.controls.buttons && v.controls.buttons.Parameters) {
+      if (v.controls.buttons && v.controls.buttons.Parameters) {{
         v.controls.buttons.Parameters.setSelected(true);
-      }
+      }}
+      window.__stiWidenParameterFields(v);
       console.log('[viewer] parameters Panel opened, params=', count, v.options.paramsVariables);
       return true;
-    } catch (e) {
+    }} catch (e) {{
       console.warn('[viewer] open parameters panel', e);
-    }
-  }
-  try {
+    }}
+  }}
+  try {{
     var form = v.controls.forms && v.controls.forms.parametersForm;
-    if (form && typeof form.changeVisibleState === 'function') {
+    if (form && typeof form.changeVisibleState === 'function') {{
       form.changeVisibleState(true);
       console.log('[viewer] parameters Dialog opened, params=', count);
       return true;
-    }
-  } catch (e0) {}
+    }}
+  }} catch (e0) {{}}
   return false;
-};
-window.__stiKeepParametersPanel = function () {
+}};
+window.__stiKeepParametersPanel = function () {{
   var v = window.__stiFindViewer();
   if (!v || !v.controls || !v.controls.parametersPanel) return;
-  if (!v.controls.parametersPanel.visible) {
+  if (!v.controls.parametersPanel.visible) {{
     window.__stiForceParametersPanel();
-  }
-};
-window.__stiAfterInit = function (args) {
+  }} else {{
+    window.__stiWidenParameterFields(v);
+  }}
+}};
+window.__stiAfterInit = function (args) {{
   var tries = 0;
-  var timer = setInterval(function () {
+  var timer = setInterval(function () {{
     tries += 1;
-    if (window.__stiForceParametersPanel() || tries > 80) {
+    if (window.__stiForceParametersPanel() || tries > 80) {{
       clearInterval(timer);
       setInterval(window.__stiKeepParametersPanel, 1000);
-    }
-  }, 250);
-};
+    }}
+  }}, 250);
+}};
 </script>
 """.strip()
 
@@ -740,6 +780,18 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     else:
         meta["dashboard_viewer_settings"] = report.get("DashboardViewerSettings")
 
+    # ширина полей Parameters panel
+    if PARAMETER_WIDTH > 0:
+        prev_w = report.get("ParameterWidth")
+        try:
+            prev_w_i = int(prev_w) if prev_w not in (None, "") else 0
+        except (TypeError, ValueError):
+            prev_w_i = 0
+        if prev_w_i != PARAMETER_WIDTH:
+            report["ParameterWidth"] = PARAMETER_WIDTH
+            changed = True
+        meta["parameter_width"] = report.get("ParameterWidth")
+
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
     rfu_forced = 0
     show_forced = 0
@@ -940,11 +992,14 @@ def viewer():
     # fullScreen ок, но toolbar обязан быть visible (ещё патчим DashboardViewerSettings)
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
-    # фильтры в одну/несколько колонок в полосе сверху
+    # фильтры в полосе сверху; меньше колонок → шире каждое поле
     sti.options.appearance.parametersPanelColumnsCount = int(
-        os.environ.get("PARAMETERS_PANEL_COLUMNS", "5") or "5"
+        os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") or "3"
     )
     sti.options.appearance.minParametersCountForMultiColumns = 1
+    sti.options.appearance.parametersPanelMaxHeight = int(
+        os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
+    )
     sti.options.toolbar.visible = True
     sti.options.toolbar.autoHide = False
     sti.options.toolbar.showParametersButton = True
