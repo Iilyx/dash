@@ -1046,29 +1046,37 @@ def _format_sql_log_block(entry: dict) -> str:
         lines.append("panel_selected:")
         for key, value in (entry.get("panel_selected") or {}).items():
             lines.append(f"  {key} = {value!r}")
-        lines.append("sql_parameters:")
+        note = entry.get("template_note")
+        if note:
+            lines.append(f"note: {note}")
+        lines.append(f"mrt_path: {entry.get('mrt_path')}")
+        lines.append(
+            f"source lookup: event={entry.get('source')!r} "
+            f"mrt_name={entry.get('mrt_source_name')!r} "
+            f"mrt_params={entry.get('mrt_parameter_names')}"
+        )
+        lines.append(
+            f"same_as_client={entry.get('template_same_as_client')} "
+            f"has_@={entry.get('template_has_at')} "
+            f"@names={entry.get('template_at_names')} "
+            f"{{vars}}={entry.get('template_brace_names')}"
+        )
+        lines.append("--- A) SqlCommand ИЗ ФАЙЛА .mrt (не трогаем клиентом) ---")
+        lines.append(entry.get("query_template") or "(ПУСТО — source не найден в Dictionary)")
+        lines.append("--- B) queryString ОТ КЛИЕНТА (сюда Stimulsoft уже подставил значения) ---")
+        lines.append(entry.get("query_from_client") or "")
+        lines.append(
+            f"   client_already_filled={entry.get('client_already_filled')}"
+        )
+        lines.append("--- C) preview: подставили sql_parameters в A (только если в A есть @) ---")
+        lines.append(entry.get("query_filled") or "")
+        lines.append("--- sql_parameters (отдельно от текста A; то что пришло в handler) ---")
         for key, meta in (entry.get("sql_parameters") or {}).items():
             if isinstance(meta, dict):
                 val = meta.get("value_after", meta.get("value"))
                 lines.append(f"  @{key} = {val!r}")
             else:
                 lines.append(f"  @{key} = {meta!r}")
-        note = entry.get("template_note")
-        if note:
-            lines.append(f"note: {note}")
-        lines.append("--- A) SQL из .mrt (шаблон словаря, как в файле) ---")
-        lines.append(entry.get("query_template") or "(нет SqlCommand для этого source в .mrt)")
-        lines.append(
-            f"   has_@param={entry.get('template_has_at')} "
-            f"at_names={entry.get('template_at_names')}"
-        )
-        lines.append("--- B) SQL от клиента (часто УЖЕ с подставленными значениями) ---")
-        lines.append(entry.get("query_from_client") or "")
-        lines.append(
-            f"   client_already_filled={entry.get('client_already_filled')}"
-        )
-        lines.append("--- C) preview filled (если в A были @param) ---")
-        lines.append(entry.get("query_filled") or "")
     elif phase == "result":
         lines.append(
             f"[3/3 RESULT] source={entry.get('source')!r} "
@@ -1110,6 +1118,31 @@ def _sql_at_names(query: str) -> set[str]:
     if not query:
         return set()
     return {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
+
+
+def _sql_brace_names(query: str) -> set[str]:
+    """Stimulsoft-выражения {Variable} в тексте SQL."""
+    if not query:
+        return set()
+    return {m.group(1) for m in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", query)}
+
+
+def _reset_sql_trace_file() -> None:
+    """Новый сеанс — чистый файл, без старых запутанных записей."""
+    try:
+        SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SQL_LOG_PATH.open("w", encoding="utf-8") as fh:
+            fh.write(
+                f"======== sql_trace session {datetime.now(timezone.utc).isoformat(timespec='seconds')} ========\n"
+                f"mrt: {MRT_PATH.resolve()}\n"
+                "A = SqlCommand из .mrt (как в файле)\n"
+                "B = queryString от клиента (часто уже с значениями)\n"
+                "C = preview подстановки @param в A\n"
+                "Если в A нет @param — в .mrt запрос без плейсхолдеров, смотри B.\n\n"
+            )
+        print(f"[viewer] sql_trace reset → {SQL_LOG_PATH.resolve()}", flush=True)
+    except Exception as exc:
+        print(f"[viewer] sql_trace reset failed: {exc}", flush=True)
 
 
 def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
@@ -1242,25 +1275,44 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         src
     ) or ""
     template_at = sorted(_sql_at_names(query_template)) if query_template else []
+    template_braces = sorted(_sql_brace_names(query_template)) if query_template else []
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
+    same_as_client = bool(
+        query_template
+        and query_from_client
+        and query_template.strip() == query_from_client.strip()
+    )
+    available_keys = sorted({k for k in SOURCE_SQL_TEMPLATES if k})[:40]
     if not query_template:
         template_note = (
-            f"для source={src!r} в .mrt не найден SqlCommand "
-            f"(ключи: Name/Alias). Смотри блок B — SQL от клиента."
+            f"для source={src!r} в .mrt НЕ найден SqlCommand. "
+            f"Доступные Name/Alias: {available_keys}. "
+            "Блок A пустой — заполненный SQL только в B (от клиента)."
         )
-    elif not template_at:
+    elif same_as_client:
         template_note = (
-            "в .mrt SqlCommand нет @param — либо фильтры через Parameters/выражения, "
-            "либо в файле уже литералы. Подстановку значений смотри в блоке B (клиент)."
+            "A == B: текст в .mrt совпадает с тем, что прислал клиент. "
+            "Либо в SqlCommand уже литералы (нет @param), либо клиент не менял запрос."
         )
-    elif client_already_filled:
+    elif not template_at and not template_braces:
         template_note = (
-            "нормально: в A шаблон с @param из .mrt, в B клиент уже подставил значения."
+            "в A (SqlCommand из .mrt) НЕТ @param и нет {Variable}. "
+            "Запрос в файле уже с литералами или без фильтров. "
+            "sql_parameters ниже — это то, что клиент прислал ОТДЕЛЬНО; "
+            "они могли НЕ попасть в текст A. Смотри B — что реально ушло в PG."
+        )
+    elif template_at and client_already_filled:
+        template_note = (
+            "нормально: A = шаблон с @param из .mrt; B = клиент уже подставил значения."
+        )
+    elif template_braces and not template_at:
+        template_note = (
+            "в A есть {Variable}, но нет @param — Stimulsoft-выражения в SQL."
         )
     else:
-        template_note = "и клиент, и .mrt содержат @param."
+        template_note = "см. A/B/C ниже."
 
     params = args.parameters or {}
     param_dump: dict[str, object] = {}
@@ -1339,11 +1391,15 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "database": str(database),
             "pg_forced": bool(PG_CONN),
             "client_already_filled": client_already_filled,
+            "template_same_as_client": same_as_client,
             "template_has_at": bool(template_at),
             "template_at_names": template_at,
+            "template_brace_names": template_braces,
             "template_note": template_note,
+            "mrt_path": str(MRT_PATH.resolve()),
             "mrt_source_name": (mrt_meta or {}).get("name"),
             "mrt_parameter_names": (mrt_meta or {}).get("parameter_names") or [],
+            "lookup_keys_sample": available_keys,
             "panel_selected": dict(LAST_VARIABLES),
             "sql_parameters": param_dump,
             "query_template": (query_template or "")[:4000],
@@ -1517,6 +1573,8 @@ def main() -> None:
     info = dashboard_debug(MRT_PATH)
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
     vers = package_versions()
+    _reset_sql_trace_file()
+    _refresh_sql_templates()
     print(f"MRT:     {MRT_PATH.resolve()}")
     print(f"sql_log: {SQL_LOG_PATH.resolve()}")
     print(f"sti:     {vers}")
