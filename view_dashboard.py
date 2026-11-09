@@ -18,8 +18,7 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=0 — сразу грузить карту/таблицу; 1 = ждать Submit
-FORCE_ALLOW_SQL_PARAMETER=1 — AllowUseAsSqlParameter у RFU (иначе @param пустой)
+FORCE_REQUEST_PARAMETERS=0 — не ждать Submit (сразу грузить SQL DataSources)
 FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
 FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns
 """
@@ -41,8 +40,6 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
-from stimulsoft_data_adapters.classes.StiParameter import StiParameter
-from stimulsoft_data_adapters.enums import StiDatabaseType
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -55,48 +52,6 @@ from extract_mrt import (
     load_mrt,
     numbered,
     repair_mrt_json,
-)
-
-# Последние значения RFU (prepareVariables + /panel-vars) → SQL @params
-LAST_VARIABLES: dict[str, object] = {}
-PANEL_VARS: dict[str, object] = {}
-# Оригинальные SqlCommand из .mrt (имя источника → SQL с @param)
-SOURCE_SQL_TEMPLATES: dict[str, str] = {}
-
-_FILE_DB_IDENTS = (
-    "Excel",
-    "Csv",
-    "JSON",
-    "Xml",
-    "File",
-    "DBase",
-    "Gis",
-    "Firebase",
-    "GoogleSheets",
-    "AzureBlob",
-    "AzureTable",
-)
-_FILE_DB_TYPES = {
-    StiDatabaseType.XML,
-    StiDatabaseType.JSON,
-    StiDatabaseType.CSV,
-    "XML",
-    "JSON",
-    "CSV",
-}
-_SQL_DB_IDENT_HINTS = (
-    "Sql",
-    "Postgre",
-    "MySql",
-    "Maria",
-    "Oracle",
-    "Firebird",
-    "Odbc",
-    "ClickHouse",
-    "Redshift",
-    "DB2",
-    "Informix",
-    "Snowflake",
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -233,14 +188,9 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# RequestParameters=true → SQL только после Submit (карта/таблица пустые до кнопки).
-# По умолчанию 0: сразу грузим данные; фильтры применяем на Submit через inject.
+# RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
+# По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
 FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-FORCE_ALLOW_SQL_PARAMETER = os.environ.get("FORCE_ALLOW_SQL_PARAMETER", "1").lower() in {
     "1",
     "true",
     "yes",
@@ -317,8 +267,6 @@ _OPENED_REPORT_JS = f"""
         if (v.requestFromUser || v.showOnParametersPanel) {{
           v.requestFromUser = true;
           v.showOnParametersPanel = true;
-          // иначе клиент не кладёт переменную в parameters{{}} запроса
-          try {{ v.allowUseAsSqlParameter = true; }} catch (eA) {{}}
         }}
       }}
     }}
@@ -459,55 +407,6 @@ window.__stiKeepParametersPanel = function () {{
     window.__stiWidenParameterFields(v);
   }}
 }};
-window.__stiPushPanelVars = function (varsObj, sync) {{
-  try {{
-    if (!varsObj) {{
-      var v = window.__stiFindViewer();
-      varsObj = v && v.options && v.options.paramsVariables;
-    }}
-    if (!varsObj) return;
-    window.__stiLastPanelVars = varsObj;
-    var body = JSON.stringify(varsObj);
-    // sync на Submit: иначе ExecuteQuery уходит раньше, чем /panel-vars
-    if (sync) {{
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/panel-vars', false);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      try {{ xhr.send(body); }} catch (eSync) {{ console.warn('[viewer] panel-vars sync', eSync); }}
-      console.log('[viewer] panel-vars sync status', xhr.status, xhr.responseText);
-      return;
-    }}
-    fetch('/panel-vars', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: body,
-      credentials: 'same-origin',
-      keepalive: true
-    }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
-      console.log('[viewer] panel-vars pushed', j);
-    }}).catch(function (e) {{
-      console.warn('[viewer] panel-vars', e);
-    }});
-  }} catch (e0) {{
-    console.warn('[viewer] push panel vars', e0);
-  }}
-}};
-window.__stiOnInteraction = function (args) {{
-  try {{
-    if (!args) return;
-    var act = args.action || '';
-    if (act === 'Variables' || act === 'variables' || act === 'DashboardElementApplyEvents') {{
-      var varsObj = args.variables;
-      if (!varsObj) {{
-        var vv = window.__stiFindViewer();
-        varsObj = vv && vv.options && vv.options.paramsVariables;
-      }}
-      window.__stiPushPanelVars(varsObj, true);
-    }}
-  }} catch (e) {{
-    console.warn('[viewer] onInteraction', e);
-  }}
-}};
 window.__stiAfterInit = function (args) {{
   var tries = 0;
   var timer = setInterval(function () {{
@@ -515,8 +414,6 @@ window.__stiAfterInit = function (args) {{
     if (window.__stiForceParametersPanel() || tries > 80) {{
       clearInterval(timer);
       setInterval(window.__stiKeepParametersPanel, 1000);
-      window.__stiPushPanelVars();
-      setInterval(function () {{ window.__stiPushPanelVars(null, false); }}, 2000);
     }}
   }}, 250);
 }};
@@ -559,164 +456,90 @@ def _is_number_param(param) -> bool:
 
 
 def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param → (1=1)/NULL. Не оставлять @ для PG (syntax error at «@»)."""
+    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
     if not query:
         return query
     pat = re.escape(name)
-    flags = re.IGNORECASE
-    # LIMIT/OFFSET @p — LIMIT NULL в PG = syntax error
-    query = re.sub(rf"\bLIMIT\s+[@:]{pat}\b", "", query, flags=flags)
-    query = re.sub(rf"\bOFFSET\s+[@:]{pat}\b", "", query, flags=flags)
-    # касты раньше сравнений
+    # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
-        "(1=1)",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
-    query = re.sub(rf"[@:]{pat}\s*::\s*\w+", "NULL", query, flags=flags)
+    query = re.sub(
+        rf"[@:]{pat}\s*::\s*\w+",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
     query = re.sub(
         rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
         "NULL",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
-        "(1=1)",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
-        "(1=1)",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*(?:=|<>|!=|>=|<=|>|<)\s*[@:]{pat}\b",
-        "(1=1)",
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s+(?:LIKE|ILIKE)\s+[@:]{pat}\b",
-        "(1=1)",
-        query,
-        flags=flags,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s+BETWEEN\s+[@:]{pat}\s+AND\s+[@:]\w+",
-        "(1=1)",
-        query,
-        flags=flags,
-    )
-    # всё оставшееся @name → NULL (не LIMIT NULL — уже сняли выше)
-    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=flags)
+    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
 
 
 def _soften_inlined_empty_literals(query: str) -> str:
-    """Клиент подставил '' в фильтры. НЕ трогаем все '' подряд (ломает 'it''s')."""
+    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
     if not query or "''" not in query:
         return query
-    flags = re.IGNORECASE
+    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
     query = re.sub(
         r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "(1=1)",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
     query = re.sub(
         r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
         "NULL",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
     query = re.sub(
         r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
         "NULL",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
-    query = re.sub(r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)", "(1=1)", query, flags=flags)
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
     query = re.sub(
         r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
-        "(1=1)",
+        "TRUE",
         query,
-        flags=flags,
+        flags=re.IGNORECASE,
     )
-    # только сравнение колонки с пустым литералом (не глобальный replace '')
-    query = re.sub(
-        r"([\w.\"`\[\]]+)\s*(?:=|<>|!=)\s*''",
-        r"(1=1)",
-        query,
-    )
+    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
+    query = re.sub(r"=\s*''", " = NULL", query)
+    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
     return query
-
-
-def _strip_at_params_outside_strings(query: str) -> str:
-    """Убрать оставшиеся @param/:param вне строковых литералов — иначе PG syntax error."""
-    if not query or ("@" not in query and ":" not in query):
-        return query
-    # LIMIT/OFFSET NULL|@x — syntax error
-    query = re.sub(r"\bLIMIT\s+(?:NULL|[@:]\w+)\b", "", query, flags=re.IGNORECASE)
-    query = re.sub(r"\bOFFSET\s+(?:NULL|[@:]\w+)\b", "", query, flags=re.IGNORECASE)
-    out: list[str] = []
-    i = 0
-    n = len(query)
-    in_str = False
-    while i < n:
-        ch = query[i]
-        if in_str:
-            out.append(ch)
-            if ch == "'":
-                if i + 1 < n and query[i + 1] == "'":
-                    out.append("'")
-                    i += 2
-                    continue
-                in_str = False
-            i += 1
-            continue
-        if ch == "'":
-            in_str = True
-            out.append(ch)
-            i += 1
-            continue
-        # @param — Stimulsoft. :param — иногда; НЕ трогать Postgres cast ::type
-        is_at = ch == "@" and i + 1 < n and (
-            query[i + 1].isalpha() or query[i + 1] == "_"
-        )
-        is_colon = (
-            ch == ":"
-            and (i == 0 or query[i - 1] != ":")
-            and i + 1 < n
-            and query[i + 1] != ":"
-            and (query[i + 1].isalpha() or query[i + 1] == "_")
-        )
-        if is_at or is_colon:
-            i += 1
-            while i < n and (query[i].isalnum() or query[i] == "_"):
-                i += 1
-            out.append("NULL")
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _finalize_sql_query(query: str, params: dict | None) -> str:
-    """Подставить оставшиеся params и гарантированно убрать @ для PostgreSQL."""
-    if not query:
-        return query
-    if params:
-        from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
-
-        query = StiSqlAdapter.applyQueryParameters(query, params, True)
-    query = _strip_at_params_outside_strings(query)
-    # подчистить двойные пробелы/висячие AND после снятия LIMIT
-    query = re.sub(r"[ \t]{2,}", " ", query)
-    query = re.sub(r"\s+;", ";", query)
-    return query.strip()
 
 
 def mrt_looks_anonymized(path: Path) -> bool:
@@ -950,7 +773,6 @@ def dashboard_debug(path: Path) -> dict:
             "+ RequestParameters. Canvas ComboBox/TreeView ← filter_elements (без Submit)."
         ),
         "force_request_parameters": FORCE_REQUEST_PARAMETERS,
-        "force_allow_sql_parameter": FORCE_ALLOW_SQL_PARAMETER,
         "force_parameters_mode": FORCE_PARAMETERS_MODE,
         "force_parameters_panel": FORCE_PARAMETERS_PANEL,
         "force_show_on_parameters_panel": FORCE_SHOW_ON_PARAMETERS_PANEL,
@@ -961,10 +783,8 @@ def dashboard_debug(path: Path) -> dict:
             "Списки Keys/Values грузит Columns SQL. Пустые SQL-параметры смягчаем отдельно."
         ),
         "note_data_sources": (
-            "SQL DataSources → PostgreSQL через patch Ident/NameInSource + "
-            "onBeginProcessData (database=PostgreSQL, connection из .env). "
-            "Фильтры: AllowUseAsSqlParameter + Submit (RequestParameters) + "
-            "inject из onPrepareVariables. Смотри sql_log.parameters / injected_from_variables."
+            "SQL DataSources ходят в Postgres через onBeginProcessData (viewer+report). "
+            "Нужны POSTGRES_* в .env и ConnectOnStart у источников."
         ),
     }
 
@@ -975,425 +795,6 @@ def mrt_has_request_from_user(report: dict) -> bool:
         if isinstance(variable, dict) and variable_is_parameters_panel_candidate(variable):
             return True
     return False
-
-
-def _sql_at_names(query: str) -> set[str]:
-    """Имена @param / :param. Не путать с Postgres cast ::type."""
-    if not query:
-        return set()
-    names = {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
-    # :name, но не ::name
-    names |= {
-        m.group(1)
-        for m in re.finditer(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", query)
-    }
-    return names
-
-
-def _collect_sql_at_names(dictionary: dict) -> set[str]:
-    names: set[str] = set()
-    for source in numbered(dictionary.get("DataSources")):
-        if not isinstance(source, dict):
-            continue
-        sql = (
-            source.get("SqlCommand")
-            or source.get("Query")
-            or source.get("SqlQuery")
-            or ""
-        )
-        names |= _sql_at_names(str(sql))
-    return names
-
-
-def _param_type_group_for_value(value: object, name: str = "") -> str:
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return "number"
-    if _type_looks_numeric("", name) and not isinstance(value, (list, dict)):
-        return "number"
-    return "string"
-
-
-def _merged_panel_values() -> dict[str, object]:
-    """PANEL_VARS (с JS Submit) перекрывают LAST_VARIABLES (prepareVariables)."""
-    merged = dict(LAST_VARIABLES)
-    merged.update({k: v for k, v in PANEL_VARS.items() if not _is_empty(v)})
-    return merged
-
-
-def _lookup_sql_template(data_source: str | None) -> str:
-    if not data_source:
-        return ""
-    if data_source in SOURCE_SQL_TEMPLATES:
-        return SOURCE_SQL_TEMPLATES[data_source]
-    lower = data_source.lower()
-    for name, sql in SOURCE_SQL_TEMPLATES.items():
-        if name.lower() == lower:
-            return sql
-    return ""
-
-
-def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
-    """Запомнить SqlCommand с @param из .mrt — клиент часто присылает уже без @ и parameters={}."""
-    global SOURCE_SQL_TEMPLATES
-    try:
-        if report is None:
-            report = load_mrt(MRT_PATH)
-    except Exception as exc:
-        print(f"[viewer] sql templates load: {exc}", flush=True)
-        return SOURCE_SQL_TEMPLATES
-    dictionary = report.get("Dictionary") if isinstance(report, dict) else {}
-    templates: dict[str, str] = {}
-    for source in numbered((dictionary or {}).get("DataSources")):
-        if not isinstance(source, dict):
-            continue
-        name = (source.get("Name") or "").strip()
-        sql = (
-            source.get("SqlCommand")
-            or source.get("Query")
-            or source.get("SqlQuery")
-            or ""
-        )
-        sql = str(sql).strip()
-        if name and sql and _sql_at_names(sql):
-            templates[name] = sql
-    SOURCE_SQL_TEMPLATES = templates
-    print(
-        f"[viewer] sql templates: {len(templates)} sources with @params "
-        f"{list(templates)[:12]}",
-        flush=True,
-    )
-    return templates
-
-
-def _normalize_panel_payload(raw: object) -> dict[str, object]:
-    """paramsVariables / onInteraction → плоский dict имя→значение."""
-    out: dict[str, object] = {}
-    if not isinstance(raw, dict):
-        return out
-    for key, item in raw.items():
-        if key in ("event", "action", "sender"):
-            continue
-        if isinstance(item, dict):
-            if item.get("isCategory") is True:
-                continue
-            name = item.get("name") or item.get("Name") or key
-            if "value" in item:
-                value = item.get("value")
-            elif "Value" in item:
-                value = item.get("Value")
-            else:
-                value = item.get("key", item.get("Key"))
-            if name:
-                out[str(name)] = value
-        else:
-            out[str(key)] = item
-    return out
-
-
-def _inject_variables_into_sql_params(
-    args: StiDataEventArgs, query: str
-) -> tuple[str, list[str], bool]:
-    """Вернуть (query, injected_names, restored_template).
-
-    Клиент часто шлёт parameters={} и SQL уже без @param (пустые литералы).
-    Тогда берём шаблон из .mrt и заполняем @param из панели.
-    """
-    injected: list[str] = []
-    restored = False
-    values = _merged_panel_values()
-    template = _lookup_sql_template(args.dataSource)
-    at_in_query = _sql_at_names(query)
-    at_in_template = _sql_at_names(template) if template else set()
-
-    # Restore шаблона ТОЛЬКО если есть реальные значения с панели.
-    # Иначе не трогаем query клиента (пустой restore + value=0 давал 0 строк → пустые карта/таблица).
-    if template and at_in_template:
-        params_empty = not args.parameters
-        values_lower = {k.lower(): v for k, v in values.items()}
-        has_values_for_template = any(
-            not _is_empty(values_lower.get(n.lower())) for n in at_in_template
-        )
-        if has_values_for_template and (not at_in_query or params_empty):
-            if query.strip() != template.strip():
-                print(
-                    f"[viewer] restore SQL template for {args.dataSource!r} "
-                    f"(@params={sorted(at_in_template)}) values={ {n: values_lower.get(n.lower()) for n in at_in_template} }",
-                    flush=True,
-                )
-            query = template
-            restored = True
-            at_in_query = set(at_in_template)
-
-    if not values and not at_in_query:
-        return query, injected, restored
-
-    params = args.parameters
-    if params is None:
-        params = {}
-        args.parameters = params
-    at_lower = {n.lower(): n for n in at_in_query}
-    params_lower = {str(k).lower(): k for k in params}
-
-    # Создаём/заполняем param для каждого @ в query из values
-    for at_name in list(at_in_query):
-        key_lower = at_name.lower()
-        value = None
-        for vk, vv in values.items():
-            if vk.lower() == key_lower and not _is_empty(vv):
-                value = vv
-                break
-        if value is None:
-            continue
-        param_key = params_lower.get(key_lower)
-        existing = params.get(param_key) if param_key is not None else None
-        if existing is not None and not _is_empty(existing.value) and not restored:
-            continue
-        group = _param_type_group_for_value(value, at_name)
-        if existing is None:
-            params[at_name] = StiParameter(at_name, 0, group, group, 0, value)
-            injected.append(at_name)
-        else:
-            if not existing.typeGroup:
-                existing.typeGroup = group
-            existing.value = value
-            injected.append(str(param_key))
-        print(
-            f"[viewer] inject @{injected[-1]}={value!r} into {args.dataSource!r}",
-            flush=True,
-        )
-
-    # Также values→params даже если имя только в values и в params пустое
-    for var_name, value in values.items():
-        if _is_empty(value):
-            continue
-        key_lower = var_name.lower()
-        if key_lower not in at_lower and key_lower not in params_lower:
-            continue
-        if key_lower in {i.lower() for i in injected}:
-            continue
-        param_key = params_lower.get(key_lower)
-        existing = params.get(param_key) if param_key is not None else None
-        use_name = at_lower.get(key_lower, param_key or var_name)
-        if existing is not None and not _is_empty(existing.value) and not restored:
-            continue
-        group = _param_type_group_for_value(value, var_name)
-        if existing is None:
-            params[use_name] = StiParameter(use_name, 0, group, group, 0, value)
-            injected.append(use_name)
-        else:
-            if not existing.typeGroup:
-                existing.typeGroup = group
-            existing.value = value
-            injected.append(str(param_key))
-        print(
-            f"[viewer] inject @{injected[-1]}={value!r} into {args.dataSource!r}",
-            flush=True,
-        )
-
-    return query, injected, restored
-
-
-def _is_file_database(ident: str) -> bool:
-    return any(h in (ident or "") for h in _FILE_DB_IDENTS)
-
-
-def _source_looks_sql(source: dict) -> bool:
-    if not isinstance(source, dict):
-        return False
-    ident = str(source.get("Ident") or "")
-    if any(h in ident for h in _FILE_DB_IDENTS) or "DataTable" in ident:
-        return False
-    has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery", "Parameters"))
-    has_sql = bool(source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery"))
-    return (
-        "Sql" in ident
-        or "Postgre" in ident
-        or has_sql
-        or has_sql_key
-        or bool(source.get("NameInSource"))
-        or bool(source.get("Connection"))
-    )
-
-
-def _patch_postgres_dictionary(dictionary: dict) -> dict:
-    """Ident/NameInSource → PostgreSQL, иначе handler: Unknown database type / нет ExecuteQuery."""
-    meta = {
-        "db_ident_forced": 0,
-        "db_named": 0,
-        "source_ident_forced": 0,
-        "name_in_source_forced": 0,
-        "connect_on_start_forced": 0,
-        "primary_connection": None,
-        "changed": False,
-    }
-    if not isinstance(dictionary, dict) or not PG_CONN:
-        return meta
-
-    sql_dbs: list[dict] = []
-    for db in numbered(dictionary.get("Databases")):
-        if not isinstance(db, dict):
-            continue
-        ident = str(db.get("Ident") or "")
-        if _is_file_database(ident):
-            continue
-        looks_sql = (
-            not ident
-            or any(h in ident for h in _SQL_DB_IDENT_HINTS)
-            or "ConnectionString" in db
-            or bool(db.get("ConnectionString"))
-        )
-        if not looks_sql:
-            continue
-        if ident != "StiPostgreSQLDatabase":
-            db["Ident"] = "StiPostgreSQLDatabase"
-            meta["db_ident_forced"] += 1
-            meta["changed"] = True
-        # Клиенту нужен Recognizable PostgreSQL connection string; пароль подставит handler
-        if not (db.get("ConnectionString") or "").strip():
-            url = database_url()
-            parsed = urlparse(url) if url else None
-            host = (parsed.hostname if parsed else None) or "127.0.0.1"
-            port = (parsed.port if parsed else None) or 5432
-            database = (
-                parsed.path.lstrip("/").split("?", 1)[0] if parsed and parsed.path else "app"
-            )
-            db["ConnectionString"] = (
-                f"Host={host}; Port={port}; Database={database}; User Id=; Password=;"
-            )
-            meta["changed"] = True
-        if db.get("ConnectionStringEncrypted"):
-            db["ConnectionStringEncrypted"] = ""
-            meta["changed"] = True
-        sql_dbs.append(db)
-
-    primary = next(
-        ((db.get("Name") or "").strip() for db in sql_dbs if (db.get("Name") or "").strip()),
-        "",
-    )
-    if sql_dbs and not primary:
-        primary = "Connection"
-        sql_dbs[0]["Name"] = primary
-        if not (sql_dbs[0].get("Alias") or "").strip():
-            sql_dbs[0]["Alias"] = primary
-        meta["db_named"] += 1
-        meta["changed"] = True
-    meta["primary_connection"] = primary or None
-    db_names = {
-        (db.get("Name") or "").strip()
-        for db in sql_dbs
-        if (db.get("Name") or "").strip()
-    }
-
-    # Если SQL-источники есть, а Databases пуст — создаём Connection
-    sql_sources = [
-        s for s in numbered(dictionary.get("DataSources")) if _source_looks_sql(s)
-    ]
-    if sql_sources and not sql_dbs:
-        primary = "Connection"
-        databases = dictionary.get("Databases")
-        if not isinstance(databases, dict):
-            databases = {}
-            dictionary["Databases"] = databases
-        next_key = str(len(databases))
-        databases[next_key] = {
-            "Ident": "StiPostgreSQLDatabase",
-            "Name": primary,
-            "Alias": primary,
-            "ConnectionString": "",
-        }
-        sql_dbs = [databases[next_key]]
-        db_names = {primary}
-        meta["primary_connection"] = primary
-        meta["db_ident_forced"] += 1
-        meta["db_named"] += 1
-        meta["changed"] = True
-
-    for source in sql_sources:
-        ident = str(source.get("Ident") or "")
-        if ident != "StiPostgreSQLSource":
-            source["Ident"] = "StiPostgreSQLSource"
-            meta["source_ident_forced"] += 1
-            meta["changed"] = True
-        # NameInSource не перетираем (Receipts и т.п.) — только если пусто
-        nis = (source.get("NameInSource") or "").strip()
-        if primary and not nis:
-            source["NameInSource"] = primary
-            meta["name_in_source_forced"] += 1
-            meta["changed"] = True
-        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            meta["connect_on_start_forced"] += 1
-            meta["changed"] = True
-        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            meta["connect_on_start_forced"] += 1
-            meta["changed"] = True
-
-    return meta
-
-
-def analyze_source_issues(report: dict) -> dict:
-    """Диагностика Dictionary: пустой Ident, битый NameInSource, пустой SqlCommand."""
-    dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
-    dbs = [d for d in numbered(dictionary.get("Databases")) if isinstance(d, dict)]
-    sources = [s for s in numbered(dictionary.get("DataSources")) if isinstance(s, dict)]
-    db_names = {(d.get("Name") or "").strip() for d in dbs if (d.get("Name") or "").strip()}
-    issues: list[str] = []
-    sql_sources = []
-    for src in sources:
-        if not _source_looks_sql(src):
-            continue
-        name = (src.get("Name") or "").strip() or "(unnamed)"
-        ident = str(src.get("Ident") or "")
-        nis = (src.get("NameInSource") or "").strip()
-        sql = (src.get("SqlCommand") or src.get("Query") or src.get("SqlQuery") or "").strip()
-        entry = {
-            "name": name,
-            "ident": ident or None,
-            "name_in_source": nis or None,
-            "has_sql": bool(sql),
-            "sql_preview": sql[:160] if sql else None,
-            "connect_on_start": src.get("ConnectOnStart"),
-        }
-        sql_sources.append(entry)
-        if not ident:
-            issues.append(f"{name}: пустой Ident (нужен StiPostgreSQLSource)")
-        elif "Postgre" not in ident and "Sql" not in ident:
-            issues.append(f"{name}: Ident={ident!r} — не SQL/PostgreSQL")
-        if not nis:
-            issues.append(f"{name}: пустой NameInSource (имя Databases.Name)")
-        elif db_names and nis not in db_names:
-            issues.append(
-                f"{name}: NameInSource={nis!r} не совпадает с Databases {sorted(db_names)}"
-            )
-        if not sql:
-            issues.append(f"{name}: пустой SqlCommand")
-    for db in dbs:
-        dname = (db.get("Name") or "").strip() or "(unnamed)"
-        ident = str(db.get("Ident") or "")
-        if _is_file_database(ident):
-            continue
-        if not ident:
-            issues.append(f"Database {dname}: пустой Ident (нужен StiPostgreSQLDatabase)")
-        elif "Postgre" not in ident and any(h in ident for h in _SQL_DB_IDENT_HINTS):
-            issues.append(f"Database {dname}: Ident={ident!r} — не PostgreSQL")
-        if not (db.get("Name") or "").strip():
-            issues.append(f"Database: пустое Name (источники не привяжутся)")
-    return {
-        "databases": [
-            {
-                "name": (d.get("Name") or "") or None,
-                "ident": (d.get("Ident") or "") or None,
-                "has_connection_string": bool(d.get("ConnectionString")),
-            }
-            for d in dbs
-        ],
-        "sql_sources": sql_sources,
-        "issues": issues,
-        "ok": len(issues) == 0 and bool(sql_sources),
-    }
 
 
 def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
@@ -1475,44 +876,45 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         meta["parameter_width"] = report.get("ParameterWidth")
 
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
-    if not isinstance(report.get("Dictionary"), dict):
-        report["Dictionary"] = dictionary
 
-    # Databases/DataSources → StiPostgreSQL* + NameInSource + ConnectOnStart
-    pg_meta = _patch_postgres_dictionary(dictionary)
-    if pg_meta.get("changed"):
-        changed = True
-    meta.update(
-        {
-            "connect_on_start_forced": pg_meta.get("connect_on_start_forced", 0),
-            "db_ident_forced": pg_meta.get("db_ident_forced", 0),
-            "db_named": pg_meta.get("db_named", 0),
-            "source_ident_forced": pg_meta.get("source_ident_forced", 0),
-            "name_in_source_forced": pg_meta.get("name_in_source_forced", 0),
-            "primary_connection": pg_meta.get("primary_connection"),
-        }
-    )
-    meta["source_issues"] = analyze_source_issues(report)
+    # DataSources: ConnectOnStart=true, чтобы dashboard реально ходил в SQL
+    connect_forced = 0
+    for source in numbered(dictionary.get("DataSources")):
+        if not isinstance(source, dict):
+            continue
+        ident = str(source.get("Ident") or "")
+        # SqlCommand может быть ключом даже с пустым телом (обезличка)
+        has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery"))
+        has_sql = bool(
+            source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery")
+        )
+        is_sql = (
+            "Sql" in ident
+            or has_sql
+            or has_sql_key
+            or bool(source.get("NameInSource"))
+            or bool(source.get("Connection"))
+        )
+        if not is_sql:
+            continue
+        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            connect_forced += 1
+            changed = True
+        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
+            source["ConnectOnStart"] = True
+            connect_forced += 1
+            changed = True
+    meta["connect_on_start_forced"] = connect_forced
     rfu_forced = 0
     show_forced = 0
-    sql_param_forced = 0
     columns_softened = 0
     defaults_set = 0
     candidates = 0
-    sql_at = _collect_sql_at_names(dictionary)
     for variable in numbered(dictionary.get("Variables")):
         if not isinstance(variable, dict):
             continue
-        name = str(variable.get("Name") or "")
-        is_panel = variable_is_parameters_panel_candidate(variable)
-        used_in_sql = bool(name) and name.lower() in {n.lower() for n in sql_at}
-        # AllowUseAsSqlParameter — иначе движок не кладёт переменную в @param источника
-        if FORCE_ALLOW_SQL_PARAMETER and (is_panel or used_in_sql):
-            if not flag_true(variable.get("AllowUseAsSqlParameter")):
-                variable["AllowUseAsSqlParameter"] = True
-                sql_param_forced += 1
-                changed = True
-        if not is_panel:
+        if not variable_is_parameters_panel_candidate(variable):
             continue
         candidates += 1
         if not flag_true(variable.get("RequestFromUser")):
@@ -1547,8 +949,6 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     meta["panel_candidates"] = candidates
     meta["rfu_forced"] = rfu_forced
     meta["show_on_panel_forced"] = show_forced
-    meta["allow_sql_parameter_forced"] = sql_param_forced
-    meta["sql_at_names"] = sorted(sql_at)
     meta["columns_dialog_softened"] = columns_softened
     meta["empty_defaults_set"] = defaults_set
     meta["has_request_from_user"] = candidates > 0 or meta["has_request_from_user"]
@@ -1560,11 +960,12 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Лог RFU + кэш значений для SQL. Пустые с DialogInfo не трогаем (First)."""
-    global LAST_VARIABLES
+    """Лог RFU. Пустые с DialogInfo не трогаем (SelectionMode=First подставит из списка).
+    Без DialogInfo — безопасный дефолт, не ''."""
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
+    # имена RFU с DialogInfo-списком — из текущего .mrt (сервер знает шаблон)
     dialog_list_names: set[str] = set()
     try:
         report = load_mrt(MRT_PATH)
@@ -1577,7 +978,6 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
     except Exception as exc:
         print(f"[viewer] prepare_variables dialog map: {exc}", flush=True)
 
-    cached: dict[str, object] = {}
     for name, var in variables.items():
         vtype = var.type.value if getattr(var, "type", None) is not None else "?"
         empty = _is_empty(var.value)
@@ -1587,7 +987,6 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
             flush=True,
         )
         if not empty:
-            cached[str(name)] = var.value
             continue
         if name in dialog_list_names:
             # Stimulsoft выберет First после fillsDialogInfoItems — не затирать 0/*
@@ -1602,18 +1001,7 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
                 var.value = default
         else:
             var.value = default
-        cached[str(name)] = var.value
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
-    LAST_VARIABLES = cached
-    # также в PANEL_VARS — чтобы beginProcessData видел значения даже без /panel-vars
-    global PANEL_VARS
-    merged_panel = dict(PANEL_VARS)
-    for key, value in cached.items():
-        if _is_empty(value) and key in merged_panel and not _is_empty(merged_panel.get(key)):
-            continue
-        merged_panel[key] = value
-    PANEL_VARS = merged_panel
-    print(f"[viewer] cached variables for SQL: {cached}", flush=True)
 
 
 def _sql_log_add(entry: dict) -> None:
@@ -1625,63 +1013,39 @@ def _sql_log_add(entry: dict) -> None:
     print(f"[viewer][sql] {entry}", flush=True)
 
 
-def _database_type_value(database) -> object:
-    return getattr(database, "value", database)
-
-
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """PostgreSQL adapter + connection из .env; пустые params → не ''."""
+    """Подмена connection string для ВСЕХ SQL DataSources из .mrt; пустые params → не ''."""
     t0 = time.perf_counter()
     src = args.dataSource or "?"
     connection = args.connection or "?"
     command = getattr(args.command, "value", args.command)
-    database = _database_type_value(args.database)
-    db_forced = False
-    # Важно: пустой/чужой Ident → Unknown database type. Форсим PostgreSQL до getDataAdapter.
-    if PG_CONN and database not in _FILE_DB_TYPES and _database_type_value(database) not in (
-        "XML",
-        "JSON",
-        "CSV",
-    ):
+    database = getattr(args.database, "value", args.database)
+    # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
+    if PG_CONN:
         was = args.connectionString
         args.connectionString = PG_CONN
-        if args.database != StiDatabaseType.POSTGRESQL:
-            args.database = StiDatabaseType.POSTGRESQL
-            db_forced = True
-        database = _database_type_value(args.database)
         print(
             f"[viewer] DB force connection={connection!r} source={src!r} "
             f"command={command!r} was={mask_pg_conn(was or '')!r} "
             f"now={mask_pg_conn(PG_CONN)!r} "
-            f"database={database!r} db_forced={db_forced}",
+            f"database={database!r}",
             flush=True,
         )
     else:
         print(
-            f"[viewer] DB skip/missing — connection={connection!r} source={src!r} "
-            f"command={command!r} database={database!r} "
-            f"conn={mask_pg_conn(args.connectionString or '')!r} pg={bool(PG_CONN)}",
+            f"[viewer] DB MISSING .env — connection={connection!r} source={src!r} "
+            f"command={command!r} conn={mask_pg_conn(args.connectionString or '')!r}",
             flush=True,
         )
 
     query = args.queryString or ""
     qpreview = query[:180].replace("\n", " ")
-    print(
-        f"[viewer] SQL source={src} params={len(args.parameters or {})} "
-        f"q={qpreview!r}",
-        flush=True,
-    )
-
-    query, injected, restored = _inject_variables_into_sql_params(args, query)
-    if restored or query != (args.queryString or ""):
-        args.queryString = query
+    print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
 
     params = args.parameters or {}
     param_dump = {}
     had_empty = False
-    drop_params: list[str] = []
-    # Пустой @param → TRUE/NULL в SQL, НЕ value=0/"*" (иначе WHERE x=0 / LIMIT 0 → пустая карта/таблица)
-    for name, param in list(params.items()):
+    for name, param in params.items():
         param_dump[name] = {
             "typeGroup": param.typeGroup,
             "typeName": param.typeName,
@@ -1697,66 +1061,34 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         had_empty = True
         kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
         query = _soften_empty_param(query, name)
-        drop_params.append(name)
-        param_dump[name]["value_after"] = None
-        param_dump[name]["softened"] = True
+        if _is_number_param(param) or _type_looks_numeric(
+            str(param.typeName or ""), name
+        ):
+            param.typeGroup = "number"
+            param.value = 0
+        else:
+            param.value = "*"
+        param_dump[name]["value_after"] = param.value
         print(
-            f"[viewer] empty @{name} ({kind}) on {src} → soften + drop param "
-            f"(no 0/* defaults)",
+            f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
             flush=True,
         )
-
-    # @param в SQL без записи в parameters — тоже смягчить
-    for at_name in list(_sql_at_names(query)):
-        if any(str(k).lower() == at_name.lower() for k in params):
-            # уже обработан выше или имеет значение
-            existing = next(
-                (params[k] for k in params if str(k).lower() == at_name.lower()),
-                None,
-            )
-            if existing is not None and not _is_empty(existing.value):
-                continue
-            if at_name in drop_params or any(
-                d.lower() == at_name.lower() for d in drop_params
-            ):
-                continue
-        had_empty = True
-        query = _soften_empty_param(query, at_name)
-        print(f"[viewer] orphan @{at_name} on {src} → soften", flush=True)
-
-    for name in drop_params:
-        if name in params:
-            del params[name]
-        # case-insensitive cleanup
-        for k in list(params):
-            if str(k).lower() == name.lower():
-                del params[k]
 
     if had_empty or "''" in (query or ""):
         before = query
         query = _soften_inlined_empty_literals(query)
+        if "''" in query:
+            query = query.replace("''", "NULL")
         if query != before:
             print(f"[viewer] softened inlined '' on {src}", flush=True)
 
-    # Подставить params и убрать любой оставшийся @ — иначе PG: syntax error at or near "@"
-    before_final = query
-    query = _finalize_sql_query(query, params)
-    if query != before_final:
+    if query != (args.queryString or ""):
+        args.queryString = query
         print(
-            f"[viewer] SQL finalized q={(query[:220]).replace(chr(10), ' ')!r}",
+            f"[viewer] SQL after soften q={(query[:180]).replace(chr(10), ' ')!r}",
             flush=True,
         )
-    args.queryString = query
-    # params уже вшиты в SQL — очищаем, чтобы handler не делал apply ещё раз по пустым
-    if drop_params or injected or restored or had_empty:
-        args.parameters = {
-            k: v
-            for k, v in (params or {}).items()
-            if not _is_empty(getattr(v, "value", None))
-        }
 
-    merged = _merged_panel_values()
-    left_at = sorted(_sql_at_names(query))
     _sql_log_add(
         {
             "phase": "begin",
@@ -1765,13 +1097,8 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "command": command,
             "database": str(database),
             "pg_forced": bool(PG_CONN),
-            "database_forced": db_forced,
-            "template_restored": restored,
-            "injected_from_variables": injected,
-            "panel_variables": {k: merged.get(k) for k in list(merged)[:40]},
-            "query": (args.queryString or "")[:4000],
+            "query": (args.queryString or "")[:2000],
             "parameters": param_dump,
-            "remaining_at_params": left_at,
             "ms": round((time.perf_counter() - t0) * 1000, 1),
         }
     )
@@ -1792,16 +1119,6 @@ def end_process_data(args: StiDataEventArgs) -> None:
             rows = len(data)
     except Exception:
         rows = None
-    # последний begin-query для этого source — чтобы увидеть SQL при syntax error
-    last_query = None
-    for item in SQL_LOG:
-        if (
-            item.get("phase") == "begin"
-            and item.get("source") == src
-            and item.get("query")
-        ):
-            last_query = item.get("query")
-            break
     entry = {
         "phase": "end",
         "connection": connection,
@@ -1810,17 +1127,12 @@ def end_process_data(args: StiDataEventArgs) -> None:
         "success": success,
         "notice": notice,
         "rows": rows,
-        "query": last_query,
     }
     _sql_log_add(entry)
     print(
         f"[viewer] SQL done source={src!r} success={success} rows={rows} notice={notice!r}",
         flush=True,
     )
-    if success is False and notice:
-        print(f"[viewer] SQL ERROR source={src!r}: {notice}", flush=True)
-        if last_query:
-            print(f"[viewer] SQL ERROR query={last_query[:500]!r}", flush=True)
 
 
 @app.get("/mrt")
@@ -1828,37 +1140,10 @@ def serve_mrt():
     """Отдать .mrt с RequestParameters/Dialog — иначе viewer без Submit."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
-    try:
-        _refresh_sql_templates(json.loads(patched))
-    except Exception as exc:
-        print(f"[viewer] refresh templates: {exc}", flush=True)
-        _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
     resp = Response(patched, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-@app.post("/panel-vars")
-def panel_vars():
-    """Клиент шлёт выбранные фильтры с панели — кладём в PANEL_VARS для SQL."""
-    global PANEL_VARS
-    payload = request.get_json(silent=True)
-    if payload is None and request.data:
-        try:
-            payload = json.loads(request.data.decode("utf-8"))
-        except Exception:
-            payload = None
-    normalized = _normalize_panel_payload(payload or {})
-    # не затираем известные значения пустыми
-    merged = dict(PANEL_VARS)
-    for key, value in normalized.items():
-        if _is_empty(value) and key in merged and not _is_empty(merged.get(key)):
-            continue
-        merged[key] = value
-    PANEL_VARS = merged
-    print(f"[viewer] /panel-vars ← {PANEL_VARS}", flush=True)
-    return jsonify({"ok": True, "count": len(PANEL_VARS), "variables": PANEL_VARS})
 
 
 @app.get("/debug")
@@ -1871,40 +1156,16 @@ def debug():
     info["database"] = probe_database()
     info["sql_log_count"] = len(SQL_LOG)
     info["sql_log"] = list(SQL_LOG)[:40]
-    info["panel_vars"] = dict(PANEL_VARS)
-    info["last_variables"] = dict(LAST_VARIABLES)
-    info["sql_templates"] = {
-        name: sql[:200] for name, sql in list(SOURCE_SQL_TEMPLATES.items())[:20]
-    }
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
-            "RequestParameters=true: выбери фильтры и нажми Submit — "
-            "тогда значения уйдут в SQL @param источников."
+            "RequestParameters=true: dashboard SQL ждёт кнопку Submit на панели. "
+            "Поставь FORCE_REQUEST_PARAMETERS=0 чтобы грузить DataSources сразу."
         )
-    else:
-        info["note_request_parameters"] = (
-            "RequestParameters=false: первый SQL может уйти с пустыми @param. "
-            "После смены фильтров всё равно нужен Submit; "
-            "для первого запроса с выбором поставь FORCE_REQUEST_PARAMETERS=1."
-        )
-    if not SQL_LOG:
+    elif not SQL_LOG:
         info["note_sql_log_empty"] = (
             "sql_log пуст — handler ещё не получил ExecuteQuery. "
             "Открой / (не только /debug), проверь database.ok и консоль [viewer][sql]."
-        )
-    source_issues = (meta.get("source_issues") or {}).get("issues") or []
-    if source_issues:
-        info["source_problems"] = source_issues
-        info["note_source_problems"] = (
-            "Проблемы Dictionary после patch — пустой SqlCommand/Ident/NameInSource. "
-            "Обезличенный test.mrt SQL не выполнит; нужен полный .mrt (MRT_PATH)."
-        )
-    db_probe = info.get("database") or {}
-    if not db_probe.get("ok"):
-        info["note_database"] = (
-            "Postgres из .env недоступен — источники упадут на connect. "
-            f"error={db_probe.get('error')}"
         )
     if info.get("filter_elements_count") == 0 and (
         info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
@@ -1950,7 +1211,6 @@ def viewer():
     sti.options.toolbar.showRefreshButton = True
     sti.javascript.appendHead(_AFTER_INIT_HEAD)
     sti.onAfterInitialize += "__stiAfterInit"
-    sti.onInteraction += "__stiOnInteraction"
     sti.onPrepareVariables += prepare_variables
     # SQL DataSources: событие и на viewer, и на report (доки Stimulsoft)
     sti.onBeginProcessData += begin_process_data
