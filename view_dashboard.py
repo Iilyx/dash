@@ -495,7 +495,7 @@ def _dialog_needs_sql_preload(dialog: dict) -> bool:
 
 
 def soften_variable_dialog_for_panel(variable: dict) -> bool:
-    """Columns→Items + placeholder, чтобы панель открылась без SQL."""
+    """Опционально Columns→Items (FORCE_SKIP_COLUMNS_PRELOAD). По умолчанию DialogInfo не трогаем."""
     dialog = variable.get("DialogInfo")
     if not isinstance(dialog, dict) or not _dialog_needs_sql_preload(dialog):
         return False
@@ -506,23 +506,75 @@ def soften_variable_dialog_for_panel(variable: dict) -> bool:
     keys, values = _dialog_keys_values(dialog)
     nonempty_keys = [k for k in keys if k not in (None, "")]
     if not nonempty_keys:
-        # числовые фильтры: безопасный placeholder, не ''
         typ = str(variable.get("Type") or "").lower()
-        if any(h in typ for h in ("int", "long", "decimal", "double", "float", "byte")):
+        if _type_looks_numeric(typ, name):
             dialog["Keys"] = {"0": "0"}
             dialog["Values"] = {"0": f"(all) {name}"}
-            if _is_empty(variable.get("Value")):
-                variable["Value"] = "0"
         else:
             dialog["Keys"] = {"0": "*"}
             dialog["Values"] = {"0": f"(all) {name}"}
-            if _is_empty(variable.get("Value")):
-                variable["Value"] = "*"
     elif not any(v not in (None, "") for v in values):
         dialog["Values"] = {str(i): str(k) for i, k in enumerate(nonempty_keys)}
     dialog["AllowUserValues"] = True
     variable["DialogInfo"] = dialog
     return True
+
+
+def _type_looks_numeric(typ: str, name: str = "") -> bool:
+    t = (typ or "").lower()
+    n = (name or "").lower()
+    if any(
+        h in t
+        for h in (
+            "int",
+            "long",
+            "short",
+            "byte",
+            "decimal",
+            "double",
+            "float",
+            "single",
+            "uint",
+            "number",
+        )
+    ):
+        return True
+    return any(
+        h in n
+        for h in (
+            "month",
+            "year",
+            "num",
+            "id",
+            "type",
+            "code",
+            "trend",
+            "count",
+            "qty",
+        )
+    )
+
+
+def default_value_for_variable(variable: dict) -> str:
+    """Дефолт вместо '': сначала Keys из DialogInfo, иначе 0 / * / Today."""
+    dialog = variable.get("DialogInfo") if isinstance(variable.get("DialogInfo"), dict) else {}
+    keys, _values = _dialog_keys_values(dialog) if dialog else ([], [])
+    nonempty_keys = [k for k in keys if k not in (None, "")]
+    if nonempty_keys:
+        return str(nonempty_keys[0])
+    typ = str(variable.get("Type") or "")
+    name = str(variable.get("Name") or "")
+    t = typ.lower()
+    if "bool" in t:
+        return "False"
+    if "datetime" in t or t.endswith(".date") or t == "date":
+        return "Today"
+    if "list" in t:
+        # Stimulsoft list: пустой список как JSON-ish не шлём ''; первая key если была
+        return "0" if _type_looks_numeric(typ, name) else "*"
+    if _type_looks_numeric(typ, name):
+        return "0"
+    return "*"
 
 
 def dashboard_debug(path: Path) -> dict:
@@ -605,9 +657,9 @@ def dashboard_debug(path: Path) -> dict:
         "force_skip_columns_preload": FORCE_SKIP_COLUMNS_PRELOAD,
         "stimulsoft_versions": package_versions(),
         "note_show_on_parameters_panel": (
-            "Панель сверху = ParametersDisplayMode=Panel + RFU. "
-            "DialogInfo Columns тянет списки SQL; пустые int смягчаем. "
-            "FORCE_SKIP_COLUMNS_PRELOAD=1 убирает SQL-preload, но тогда списки пустые."
+            "Панель сверху = Panel + RFU. Пустым Value ставим дефолты (0/*/Today/первый Key). "
+            "DialogInfo Columns не трогаем — списки грузятся SQL. "
+            "FORCE_SKIP_COLUMNS_PRELOAD=1 только если нужно отключить Columns."
         ),
     }
 
@@ -702,16 +754,15 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
             variable["ShowOnParametersPanel"] = True
             show_forced += 1
             changed = True
+        # DialogInfo не трогаем по умолчанию (Columns сам подтянет Keys/Values)
         if FORCE_SKIP_COLUMNS_PRELOAD and soften_variable_dialog_for_panel(variable):
             columns_softened += 1
             changed = True
-        # пустой Value у int RFU → '' в SQL до Submit
+        # везде дефолты вместо '' — иначе Columns-preload и dashboard SQL падают на int ""
         if _is_empty(variable.get("Value")):
-            typ = str(variable.get("Type") or "").lower()
-            if any(h in typ for h in ("int", "long", "decimal", "double", "float", "byte")):
-                variable["Value"] = "0"
-                defaults_set += 1
-                changed = True
+            variable["Value"] = default_value_for_variable(variable)
+            defaults_set += 1
+            changed = True
     meta["panel_candidates"] = candidates
     meta["rfu_forced"] = rfu_forced
     meta["show_on_panel_forced"] = show_forced
@@ -724,8 +775,9 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         return raw, meta
     return json.dumps(report, ensure_ascii=False, indent=2) + "\n", meta
 
+
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Лог RFU; пустые числовые → None (не ''), чтобы SQL не получил \"\"."""
+    """Пустые RFU → дефолты (0 / * / Today), никогда ''."""
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
@@ -738,14 +790,21 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         )
         if not empty:
             continue
-        # '' в int/number ломает PG; None безопаснее до выбора на панели
-        if isinstance(var.value, str) and var.value.strip() == "":
-            var.value = None
-            print(f"[viewer]   var {name}: '' → None", flush=True)
+        fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
+        default = default_value_for_variable(fake)
+        # числовые типы — int, иначе строка (Stimulsoft сам приведёт)
+        if _type_looks_numeric(vtype, name) and "list" not in vtype.lower():
+            try:
+                var.value = int(default)
+            except (TypeError, ValueError):
+                var.value = default
+        else:
+            var.value = default
+        print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Connection string из .env; пустые params → TRUE/NULL, никогда ''."""
+    """Connection string из .env; пустые params → дефолт/TRUE, никогда ''."""
     if PG_CONN and args.connectionString is not None:
         args.connectionString = PG_CONN
 
@@ -766,18 +825,27 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             continue
         had_empty = True
         kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
+        # смягчить фильтр + подставить дефолт, если @ останется до applyQueryParameters
         query = _soften_empty_param(query, name)
-        # StiSqlAdapter.applyQueryParameters после события:
-        #   number → str(value); иначе → 'value' / '' при None
-        # Пустой number/string с '' даёт PG: invalid input syntax for type integer ""
-        # Если @name ещё остался — вставить NULL без кавычек.
-        param.typeGroup = "number"
-        param.value = "NULL"
-        print(f"[viewer] empty @{name} ({kind}) on {src} → soften + NULL", flush=True)
+        if _is_number_param(param) or _type_looks_numeric(
+            str(param.typeName or ""), name
+        ):
+            param.typeGroup = "number"
+            param.value = 0
+        else:
+            # строковый дефолт, не ''
+            param.value = "*"
+        print(
+            f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
+            flush=True,
+        )
 
     if had_empty or "''" in (query or ""):
         before = query
         query = _soften_inlined_empty_literals(query)
+        # residual '' → NULL (PG integer "")
+        if "''" in query:
+            query = query.replace("''", "NULL")
         if query != before:
             print(f"[viewer] softened inlined '' on {src}", flush=True)
 
