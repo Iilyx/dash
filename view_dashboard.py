@@ -559,90 +559,164 @@ def _is_number_param(param) -> bool:
 
 
 def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
+    """Пустой @Param → (1=1)/NULL. Не оставлять @ для PG (syntax error at «@»)."""
     if not query:
         return query
     pat = re.escape(name)
-    # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
+    flags = re.IGNORECASE
+    # LIMIT/OFFSET @p — LIMIT NULL в PG = syntax error
+    query = re.sub(rf"\bLIMIT\s+[@:]{pat}\b", "", query, flags=flags)
+    query = re.sub(rf"\bOFFSET\s+[@:]{pat}\b", "", query, flags=flags)
+    # касты раньше сравнений
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
-        "TRUE",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
-    query = re.sub(
-        rf"[@:]{pat}\s*::\s*\w+",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
+    query = re.sub(rf"[@:]{pat}\s*::\s*\w+", "NULL", query, flags=flags)
     query = re.sub(
         rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
         "NULL",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
     query = re.sub(
         rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
-        "TRUE",
+        rf"[\w.\"`\[\]]+?\s*(?:=|<>|!=|>=|<=|>|<)\s*[@:]{pat}\b",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
-    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s+(?:LIKE|ILIKE)\s+[@:]{pat}\b",
+        "(1=1)",
+        query,
+        flags=flags,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s+BETWEEN\s+[@:]{pat}\s+AND\s+[@:]\w+",
+        "(1=1)",
+        query,
+        flags=flags,
+    )
+    # всё оставшееся @name → NULL (не LIMIT NULL — уже сняли выше)
+    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=flags)
 
 
 def _soften_inlined_empty_literals(query: str) -> str:
-    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
+    """Клиент подставил '' в фильтры. НЕ трогаем все '' подряд (ломает 'it''s')."""
     if not query or "''" not in query:
         return query
-    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
+    flags = re.IGNORECASE
     query = re.sub(
         r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "TRUE",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
     query = re.sub(
         r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
         "NULL",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
     query = re.sub(
         r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
         "NULL",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
+    query = re.sub(r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)", "(1=1)", query, flags=flags)
     query = re.sub(
         r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
-        "TRUE",
+        "(1=1)",
         query,
-        flags=re.IGNORECASE,
+        flags=flags,
     )
-    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
-    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
-    query = re.sub(r"=\s*''", " = NULL", query)
-    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
+    # только сравнение колонки с пустым литералом (не глобальный replace '')
+    query = re.sub(
+        r"([\w.\"`\[\]]+)\s*(?:=|<>|!=)\s*''",
+        r"(1=1)",
+        query,
+    )
     return query
+
+
+def _strip_at_params_outside_strings(query: str) -> str:
+    """Убрать оставшиеся @param/:param вне строковых литералов — иначе PG syntax error."""
+    if not query or ("@" not in query and ":" not in query):
+        return query
+    # LIMIT/OFFSET NULL|@x — syntax error
+    query = re.sub(r"\bLIMIT\s+(?:NULL|[@:]\w+)\b", "", query, flags=re.IGNORECASE)
+    query = re.sub(r"\bOFFSET\s+(?:NULL|[@:]\w+)\b", "", query, flags=re.IGNORECASE)
+    out: list[str] = []
+    i = 0
+    n = len(query)
+    in_str = False
+    while i < n:
+        ch = query[i]
+        if in_str:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and query[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        # @param — Stimulsoft. :param — иногда; НЕ трогать Postgres cast ::type
+        is_at = ch == "@" and i + 1 < n and (
+            query[i + 1].isalpha() or query[i + 1] == "_"
+        )
+        is_colon = (
+            ch == ":"
+            and (i == 0 or query[i - 1] != ":")
+            and i + 1 < n
+            and query[i + 1] != ":"
+            and (query[i + 1].isalpha() or query[i + 1] == "_")
+        )
+        if is_at or is_colon:
+            i += 1
+            while i < n and (query[i].isalnum() or query[i] == "_"):
+                i += 1
+            out.append("NULL")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _finalize_sql_query(query: str, params: dict | None) -> str:
+    """Подставить оставшиеся params и гарантированно убрать @ для PostgreSQL."""
+    if not query:
+        return query
+    if params:
+        from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
+
+        query = StiSqlAdapter.applyQueryParameters(query, params, True)
+    query = _strip_at_params_outside_strings(query)
+    # подчистить двойные пробелы/висячие AND после снятия LIMIT
+    query = re.sub(r"[ \t]{2,}", " ", query)
+    query = re.sub(r"\s+;", ";", query)
+    return query.strip()
 
 
 def mrt_looks_anonymized(path: Path) -> bool:
@@ -904,9 +978,16 @@ def mrt_has_request_from_user(report: dict) -> bool:
 
 
 def _sql_at_names(query: str) -> set[str]:
+    """Имена @param / :param. Не путать с Postgres cast ::type."""
     if not query:
         return set()
-    return {m.group(1) for m in re.finditer(r"[@:]([A-Za-z_][A-Za-z0-9_]*)", query)}
+    names = {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
+    # :name, но не ::name
+    names |= {
+        m.group(1)
+        for m in re.finditer(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", query)
+    }
+    return names
 
 
 def _collect_sql_at_names(dictionary: dict) -> set[str]:
@@ -1654,19 +1735,28 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if had_empty or "''" in (query or ""):
         before = query
         query = _soften_inlined_empty_literals(query)
-        if "''" in query:
-            query = query.replace("''", "NULL")
         if query != before:
             print(f"[viewer] softened inlined '' on {src}", flush=True)
 
-    if query != (args.queryString or ""):
-        args.queryString = query
+    # Подставить params и убрать любой оставшийся @ — иначе PG: syntax error at or near "@"
+    before_final = query
+    query = _finalize_sql_query(query, params)
+    if query != before_final:
         print(
-            f"[viewer] SQL after soften q={(query[:180]).replace(chr(10), ' ')!r}",
+            f"[viewer] SQL finalized q={(query[:220]).replace(chr(10), ' ')!r}",
             flush=True,
         )
+    args.queryString = query
+    # params уже вшиты в SQL — очищаем, чтобы handler не делал apply ещё раз по пустым
+    if drop_params or injected or restored or had_empty:
+        args.parameters = {
+            k: v
+            for k, v in (params or {}).items()
+            if not _is_empty(getattr(v, "value", None))
+        }
 
     merged = _merged_panel_values()
+    left_at = sorted(_sql_at_names(query))
     _sql_log_add(
         {
             "phase": "begin",
@@ -1679,8 +1769,9 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "template_restored": restored,
             "injected_from_variables": injected,
             "panel_variables": {k: merged.get(k) for k in list(merged)[:40]},
-            "query": (args.queryString or "")[:2000],
+            "query": (args.queryString or "")[:4000],
             "parameters": param_dump,
+            "remaining_at_params": left_at,
             "ms": round((time.perf_counter() - t0) * 1000, 1),
         }
     )
@@ -1701,6 +1792,16 @@ def end_process_data(args: StiDataEventArgs) -> None:
             rows = len(data)
     except Exception:
         rows = None
+    # последний begin-query для этого source — чтобы увидеть SQL при syntax error
+    last_query = None
+    for item in SQL_LOG:
+        if (
+            item.get("phase") == "begin"
+            and item.get("source") == src
+            and item.get("query")
+        ):
+            last_query = item.get("query")
+            break
     entry = {
         "phase": "end",
         "connection": connection,
@@ -1709,12 +1810,17 @@ def end_process_data(args: StiDataEventArgs) -> None:
         "success": success,
         "notice": notice,
         "rows": rows,
+        "query": last_query,
     }
     _sql_log_add(entry)
     print(
         f"[viewer] SQL done source={src!r} success={success} rows={rows} notice={notice!r}",
         flush=True,
     )
+    if success is False and notice:
+        print(f"[viewer] SQL ERROR source={src!r}: {notice}", flush=True)
+        if last_query:
+            print(f"[viewer] SQL ERROR query={last_query[:500]!r}", flush=True)
 
 
 @app.get("/mrt")
