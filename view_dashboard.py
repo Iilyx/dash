@@ -547,21 +547,76 @@ def variable_has_dialog_list(variable: dict) -> bool:
     return init in {"columns", "items", "1"}
 
 
+def _datafilter_expression_defaults(report: dict) -> dict[str, str]:
+    """DataFilters: Value=\"{Patient}\", Value2=\"0\", IsExpression → Patient→0.
+
+    Drill-down/expression `{argument}` / `{Var}` при пустом Var должен брать Value2,
+    а не наш placeholder '_'.
+    """
+    out: dict[str, str] = {}
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            filters = node.get("DataFilters")
+            if filters is not None:
+                for item in numbered(filters):
+                    if not isinstance(item, dict):
+                        continue
+                    val = str(item.get("Value") or "").strip()
+                    val2 = item.get("Value2")
+                    if val2 is None or val2 == "":
+                        continue
+                    m = re.fullmatch(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", val)
+                    if not m:
+                        continue
+                    # IsExpression или просто {Var}
+                    name = m.group(1)
+                    if name not in out:
+                        out[name] = str(val2)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(report)
+    return out
+
+
+# кэш Value2 из DataFilters текущего MRT
+_FILTER_EXPR_DEFAULTS: dict[str, str] | None = None
+
+
+def _filter_expr_defaults() -> dict[str, str]:
+    global _FILTER_EXPR_DEFAULTS
+    if _FILTER_EXPR_DEFAULTS is not None:
+        return _FILTER_EXPR_DEFAULTS
+    try:
+        _FILTER_EXPR_DEFAULTS = _datafilter_expression_defaults(load_mrt(MRT_PATH))
+    except Exception:
+        _FILTER_EXPR_DEFAULTS = {}
+    return _FILTER_EXPR_DEFAULTS
+
+
 def default_value_for_variable(variable: dict) -> str | None:
-    """Дефолт вместо ''. None = не ставить Value (DialogInfo сам выберет First)."""
+    """Дефолт вместо ''. None = не ставить Value (DialogInfo/Value2 сами)."""
     if variable_has_dialog_list(variable):
         return None
     typ = str(variable.get("Type") or "")
     name = str(variable.get("Name") or "")
     t = typ.lower()
+    # expression DataFilters {Name} → Value2 (часто "0" для int Path)
+    expr_defaults = _filter_expr_defaults()
+    if name in expr_defaults:
+        return expr_defaults[name]
     if "bool" in t:
         return "False"
     if "datetime" in t or t.endswith(".date") or t == "date":
         return "Today"
     if _type_looks_numeric(typ, name):
         return "0"
-    # без DialogInfo строковый placeholder; '' нельзя (PG int "")
-    return "0" if _type_looks_numeric(typ, name) else "_"
+    # НЕ '_': ломает {Patient}→NameID integer. Пусто → Stimulsoft Value2.
+    return None
 
 
 def dashboard_debug(path: Path) -> dict:
@@ -876,7 +931,11 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
             print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
             continue
         fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
-        default = default_value_for_variable(fake) or "0"
+        default = default_value_for_variable(fake)
+        if default is None:
+            # expression {Var} + Value2 в DataFilters; не подставляем '_'
+            print(f"[viewer]   var {name}: empty → leave (expression/Value2)", flush=True)
+            continue
         if _type_looks_numeric(vtype, name) and "list" not in vtype.lower():
             try:
                 var.value = int(default)
@@ -1278,10 +1337,15 @@ def end_process_data(args: StiDataEventArgs) -> None:
 @app.get("/mrt")
 def serve_mrt():
     """Отдать .mrt с патчем панели фильтров."""
+    global _FILTER_EXPR_DEFAULTS
+    _FILTER_EXPR_DEFAULTS = None  # перечитать Value2 из DataFilters
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
     try:
-        _refresh_sql_templates(json.loads(patched))
+        report = json.loads(patched)
+        _refresh_sql_templates(report)
+        _FILTER_EXPR_DEFAULTS = _datafilter_expression_defaults(report)
+        meta["filter_expr_defaults"] = dict(_FILTER_EXPR_DEFAULTS)
     except Exception:
         _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
