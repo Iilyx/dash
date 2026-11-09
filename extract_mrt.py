@@ -605,6 +605,23 @@ def dialog_info(node: dict | None) -> dict | None:
     return cleaned or None
 
 
+def flag_true(value) -> bool:
+    """Stimulsoft JSON: true / "true" / 1 — RequestFromUser и соседние флаги."""
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes"}:
+        return True
+    return False
+
+
+def flag_false(value) -> bool:
+    if value is False or value == 0:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"false", "0", "no"}:
+        return True
+    return False
+
+
 def variables(node) -> list[dict]:
     result = []
     for variable in numbered(node):
@@ -622,15 +639,16 @@ def variables(node) -> list[dict]:
             "to": text(variable.get("InitByExpressionTo")),
             "selection": text(variable.get("SelectionMode") or variable.get("Selection")),
         }
-        if variable.get("RequestFromUser") is True:
+        # RequestFromUser = диалог/панель параметров → это и есть «фильтр» для SQL
+        if flag_true(variable.get("RequestFromUser")):
             item["request_from_user"] = True
-        if variable.get("ShowOnParametersPanel") is False:
+        if flag_false(variable.get("ShowOnParametersPanel")):
             item["show_on_parameters_panel"] = False
-        if variable.get("AllowUseAsSqlParameter") is True:
+        if flag_true(variable.get("AllowUseAsSqlParameter")):
             item["sql_parameter"] = True
-        if variable.get("ReadOnly") is True:
+        if flag_true(variable.get("ReadOnly")):
             item["read_only"] = True
-        if variable.get("AllowNullableString") is True:
+        if flag_true(variable.get("AllowNullableString")):
             item["nullable"] = True
         dialog = dialog_info(variable.get("DialogInfo"))
         if dialog:

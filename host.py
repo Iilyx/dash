@@ -522,12 +522,21 @@ def variables_by_names(variables: list[dict], names: list[str]) -> list[dict]:
 
 
 def is_filter_variable(variable: dict) -> bool:
+    """Фильтр: category Фильтр / RequestFromUser / SQL-параметр / dialog."""
     category = variable.get("category")
-    return isinstance(category, str) and category.strip().lower() in FILTER_CATEGORIES
+    if isinstance(category, str) and category.strip().lower() in FILTER_CATEGORIES:
+        return True
+    # Stimulsoft: RequestFromUser → панель параметров / dialog перед SQL
+    if variable.get("request_from_user") is True:
+        return True
+    if variable.get("sql_parameter") is True:
+        return True
+    dialog = variable.get("dialog")
+    return isinstance(dialog, dict) and bool(dialog)
 
 
 def filter_variables(variables: list[dict]) -> list[dict]:
-    """Все variables с category Фильтр / Фильтры — не только те, что встретились в SQL {}."""
+    """Фильтры: category / RequestFromUser / dialog — не только {Name} из SQL."""
     return [v for v in variables if isinstance(v, dict) and is_filter_variable(v)]
 
 

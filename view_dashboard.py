@@ -25,6 +25,7 @@ from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
 ROOT = Path(__file__).resolve().parent
 
@@ -174,19 +175,26 @@ def _soften_empty_param(query: str, name: str) -> str:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Пустые переменные фильтров: не оставлять '' для Int/List."""
+    """RequestFromUser / пустые фильтры: не оставлять '' для Int/List.
+
+    Stimulsoft шлёт сюда variables с RequestFromUser (панель параметров / dialog).
+    Пока пользователь ничего не выбрал — value часто "".
+    """
     variables = args.variables or {}
     for name, var in variables.items():
         if not _is_empty(var.value):
             continue
         vtype = var.type
+        type_name = vtype.value if vtype is not None else "?"
+        # это как раз RequestFromUser-переменные, пришедшие в onPrepareVariables
         if vtype in _NUMERIC_VAR_TYPES:
-            # None → дальше SQL-параметр тоже увидит пустоту и soften'ится
             var.value = None
-            print(f"[viewer] filter var {name} ({vtype.value}) empty → None", flush=True)
+            print(f"[viewer] RequestFromUser {name} ({type_name}) empty → None", flush=True)
         elif vtype is not None and str(vtype.value).endswith("List"):
             var.value = []
-            print(f"[viewer] filter var {name} ({vtype.value}) empty → []", flush=True)
+            print(f"[viewer] RequestFromUser {name} ({type_name}) empty → []", flush=True)
+        else:
+            print(f"[viewer] RequestFromUser {name} ({type_name}) empty", flush=True)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
@@ -229,7 +237,10 @@ def serve_mrt():
 def viewer():
     sti = StiViewer()
     sti.options.appearance.fullScreenMode = True
-    # фильтры/variables → defaults; SQL @Param → не ''
+    # RequestFromUser → показать панель параметров (dialog) сверху
+    sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    sti.options.toolbar.showParametersButton = True
+    # variables (RequestFromUser) + SQL @Param → не ''
     sti.onPrepareVariables += prepare_variables
     sti.onBeginProcessData += begin_process_data
 
