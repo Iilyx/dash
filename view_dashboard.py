@@ -57,8 +57,11 @@ from extract_mrt import (
     repair_mrt_json,
 )
 
-# Последние значения RFU с onPrepareVariables → подмешиваем в SQL @params
+# Последние значения RFU (prepareVariables + /panel-vars) → SQL @params
 LAST_VARIABLES: dict[str, object] = {}
+PANEL_VARS: dict[str, object] = {}
+# Оригинальные SqlCommand из .mrt (имя источника → SQL с @param)
+SOURCE_SQL_TEMPLATES: dict[str, str] = {}
 
 _FILE_DB_IDENTS = (
     "Excel",
@@ -315,6 +318,8 @@ _OPENED_REPORT_JS = f"""
         if (v.requestFromUser || v.showOnParametersPanel) {{
           v.requestFromUser = true;
           v.showOnParametersPanel = true;
+          // иначе клиент не кладёт переменную в parameters{{}} запроса
+          try {{ v.allowUseAsSqlParameter = true; }} catch (eA) {{}}
         }}
       }}
     }}
@@ -455,6 +460,55 @@ window.__stiKeepParametersPanel = function () {{
     window.__stiWidenParameterFields(v);
   }}
 }};
+window.__stiPushPanelVars = function (varsObj, sync) {{
+  try {{
+    if (!varsObj) {{
+      var v = window.__stiFindViewer();
+      varsObj = v && v.options && v.options.paramsVariables;
+    }}
+    if (!varsObj) return;
+    window.__stiLastPanelVars = varsObj;
+    var body = JSON.stringify(varsObj);
+    // sync на Submit: иначе ExecuteQuery уходит раньше, чем /panel-vars
+    if (sync) {{
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/panel-vars', false);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      try {{ xhr.send(body); }} catch (eSync) {{ console.warn('[viewer] panel-vars sync', eSync); }}
+      console.log('[viewer] panel-vars sync status', xhr.status, xhr.responseText);
+      return;
+    }}
+    fetch('/panel-vars', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: body,
+      credentials: 'same-origin',
+      keepalive: true
+    }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
+      console.log('[viewer] panel-vars pushed', j);
+    }}).catch(function (e) {{
+      console.warn('[viewer] panel-vars', e);
+    }});
+  }} catch (e0) {{
+    console.warn('[viewer] push panel vars', e0);
+  }}
+}};
+window.__stiOnInteraction = function (args) {{
+  try {{
+    if (!args) return;
+    var act = args.action || '';
+    if (act === 'Variables' || act === 'variables' || act === 'DashboardElementApplyEvents') {{
+      var varsObj = args.variables;
+      if (!varsObj) {{
+        var vv = window.__stiFindViewer();
+        varsObj = vv && vv.options && vv.options.paramsVariables;
+      }}
+      window.__stiPushPanelVars(varsObj, true);
+    }}
+  }} catch (e) {{
+    console.warn('[viewer] onInteraction', e);
+  }}
+}};
 window.__stiAfterInit = function (args) {{
   var tries = 0;
   var timer = setInterval(function () {{
@@ -462,6 +516,8 @@ window.__stiAfterInit = function (args) {{
     if (window.__stiForceParametersPanel() || tries > 80) {{
       clearInterval(timer);
       setInterval(window.__stiKeepParametersPanel, 1000);
+      window.__stiPushPanelVars();
+      setInterval(function () {{ window.__stiPushPanelVars(null, false); }}, 2000);
     }}
   }}, 250);
 }};
@@ -879,31 +935,172 @@ def _param_type_group_for_value(value: object, name: str = "") -> str:
     return "string"
 
 
-def _inject_variables_into_sql_params(args: StiDataEventArgs, query: str) -> list[str]:
-    """Подставить значения RFU в args.parameters, если клиент прислал пустые/@без param."""
+def _merged_panel_values() -> dict[str, object]:
+    """PANEL_VARS (с JS Submit) перекрывают LAST_VARIABLES (prepareVariables)."""
+    merged = dict(LAST_VARIABLES)
+    merged.update({k: v for k, v in PANEL_VARS.items() if not _is_empty(v)})
+    return merged
+
+
+def _lookup_sql_template(data_source: str | None) -> str:
+    if not data_source:
+        return ""
+    if data_source in SOURCE_SQL_TEMPLATES:
+        return SOURCE_SQL_TEMPLATES[data_source]
+    lower = data_source.lower()
+    for name, sql in SOURCE_SQL_TEMPLATES.items():
+        if name.lower() == lower:
+            return sql
+    return ""
+
+
+def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
+    """Запомнить SqlCommand с @param из .mrt — клиент часто присылает уже без @ и parameters={}."""
+    global SOURCE_SQL_TEMPLATES
+    try:
+        if report is None:
+            report = load_mrt(MRT_PATH)
+    except Exception as exc:
+        print(f"[viewer] sql templates load: {exc}", flush=True)
+        return SOURCE_SQL_TEMPLATES
+    dictionary = report.get("Dictionary") if isinstance(report, dict) else {}
+    templates: dict[str, str] = {}
+    for source in numbered((dictionary or {}).get("DataSources")):
+        if not isinstance(source, dict):
+            continue
+        name = (source.get("Name") or "").strip()
+        sql = (
+            source.get("SqlCommand")
+            or source.get("Query")
+            or source.get("SqlQuery")
+            or ""
+        )
+        sql = str(sql).strip()
+        if name and sql and _sql_at_names(sql):
+            templates[name] = sql
+    SOURCE_SQL_TEMPLATES = templates
+    print(
+        f"[viewer] sql templates: {len(templates)} sources with @params "
+        f"{list(templates)[:12]}",
+        flush=True,
+    )
+    return templates
+
+
+def _normalize_panel_payload(raw: object) -> dict[str, object]:
+    """paramsVariables / onInteraction → плоский dict имя→значение."""
+    out: dict[str, object] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, item in raw.items():
+        if key in ("event", "action", "sender"):
+            continue
+        if isinstance(item, dict):
+            if item.get("isCategory") is True:
+                continue
+            name = item.get("name") or item.get("Name") or key
+            if "value" in item:
+                value = item.get("value")
+            elif "Value" in item:
+                value = item.get("Value")
+            else:
+                value = item.get("key", item.get("Key"))
+            if name:
+                out[str(name)] = value
+        else:
+            out[str(key)] = item
+    return out
+
+
+def _inject_variables_into_sql_params(
+    args: StiDataEventArgs, query: str
+) -> tuple[str, list[str], bool]:
+    """Вернуть (query, injected_names, restored_template).
+
+    Клиент часто шлёт parameters={} и SQL уже без @param (пустые литералы).
+    Тогда берём шаблон из .mrt и заполняем @param из панели.
+    """
     injected: list[str] = []
-    if not LAST_VARIABLES:
-        return injected
+    restored = False
+    values = _merged_panel_values()
+    template = _lookup_sql_template(args.dataSource)
+    at_in_query = _sql_at_names(query)
+    at_in_template = _sql_at_names(template) if template else set()
+
+    # Restore: query без @ / parameters={} → шаблон из .mrt с @param
+    if template and at_in_template:
+        params_empty = not args.parameters
+        values_lower = {k.lower(): v for k, v in values.items()}
+        has_values_for_template = any(
+            not _is_empty(values_lower.get(n.lower())) for n in at_in_template
+        )
+        if (not at_in_query and at_in_template) or (
+            params_empty and has_values_for_template
+        ):
+            if query.strip() != template.strip():
+                print(
+                    f"[viewer] restore SQL template for {args.dataSource!r} "
+                    f"(@params={sorted(at_in_template)})",
+                    flush=True,
+                )
+            query = template
+            restored = True
+            at_in_query = set(at_in_template)
+
+    if not values and not at_in_query:
+        return query, injected, restored
+
     params = args.parameters
     if params is None:
         params = {}
         args.parameters = params
-    at_lower = {n.lower(): n for n in _sql_at_names(query)}
+    at_lower = {n.lower(): n for n in at_in_query}
     params_lower = {str(k).lower(): k for k in params}
-    for var_name, value in LAST_VARIABLES.items():
+
+    # Создаём/заполняем param для каждого @ в query из values
+    for at_name in list(at_in_query):
+        key_lower = at_name.lower()
+        value = None
+        for vk, vv in values.items():
+            if vk.lower() == key_lower and not _is_empty(vv):
+                value = vv
+                break
+        if value is None:
+            continue
+        param_key = params_lower.get(key_lower)
+        existing = params.get(param_key) if param_key is not None else None
+        if existing is not None and not _is_empty(existing.value) and not restored:
+            continue
+        group = _param_type_group_for_value(value, at_name)
+        if existing is None:
+            params[at_name] = StiParameter(at_name, 0, group, group, 0, value)
+            injected.append(at_name)
+        else:
+            if not existing.typeGroup:
+                existing.typeGroup = group
+            existing.value = value
+            injected.append(str(param_key))
+        print(
+            f"[viewer] inject @{injected[-1]}={value!r} into {args.dataSource!r}",
+            flush=True,
+        )
+
+    # Также values→params даже если имя только в values и в params пустое
+    for var_name, value in values.items():
         if _is_empty(value):
             continue
         key_lower = var_name.lower()
-        in_query = key_lower in at_lower
-        param_key = params_lower.get(key_lower)
-        if not in_query and param_key is None:
+        if key_lower not in at_lower and key_lower not in params_lower:
             continue
+        if key_lower in {i.lower() for i in injected}:
+            continue
+        param_key = params_lower.get(key_lower)
         existing = params.get(param_key) if param_key is not None else None
-        if existing is not None and not _is_empty(existing.value):
+        use_name = at_lower.get(key_lower, param_key or var_name)
+        if existing is not None and not _is_empty(existing.value) and not restored:
             continue
         group = _param_type_group_for_value(value, var_name)
         if existing is None:
-            use_name = at_lower.get(key_lower, var_name)
             params[use_name] = StiParameter(use_name, 0, group, group, 0, value)
             injected.append(use_name)
         else:
@@ -912,11 +1109,11 @@ def _inject_variables_into_sql_params(args: StiDataEventArgs, query: str) -> lis
             existing.value = value
             injected.append(str(param_key))
         print(
-            f"[viewer] inject @{injected[-1]}={value!r} from prepare_variables "
-            f"into {args.dataSource!r}",
+            f"[viewer] inject @{injected[-1]}={value!r} into {args.dataSource!r}",
             flush=True,
         )
-    return injected
+
+    return query, injected, restored
 
 
 def _is_file_database(ident: str) -> bool:
@@ -1329,6 +1526,14 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         cached[str(name)] = var.value
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
     LAST_VARIABLES = cached
+    # также в PANEL_VARS — чтобы beginProcessData видел значения даже без /panel-vars
+    global PANEL_VARS
+    merged_panel = dict(PANEL_VARS)
+    for key, value in cached.items():
+        if _is_empty(value) and key in merged_panel and not _is_empty(merged_panel.get(key)):
+            continue
+        merged_panel[key] = value
+    PANEL_VARS = merged_panel
     print(f"[viewer] cached variables for SQL: {cached}", flush=True)
 
 
@@ -1382,13 +1587,20 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
     query = args.queryString or ""
     qpreview = query[:180].replace("\n", " ")
-    print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
+    print(
+        f"[viewer] SQL source={src} params={len(args.parameters or {})} "
+        f"q={qpreview!r}",
+        flush=True,
+    )
 
-    injected = _inject_variables_into_sql_params(args, query)
+    query, injected, restored = _inject_variables_into_sql_params(args, query)
+    if restored or query != (args.queryString or ""):
+        args.queryString = query
 
     params = args.parameters or {}
     param_dump = {}
     had_empty = False
+    # Не смягчаем @param, если только что восстановили шаблон и подставили значения
     for name, param in params.items():
         param_dump[name] = {
             "typeGroup": param.typeGroup,
@@ -1433,6 +1645,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
+    merged = _merged_panel_values()
     _sql_log_add(
         {
             "phase": "begin",
@@ -1442,8 +1655,9 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "database": str(database),
             "pg_forced": bool(PG_CONN),
             "database_forced": db_forced,
+            "template_restored": restored,
             "injected_from_variables": injected,
-            "last_variables": {k: LAST_VARIABLES.get(k) for k in list(LAST_VARIABLES)[:40]},
+            "panel_variables": {k: merged.get(k) for k in list(merged)[:40]},
             "query": (args.queryString or "")[:2000],
             "parameters": param_dump,
             "ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -1487,10 +1701,37 @@ def serve_mrt():
     """Отдать .mrt с RequestParameters/Dialog — иначе viewer без Submit."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     patched, meta = patch_mrt_for_parameters_panel(raw)
+    try:
+        _refresh_sql_templates(json.loads(patched))
+    except Exception as exc:
+        print(f"[viewer] refresh templates: {exc}", flush=True)
+        _refresh_sql_templates()
     print(f"[viewer] serve /mrt patch={meta}", flush=True)
     resp = Response(patched, mimetype="application/json")
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.post("/panel-vars")
+def panel_vars():
+    """Клиент шлёт выбранные фильтры с панели — кладём в PANEL_VARS для SQL."""
+    global PANEL_VARS
+    payload = request.get_json(silent=True)
+    if payload is None and request.data:
+        try:
+            payload = json.loads(request.data.decode("utf-8"))
+        except Exception:
+            payload = None
+    normalized = _normalize_panel_payload(payload or {})
+    # не затираем известные значения пустыми
+    merged = dict(PANEL_VARS)
+    for key, value in normalized.items():
+        if _is_empty(value) and key in merged and not _is_empty(merged.get(key)):
+            continue
+        merged[key] = value
+    PANEL_VARS = merged
+    print(f"[viewer] /panel-vars ← {PANEL_VARS}", flush=True)
+    return jsonify({"ok": True, "count": len(PANEL_VARS), "variables": PANEL_VARS})
 
 
 @app.get("/debug")
@@ -1503,6 +1744,11 @@ def debug():
     info["database"] = probe_database()
     info["sql_log_count"] = len(SQL_LOG)
     info["sql_log"] = list(SQL_LOG)[:40]
+    info["panel_vars"] = dict(PANEL_VARS)
+    info["last_variables"] = dict(LAST_VARIABLES)
+    info["sql_templates"] = {
+        name: sql[:200] for name, sql in list(SOURCE_SQL_TEMPLATES.items())[:20]
+    }
     info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
     if FORCE_REQUEST_PARAMETERS:
         info["note_request_parameters"] = (
@@ -1577,6 +1823,7 @@ def viewer():
     sti.options.toolbar.showRefreshButton = True
     sti.javascript.appendHead(_AFTER_INIT_HEAD)
     sti.onAfterInitialize += "__stiAfterInit"
+    sti.onInteraction += "__stiOnInteraction"
     sti.onPrepareVariables += prepare_variables
     # SQL DataSources: событие и на viewer, и на report (доки Stimulsoft)
     sti.onBeginProcessData += begin_process_data
