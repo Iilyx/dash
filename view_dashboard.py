@@ -18,9 +18,9 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true
+FORCE_REQUEST_PARAMETERS=0 — не ждать Submit (сразу грузить SQL DataSources)
 FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
-FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns (иначе нет значений в списках)
+FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns
 """
 
 from __future__ import annotations
@@ -30,7 +30,10 @@ import json
 import os
 import re
 import sys
+import time
 import webbrowser
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
@@ -52,6 +55,8 @@ from extract_mrt import (
 )
 
 ROOT = Path(__file__).resolve().parent
+# Последние SQL/data-запросы к handler (видно в /debug → sql_log)
+SQL_LOG: deque[dict] = deque(maxlen=80)
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -183,8 +188,9 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# По докам 2025.4+: RequestParameters + Dialog|Panel → параметры до рендера dashboard
-FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
+# RequestParameters=true → dashboard НЕ ходит в SQL, пока не нажали Submit.
+# По умолчанию 0: сразу грузим DataSources (панель фильтров всё равно сверху).
+FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -240,7 +246,7 @@ _OPENED_REPORT_JS = f"""
 (function () {{
   var r = args.report;
   if (!r) return;
-  r.requestParameters = true;
+  r.requestParameters = {str(FORCE_REQUEST_PARAMETERS).lower()};
   try {{
     r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.{FORCE_PARAMETERS_MODE or "Panel"};
   }} catch (e) {{
@@ -818,9 +824,15 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     meta["has_request_from_user"] = mrt_has_request_from_user(report)
     changed = False
 
-    if FORCE_REQUEST_PARAMETERS and not report.get("RequestParameters"):
-        report["RequestParameters"] = True
-        changed = True
+    if FORCE_REQUEST_PARAMETERS:
+        if not report.get("RequestParameters"):
+            report["RequestParameters"] = True
+            changed = True
+    else:
+        # иначе dashboard ждёт Submit и SQL «молчит»
+        if report.get("RequestParameters") not in (False, 0, "false", "False"):
+            report["RequestParameters"] = False
+            changed = True
     meta["request_parameters"] = bool(report.get("RequestParameters"))
 
     if FORCE_PARAMETERS_MODE:
@@ -992,11 +1004,22 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
         print(f"[viewer]   var {name}: empty → {var.value!r}", flush=True)
 
 
+def _sql_log_add(entry: dict) -> None:
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **entry,
+    }
+    SQL_LOG.appendleft(entry)
+    print(f"[viewer][sql] {entry}", flush=True)
+
+
 def begin_process_data(args: StiDataEventArgs) -> None:
     """Подмена connection string для ВСЕХ SQL DataSources из .mrt; пустые params → не ''."""
+    t0 = time.perf_counter()
     src = args.dataSource or "?"
     connection = args.connection or "?"
     command = getattr(args.command, "value", args.command)
+    database = getattr(args.database, "value", args.database)
     # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
     if PG_CONN:
         was = args.connectionString
@@ -1005,7 +1028,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             f"[viewer] DB force connection={connection!r} source={src!r} "
             f"command={command!r} was={mask_pg_conn(was or '')!r} "
             f"now={mask_pg_conn(PG_CONN)!r} "
-            f"database={getattr(args.database, 'value', args.database)!r}",
+            f"database={database!r}",
             flush=True,
         )
     else:
@@ -1020,8 +1043,14 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
 
     params = args.parameters or {}
+    param_dump = {}
     had_empty = False
     for name, param in params.items():
+        param_dump[name] = {
+            "typeGroup": param.typeGroup,
+            "typeName": param.typeName,
+            "value": param.value,
+        }
         print(
             f"[viewer]   @{name} typeGroup={param.typeGroup!r} "
             f"typeName={param.typeName!r} value={param.value!r}",
@@ -1031,7 +1060,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             continue
         had_empty = True
         kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
-        # смягчить фильтр + подставить дефолт, если @ останется до applyQueryParameters
         query = _soften_empty_param(query, name)
         if _is_number_param(param) or _type_looks_numeric(
             str(param.typeName or ""), name
@@ -1039,8 +1067,8 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             param.typeGroup = "number"
             param.value = 0
         else:
-            # строковый дефолт, не ''
             param.value = "*"
+        param_dump[name]["value_after"] = param.value
         print(
             f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
             flush=True,
@@ -1049,7 +1077,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if had_empty or "''" in (query or ""):
         before = query
         query = _soften_inlined_empty_literals(query)
-        # residual '' → NULL (PG integer "")
         if "''" in query:
             query = query.replace("''", "NULL")
         if query != before:
@@ -1061,6 +1088,51 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             f"[viewer] SQL after soften q={(query[:180]).replace(chr(10), ' ')!r}",
             flush=True,
         )
+
+    _sql_log_add(
+        {
+            "phase": "begin",
+            "connection": connection,
+            "source": src,
+            "command": command,
+            "database": str(database),
+            "pg_forced": bool(PG_CONN),
+            "query": (args.queryString or "")[:2000],
+            "parameters": param_dump,
+            "ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
+    )
+
+
+def end_process_data(args: StiDataEventArgs) -> None:
+    """Лог результата SQL — чтобы было видно, ходили ли в базу."""
+    src = args.dataSource or "?"
+    connection = args.connection or "?"
+    command = getattr(args.command, "value", args.command)
+    result = args.result
+    success = getattr(result, "success", None) if result is not None else None
+    notice = getattr(result, "notice", None) if result is not None else None
+    rows = None
+    try:
+        data = getattr(result, "data", None) if result is not None else None
+        if data is not None:
+            rows = len(data)
+    except Exception:
+        rows = None
+    entry = {
+        "phase": "end",
+        "connection": connection,
+        "source": src,
+        "command": command,
+        "success": success,
+        "notice": notice,
+        "rows": rows,
+    }
+    _sql_log_add(entry)
+    print(
+        f"[viewer] SQL done source={src!r} success={success} rows={rows} notice={notice!r}",
+        flush=True,
+    )
 
 
 @app.get("/mrt")
@@ -1082,6 +1154,19 @@ def debug():
     _, meta = patch_mrt_for_parameters_panel(raw)
     info["mrt_patch"] = meta
     info["database"] = probe_database()
+    info["sql_log_count"] = len(SQL_LOG)
+    info["sql_log"] = list(SQL_LOG)[:40]
+    info["force_request_parameters"] = FORCE_REQUEST_PARAMETERS
+    if FORCE_REQUEST_PARAMETERS:
+        info["note_request_parameters"] = (
+            "RequestParameters=true: dashboard SQL ждёт кнопку Submit на панели. "
+            "Поставь FORCE_REQUEST_PARAMETERS=0 чтобы грузить DataSources сразу."
+        )
+    elif not SQL_LOG:
+        info["note_sql_log_empty"] = (
+            "sql_log пуст — handler ещё не получил ExecuteQuery. "
+            "Открой / (не только /debug), проверь database.ok и консоль [viewer][sql]."
+        )
     if info.get("filter_elements_count") == 0 and (
         info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
     ):
@@ -1129,6 +1214,7 @@ def viewer():
     sti.onPrepareVariables += prepare_variables
     # SQL DataSources: событие и на viewer, и на report (доки Stimulsoft)
     sti.onBeginProcessData += begin_process_data
+    sti.onEndProcessData += end_process_data
     # после открытия .mrt — Panel + RequestParameters (полоса Submit)
     sti.onOpenedReport += _OPENED_REPORT_JS
 
@@ -1138,6 +1224,7 @@ def viewer():
     report = StiReport()
     report.onBeforeRender += _OPENED_REPORT_JS
     report.onBeginProcessData += begin_process_data
+    report.onEndProcessData += end_process_data
     report.onPrepareVariables += prepare_variables
     report.loadFile(url_for("serve_mrt", _external=True))
     sti.report = report
