@@ -548,6 +548,10 @@ def mrt_looks_anonymized(path: Path) -> bool:
 
 def variable_is_parameters_panel_candidate(variable: dict) -> bool:
     """Кандидат на полосу фильтров: RFU / ShowOnParametersPanel / ключ после обезлички."""
+    # без Name Stimulsoft не покажет поле — не форсим пустые
+    name = variable.get("Name")
+    if name is None or (isinstance(name, str) and name.strip() == ""):
+        return False
     if flag_false(variable.get("RequestFromUser")) and flag_false(
         variable.get("ShowOnParametersPanel")
     ):
@@ -653,9 +657,10 @@ def variable_has_dialog_list(variable: dict) -> bool:
     if not isinstance(dialog, dict) or not dialog:
         return False
     keys, _values = _dialog_keys_values(dialog)
-    if any(k not in (None, "") for k in keys):
+    # Keys есть даже если значения "" (обезличка) — это всё ещё list-dialog
+    if keys:
         return True
-    if dialog.get("KeysColumn") or dialog.get("ValuesColumn"):
+    if "KeysColumn" in dialog or "ValuesColumn" in dialog:
         return True
     init = str(dialog.get("ItemsInitializationType") or "").lower()
     return init in {"columns", "items", "1"}
