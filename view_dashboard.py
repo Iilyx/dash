@@ -59,8 +59,9 @@ ROOT = Path(__file__).resolve().parent
 SQL_LOG: deque[dict] = deque(maxlen=80)
 # Выбранные RFU с панели (onPrepareVariables) — для лога вместе с SQL
 LAST_VARIABLES: dict[str, object] = {}
-# SqlCommand из .mrt с @param (клиент часто шлёт queryString уже заполненным)
+# SqlCommand из .mrt (ключ — Name и Alias источника)
 SOURCE_SQL_TEMPLATES: dict[str, str] = {}
+SOURCE_SQL_META: dict[str, dict] = {}
 
 _NUM_TYPE_HINTS = (
     "number",
@@ -1052,16 +1053,21 @@ def _format_sql_log_block(entry: dict) -> str:
                 lines.append(f"  @{key} = {val!r}")
             else:
                 lines.append(f"  @{key} = {meta!r}")
-        if entry.get("client_already_filled"):
-            lines.append(
-                "note: клиент прислал SQL уже без @param (значения вшиты) — "
-                "шаблон берём из .mrt"
-            )
-        lines.append("query_template (.mrt, с @param):")
-        lines.append(entry.get("query_template") or "(нет SqlCommand в .mrt)")
-        lines.append("query_from_client (что пришло в handler):")
-        lines.append(entry.get("query_from_client") or entry.get("query") or "")
-        lines.append("query_filled (preview после подстановки):")
+        note = entry.get("template_note")
+        if note:
+            lines.append(f"note: {note}")
+        lines.append("--- A) SQL из .mrt (шаблон словаря, как в файле) ---")
+        lines.append(entry.get("query_template") or "(нет SqlCommand для этого source в .mrt)")
+        lines.append(
+            f"   has_@param={entry.get('template_has_at')} "
+            f"at_names={entry.get('template_at_names')}"
+        )
+        lines.append("--- B) SQL от клиента (часто УЖЕ с подставленными значениями) ---")
+        lines.append(entry.get("query_from_client") or "")
+        lines.append(
+            f"   client_already_filled={entry.get('client_already_filled')}"
+        )
+        lines.append("--- C) preview filled (если в A были @param) ---")
         lines.append(entry.get("query_filled") or "")
     elif phase == "result":
         lines.append(
@@ -1107,8 +1113,8 @@ def _sql_at_names(query: str) -> set[str]:
 
 
 def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
-    """Запомнить SqlCommand с @param из .mrt — для лога (клиент шлёт уже заполненный SQL)."""
-    global SOURCE_SQL_TEMPLATES
+    """Запомнить SqlCommand из .mrt по Name и Alias (клиент шлёт query уже заполненным)."""
+    global SOURCE_SQL_TEMPLATES, SOURCE_SQL_META
     try:
         if report is None:
             report = load_mrt(MRT_PATH)
@@ -1117,20 +1123,43 @@ def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
         return SOURCE_SQL_TEMPLATES
     dictionary = report.get("Dictionary") if isinstance(report, dict) else {}
     templates: dict[str, str] = {}
+    meta: dict[str, dict] = {}
     for source in numbered((dictionary or {}).get("DataSources")):
         if not isinstance(source, dict):
             continue
         name = (source.get("Name") or "").strip()
+        alias = (source.get("Alias") or "").strip()
         sql = str(
             source.get("SqlCommand")
             or source.get("Query")
             or source.get("SqlQuery")
             or ""
         ).strip()
-        if name and sql:
-            templates[name] = sql
+        if not sql:
+            continue
+        param_names = []
+        for p in numbered(source.get("Parameters")):
+            if isinstance(p, dict) and p.get("Name"):
+                param_names.append(str(p.get("Name")))
+        info = {
+            "name": name or None,
+            "alias": alias or None,
+            "sql": sql,
+            "at_names": sorted(_sql_at_names(sql)),
+            "parameter_names": param_names,
+        }
+        for key in {name, alias, name.lower() if name else "", alias.lower() if alias else ""}:
+            if not key:
+                continue
+            templates[key] = sql
+            meta[key] = info
     SOURCE_SQL_TEMPLATES = templates
-    print(f"[viewer] sql templates loaded: {len(templates)}", flush=True)
+    SOURCE_SQL_META = meta
+    print(
+        f"[viewer] sql templates loaded: {len({t for t in templates})} keys, "
+        f"unique sql={len({id(v) for v in templates.values()})}",
+        flush=True,
+    )
     return templates
 
 
@@ -1142,10 +1171,28 @@ def _lookup_sql_template(data_source: str | None) -> str:
     if data_source in SOURCE_SQL_TEMPLATES:
         return SOURCE_SQL_TEMPLATES[data_source]
     lower = data_source.lower()
+    if lower in SOURCE_SQL_TEMPLATES:
+        return SOURCE_SQL_TEMPLATES[lower]
     for name, sql in SOURCE_SQL_TEMPLATES.items():
         if name.lower() == lower:
             return sql
     return ""
+
+
+def _lookup_sql_meta(data_source: str | None) -> dict:
+    if not data_source:
+        return {}
+    if not SOURCE_SQL_META:
+        _refresh_sql_templates()
+    if data_source in SOURCE_SQL_META:
+        return SOURCE_SQL_META[data_source]
+    lower = data_source.lower()
+    if lower in SOURCE_SQL_META:
+        return SOURCE_SQL_META[lower]
+    for name, info in SOURCE_SQL_META.items():
+        if name.lower() == lower:
+            return info
+    return {}
 
 
 def _filled_sql_preview(query: str, params: dict) -> str:
@@ -1189,11 +1236,31 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     # то, что прислал клиент (часто уже без @param — значения вшиты)
     query_from_client = args.queryString or ""
     query = query_from_client
-    # настоящий шаблон с @param — из .mrt
-    query_template = _lookup_sql_template(src) or ""
+    # шаблон ТОЛЬКО из .mrt (никогда не подменяем клиентским SQL)
+    mrt_meta = _lookup_sql_meta(src)
+    query_template = (mrt_meta.get("sql") if mrt_meta else None) or _lookup_sql_template(
+        src
+    ) or ""
+    template_at = sorted(_sql_at_names(query_template)) if query_template else []
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
+    if not query_template:
+        template_note = (
+            f"для source={src!r} в .mrt не найден SqlCommand "
+            f"(ключи: Name/Alias). Смотри блок B — SQL от клиента."
+        )
+    elif not template_at:
+        template_note = (
+            "в .mrt SqlCommand нет @param — либо фильтры через Parameters/выражения, "
+            "либо в файле уже литералы. Подстановку значений смотри в блоке B (клиент)."
+        )
+    elif client_already_filled:
+        template_note = (
+            "нормально: в A шаблон с @param из .mrt, в B клиент уже подставил значения."
+        )
+    else:
+        template_note = "и клиент, и .mrt содержат @param."
 
     params = args.parameters or {}
     param_dump: dict[str, object] = {}
@@ -1248,19 +1315,17 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         flush=True,
     )
 
-    # 2/3 — шаблон из .mrt + что прислал клиент + заполненный preview
-    # filled: если есть шаблон с @ — подставляем в него; иначе то, что уйдёт в PG
-    fill_base = query_template if _sql_at_names(query_template) else query
-    filled = _filled_sql_preview(fill_base, params)
-    if fill_base == query and not _sql_at_names(fill_base):
-        # клиент уже всё подставил — filled = query после soften
-        filled = query
+    # 2/3 — A .mrt / B клиент / C filled preview
+    if template_at:
+        filled = _filled_sql_preview(query_template, params)
+    else:
+        filled = query  # нечего подставлять в шаблон — уйдёт то, что после soften
     print(
-        f"[viewer][2/3 SQL] source={src!r} connection={connection!r} "
-        f"client_already_filled={client_already_filled}\n"
-        f"  template(.mrt): {(query_template or '(нет в .mrt)')[:500].replace(chr(10), ' ')}\n"
-        f"  from_client:    {query_from_client[:500].replace(chr(10), ' ')}\n"
-        f"  filled:         {filled[:800].replace(chr(10), ' ')}",
+        f"[viewer][2/3 SQL] source={src!r} connection={connection!r}\n"
+        f"  note: {template_note}\n"
+        f"  A .mrt:      {(query_template or '(нет)')[:400].replace(chr(10), ' ')}\n"
+        f"  B client:    {query_from_client[:400].replace(chr(10), ' ')}\n"
+        f"  C filled:    {filled[:400].replace(chr(10), ' ')}",
         flush=True,
     )
 
@@ -1274,6 +1339,11 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "database": str(database),
             "pg_forced": bool(PG_CONN),
             "client_already_filled": client_already_filled,
+            "template_has_at": bool(template_at),
+            "template_at_names": template_at,
+            "template_note": template_note,
+            "mrt_source_name": (mrt_meta or {}).get("name"),
+            "mrt_parameter_names": (mrt_meta or {}).get("parameter_names") or [],
             "panel_selected": dict(LAST_VARIABLES),
             "sql_parameters": param_dump,
             "query_template": (query_template or "")[:4000],
