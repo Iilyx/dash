@@ -13,13 +13,13 @@
 
 Canvas ComboBox/TreeView — это ДРУГИЕ фильтры: применяются сразу, БЕЗ Submit.
 
-Запуск:
-  .venv/bin/python view_dashboard.py /path/to/full.mrt
-  .venv/bin/python view_dashboard.py PatientHealthKPI.mrt   # demo с RFU+Submit
+Запуск (путь к .mrt — из .env MRT_PATH):
+  # в .env:  MRT_PATH=/path/to/full.mrt
+  .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=1 (default) — дописать RequestParameters в отдаваемый .mrt
-FORCE_PARAMETERS_DIALOG=1 (default) — ParametersDisplayMode=Dialog
+FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true в отдаваемом .mrt
+FORCE_PARAMETERS_PANEL=1 — ParametersDisplayMode=Panel (полоса + Submit)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
-from extract_mrt import catalog_from_report, flag_true, load_mrt, numbered
+from extract_mrt import catalog_from_report, flag_false, flag_true, load_mrt, numbered
 
 ROOT = Path(__file__).resolve().parent
 
@@ -113,16 +113,20 @@ def stimulsoft_pg_connection_string(url: str) -> str:
 
 
 def resolve_mrt_path() -> Path:
+    """Сначала MRT_PATH из .env, опционально переопределение аргументом CLI."""
+    env_path = os.environ.get("MRT_PATH", "").strip()
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         return path_of(sys.argv[1])
-    return path_of(os.environ.get("MRT_PATH", "test.mrt"))
+    if env_path:
+        return path_of(env_path)
+    return path_of("PatientHealthKPI.mrt")
 
 
 load_env()
 
 MRT_PATH = resolve_mrt_path()
 if not MRT_PATH.is_file():
-    raise SystemExit(f"Нет .mrt: {MRT_PATH} (MRT_PATH в .env или путь аргументом)")
+    raise SystemExit(f"Нет .mrt: {MRT_PATH} — задай MRT_PATH в .env")
 
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
@@ -130,29 +134,42 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# По докам Stimulsoft 2025.4: RequestParameters + Dialog → панель/окно и Submit
+# По докам: RequestParameters + Panel → полоса параметров и кнопка Submit
 FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
     "1",
     "true",
     "yes",
 }
-FORCE_PARAMETERS_DIALOG = os.environ.get("FORCE_PARAMETERS_DIALOG", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+FORCE_PARAMETERS_PANEL = os.environ.get(
+    "FORCE_PARAMETERS_PANEL",
+    os.environ.get("FORCE_PARAMETERS_DIALOG", "1"),  # старое имя
+).lower() in {"1", "true", "yes"}
 
-# JS: до рендера включить RequestParameters / Dialog (клиентский движок)
-_BEFORE_RENDER_JS = """
+# JS после открытия отчёта: Panel + RequestParameters + ShowOnParametersPanel
+_OPENED_REPORT_JS = """
 (function () {
   var r = args.report;
   if (!r) return;
   r.requestParameters = true;
   try {
-    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.Dialog;
+    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.Panel;
   } catch (e) {
-    try { r.parametersDisplayMode = 0; } catch (e2) {}
+    try { r.parametersDisplayMode = 1; } catch (e2) {}
   }
+  try {
+    var dict = r.dictionary;
+    var vars = dict && dict.variables;
+    if (!vars) return;
+    var count = vars.count || 0;
+    for (var i = 0; i < count; i++) {
+      var v = vars.getByIndex ? vars.getByIndex(i) : null;
+      if (!v && vars.list) v = vars.list[i];
+      if (!v) continue;
+      if (v.requestFromUser) {
+        v.showOnParametersPanel = true;
+      }
+    }
+  } catch (e3) {}
 })();
 """.strip()
 
@@ -268,7 +285,7 @@ def dashboard_debug(path: Path) -> dict:
             "Canvas ComboBox/TreeView ← filter_elements_on_canvas (без Submit)."
         ),
         "force_request_parameters": FORCE_REQUEST_PARAMETERS,
-        "force_parameters_dialog": FORCE_PARAMETERS_DIALOG,
+        "force_parameters_panel": FORCE_PARAMETERS_PANEL,
     }
 
 
@@ -281,15 +298,16 @@ def mrt_has_request_from_user(report: dict) -> bool:
 
 
 def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
-    """В .mrt: RequestParameters + ParametersDisplayMode — иначе нет Submit.
+    """В .mrt: RequestParameters + Panel + ShowOnParametersPanel для RFU.
 
-    Docs: Request Parameters for Dashboards (2025.4), Parameters Display Mode = Dialog.
+    Docs: Request Parameters for Dashboards; Variables → Submit на options bar.
     """
     meta = {
         "patched": False,
         "request_parameters": False,
         "parameters_display_mode": None,
         "has_request_from_user": False,
+        "show_on_panel_forced": 0,
     }
     try:
         report = json.loads(raw)
@@ -307,14 +325,35 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
         changed = True
     meta["request_parameters"] = bool(report.get("RequestParameters"))
 
-    if FORCE_PARAMETERS_DIALOG:
+    if FORCE_PARAMETERS_PANEL:
         mode = report.get("ParametersDisplayMode")
-        if mode not in ("Dialog", 0, "0"):
-            report["ParametersDisplayMode"] = "Dialog"
+        # Panel = классическая полоса с Submit (не Dialog-окно)
+        if mode not in ("Panel", 1, "1"):
+            report["ParametersDisplayMode"] = "Panel"
             changed = True
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
     else:
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
+
+    # RFU-переменные обязаны быть на панели параметров
+    dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+    forced = 0
+    for variable in numbered(dictionary.get("Variables")):
+        if not isinstance(variable, dict):
+            continue
+        if not flag_true(variable.get("RequestFromUser")):
+            continue
+        if variable.get("ShowOnParametersPanel") is False or flag_false(
+            variable.get("ShowOnParametersPanel")
+        ):
+            variable["ShowOnParametersPanel"] = True
+            forced += 1
+            changed = True
+        elif "ShowOnParametersPanel" not in variable:
+            variable["ShowOnParametersPanel"] = True
+            forced += 1
+            changed = True
+    meta["show_on_panel_forced"] = forced
 
     meta["patched"] = changed
     if not changed:
@@ -385,6 +424,12 @@ def debug():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     _, meta = patch_mrt_for_parameters_panel(raw)
     info["mrt_patch"] = meta
+    if info.get("filter_elements_count") == 0 and info.get("request_from_user_count"):
+        info["note"] = (
+            "Canvas-фильтров нет (filter_elements_count=0). "
+            "Ожидай полосу Parameters + Submit сверху (RequestFromUser). "
+            f"RFU: {[v.get('name') for v in info.get('request_from_user_variables') or []]}"
+        )
     if not meta.get("has_request_from_user") and not info.get("request_from_user_count"):
         info["why_no_submit_panel"] = (
             "В .mrt нет variables с RequestFromUser=true. "
@@ -404,13 +449,14 @@ def viewer():
     sti.options.toolbar.showParametersButton = True
     sti.onPrepareVariables += prepare_variables
     sti.onBeginProcessData += begin_process_data
+    # после открытия .mrt — Panel + RequestParameters (полоса Submit)
+    sti.onOpenedReport += _OPENED_REPORT_JS
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
 
     report = StiReport()
-    # Клиент: после load включить RequestParameters + Dialog (Submit)
-    report.onBeforeRender += _BEFORE_RENDER_JS
+    report.onBeforeRender += _OPENED_REPORT_JS
     report.loadFile(url_for("serve_mrt", _external=True))
     sti.report = report
     return sti.getFrameworkResponse()
