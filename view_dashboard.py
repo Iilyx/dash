@@ -8,8 +8,9 @@
 Чтобы переменная была на панели фильтров + Submit:
   1) RequestFromUser = true
   2) Report.RequestParameters = true
-  3) ParametersDisplayMode = Dialog|Panel  (Dialog — модалка до рендера, надёжнее)
+  3) ParametersDisplayMode = Panel|Dialog  (Panel — полоса сверху; Dialog — окно)
   В JS 2026.x ShowOnParametersPanel = алиас RequestFromUser (отдельного флага нет).
+  DialogInfo Columns: список значений грузится SQL (пустые int смягчаем, не режем Columns).
 
 Canvas ComboBox/TreeView — другие фильтры (без Submit).
 
@@ -18,8 +19,8 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   # http://127.0.0.1:8040/  и  /debug
 
 FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true
-FORCE_PARAMETERS_MODE=Dialog|Panel — по умолчанию Dialog
-FORCE_SHOW_ON_PARAMETERS_PANEL=1 — RFU → ShowOnParametersPanel=true
+FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
+FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns (иначе нет значений в списках)
 """
 
 from __future__ import annotations
@@ -150,18 +151,18 @@ FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower
     "true",
     "yes",
 }
-# Dialog заметнее Panel: модалка с Submit до данных (меньше шансов «съесть» SQL-ошибкой)
+# Panel = полоса параметров сверху; Dialog = модальное окно
 _explicit = os.environ.get("FORCE_PARAMETERS_MODE", "").strip()
 if _explicit.lower() in {"0", "false", "no", "off"}:
     FORCE_PARAMETERS_MODE = None
-elif _explicit.lower() == "panel":
-    FORCE_PARAMETERS_MODE = "Panel"
 elif _explicit.lower() == "dialog":
     FORCE_PARAMETERS_MODE = "Dialog"
+elif _explicit.lower() == "panel":
+    FORCE_PARAMETERS_MODE = "Panel"
 elif _explicit:
     FORCE_PARAMETERS_MODE = _explicit
 else:
-    # legacy FORCE_PARAMETERS_PANEL/DIALOG=1 → включить Dialog (не Panel!)
+    # legacy FORCE_PARAMETERS_PANEL=1 / без MODE → Panel сверху
     _legacy = (
         os.environ.get("FORCE_PARAMETERS_PANEL")
         or os.environ.get("FORCE_PARAMETERS_DIALOG")
@@ -169,18 +170,18 @@ else:
     ).strip()
     if _legacy.lower() in {"0", "false", "no", "off"}:
         FORCE_PARAMETERS_MODE = None
-    elif _legacy.lower() == "panel":
-        FORCE_PARAMETERS_MODE = "Panel"
-    else:
+    elif _legacy.lower() == "dialog":
         FORCE_PARAMETERS_MODE = "Dialog"
+    else:
+        FORCE_PARAMETERS_MODE = "Panel"
 FORCE_PARAMETERS_PANEL = FORCE_PARAMETERS_MODE is not None  # совместимость /debug
 FORCE_SHOW_ON_PARAMETERS_PANEL = os.environ.get(
     "FORCE_SHOW_ON_PARAMETERS_PANEL", "1"
 ).lower() in {"1", "true", "yes"}
-# До панели Stimulsoft для RFU+Columns зовёт connectToDataAsync → SQL с пустыми int →
-# «invalid input syntax for type integer ""» и панель не открывается. Items без SQL.
+# Columns→Items режет списки значений. По умолчанию OFF: DialogInfo грузит Keys/Values SQL.
+# Пустые int смягчаем в begin_process_data + Value=0 у RFU.
 FORCE_SKIP_COLUMNS_PRELOAD = os.environ.get(
-    "FORCE_SKIP_COLUMNS_PRELOAD", "1"
+    "FORCE_SKIP_COLUMNS_PRELOAD", "0"
 ).lower() in {"1", "true", "yes"}
 
 # StiDashboardViewerSettings (биты):
@@ -201,7 +202,7 @@ _OPENED_REPORT_JS = f"""
   if (!r) return;
   r.requestParameters = true;
   try {{
-    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.{FORCE_PARAMETERS_MODE or "Dialog"};
+    r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.{FORCE_PARAMETERS_MODE or "Panel"};
   }} catch (e) {{
     try {{ r.parametersDisplayMode = {"0" if FORCE_PARAMETERS_MODE == "Dialog" else "1"}; }} catch (e2) {{}}
   }}
@@ -280,7 +281,20 @@ window.__stiForceParametersPanel = function () {
     console.log('[viewer] waiting paramsVariables…');
     return false;
   }
-  // Dialog: модалка parametersForm; Panel: полоса parametersPanel
+  // Сначала полоса сверху (Panel); Dialog-окно — только если полосы нет
+  if (v.controls.parametersPanel) {
+    try {
+      v.waitingToShowParameters = true;
+      v.controls.parametersPanel.changeVisibleState(true);
+      if (v.controls.buttons && v.controls.buttons.Parameters) {
+        v.controls.buttons.Parameters.setSelected(true);
+      }
+      console.log('[viewer] parameters Panel opened, params=', count, v.options.paramsVariables);
+      return true;
+    } catch (e) {
+      console.warn('[viewer] open parameters panel', e);
+    }
+  }
   try {
     var form = v.controls.forms && v.controls.forms.parametersForm;
     if (form && typeof form.changeVisibleState === 'function') {
@@ -289,19 +303,7 @@ window.__stiForceParametersPanel = function () {
       return true;
     }
   } catch (e0) {}
-  if (!v.controls.parametersPanel) return false;
-  try {
-    v.waitingToShowParameters = true;
-    v.controls.parametersPanel.changeVisibleState(true);
-    if (v.controls.buttons && v.controls.buttons.Parameters) {
-      v.controls.buttons.Parameters.setSelected(true);
-    }
-    console.log('[viewer] parameters Panel opened, params=', count, v.options.paramsVariables);
-    return true;
-  } catch (e) {
-    console.warn('[viewer] open parameters panel', e);
-    return false;
-  }
+  return false;
 };
 window.__stiKeepParametersPanel = function () {
   var v = window.__stiFindViewer();
@@ -603,9 +605,9 @@ def dashboard_debug(path: Path) -> dict:
         "force_skip_columns_preload": FORCE_SKIP_COLUMNS_PRELOAD,
         "stimulsoft_versions": package_versions(),
         "note_show_on_parameters_panel": (
-            "В Stimulsoft JS 2026.x ShowOnParametersPanel — алиас RequestFromUser. "
-            "Панель = RFU + RequestParameters + Dialog. "
-            "RFU+Columns без Keys раньше дергали SQL до панели → integer \"\"."
+            "Панель сверху = ParametersDisplayMode=Panel + RFU. "
+            "DialogInfo Columns тянет списки SQL; пустые int смягчаем. "
+            "FORCE_SKIP_COLUMNS_PRELOAD=1 убирает SQL-preload, но тогда списки пустые."
         ),
     }
 
