@@ -46,20 +46,6 @@ LAST_VARIABLES: dict[str, object] = {}
 # SqlCommand из .mrt (с @param). Клиент часто шлёт queryString уже без @.
 SOURCE_SQL_TEMPLATES: dict[str, str] = {}
 
-_NUM_TYPE_HINTS = (
-    "number",
-    "int",
-    "long",
-    "short",
-    "byte",
-    "decimal",
-    "double",
-    "float",
-    "single",
-    "money",
-    "numeric",
-)
-
 FILTER_ELEMENT_TYPES = {
     "StiComboBoxElement",
     "StiListBoxElement",
@@ -437,101 +423,6 @@ def _is_empty(value: object) -> bool:
     if isinstance(value, (list, tuple, dict)) and len(value) == 0:
         return True
     return False
-
-
-def _is_number_param(param) -> bool:
-    group = str(getattr(param, "typeGroup", "") or "").lower()
-    name = str(getattr(param, "typeName", "") or "").lower()
-    if group == "number":
-        return True
-    return any(h in group or h in name for h in _NUM_TYPE_HINTS)
-
-
-def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
-    if not query:
-        return query
-    pat = re.escape(name)
-    # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[@:]{pat}\s*::\s*\w+",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
-
-
-def _soften_inlined_empty_literals(query: str) -> str:
-    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
-    if not query or "''" not in query:
-        return query
-    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
-        "NULL",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(
-        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
-        "TRUE",
-        query,
-        flags=re.IGNORECASE,
-    )
-    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
-    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
-    query = re.sub(r"=\s*''", " = NULL", query)
-    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
-    return query
 
 
 def mrt_looks_anonymized(path: Path) -> bool:
@@ -1241,7 +1132,7 @@ def _should_log_sql_command(args: StiDataEventArgs) -> bool:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string; пустые params → no-op; лог JSON: шаблон .mrt + SQL."""
+    """Connection string + только подстановка @param. SQL-текст не переписываем."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1252,40 +1143,20 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
-    # клиент часто шлёт SQL уже без @param + с \" / \\n
+    # только снять JSON/JS-экранирование \" \\n — без TRUE/NULL-rewrite условий
     raw_from_client = args.queryString or ""
-    query_from_client = _unescape_sql(raw_from_client)
-    query = query_from_client
+    query = _unescape_sql(raw_from_client)
     query_template = _unescape_sql(_lookup_sql_template(src) or "")
-    client_already_filled = bool(query_from_client) and not _sql_at_names(
-        query_from_client
-    )
-
     params = args.parameters or {}
-    had_empty = False
-    for name, param in params.items():
-        if not _is_empty(param.value):
-            continue
-        had_empty = True
-        query = _soften_empty_param(query, name)
-        if _is_number_param(param) or _type_looks_numeric(
-            str(param.typeName or ""), name
-        ):
-            param.typeGroup = "number"
-            param.value = 0
-        else:
-            param.value = "*"
+    client_already_filled = bool(query) and not _sql_at_names(query)
 
-    if had_empty or "''" in (query or ""):
-        query = _soften_inlined_empty_literals(query)
-        if "''" in query:
-            query = query.replace("''", "NULL")
-
-    # сами подставляем @param (PG), Stimulsoft больше не трогает parameters
+    # только @Name → значение; пустой param → NULL в месте @param, остальной SQL не трогаем
     if params and _sql_at_names(query):
         query = _substitute_sql(query, params)
-    query = _unescape_sql(query)
+        query = _unescape_sql(query)
+
     args.queryString = query
+    # чтобы Stimulsoft не применил parameters ещё раз с JS-escape
     args.parameters = {}
 
     if not _should_log_sql_command(args):
@@ -1302,7 +1173,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "params": dict(LAST_VARIABLES),
             "sql_params": _params_dict(params),
             "sql_template": query_template,
-            "sql_from_client": query_from_client,
+            "sql_from_client": _unescape_sql(raw_from_client),
             "sql_sent": query,
             "sql_substituted": query,
         }
