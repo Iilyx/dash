@@ -145,9 +145,11 @@ FORCE_PARAMETERS_PANEL = os.environ.get(
     os.environ.get("FORCE_PARAMETERS_DIALOG", "1"),  # старое имя
 ).lower() in {"1", "true", "yes"}
 
-# StiDashboardViewerSettings.All — иначе toolbar/Parameters скрыты шаблоном
-# ShowToolBar=1 … ShowParametersButton=512 → All=1023
-DASHBOARD_VIEWER_SETTINGS_ALL = 1023
+# StiDashboardViewerSettings (биты):
+# ShowToolBar=1 Refresh=2 Open=4 FullScreen=8 Menu=16 Edit=32
+# Snapshots=64 Exports=128 ResetAllFilters=256 Parameters=512  All=1023
+# ResetAllFilters НЕ включаем: без ComboBox/TreeView на холсте это пустая кнопка.
+DASHBOARD_VIEWER_SETTINGS = 1 | 2 | 4 | 8 | 16 | 128 | 512  # = 671
 FORCE_DASHBOARD_TOOLBAR = os.environ.get("FORCE_DASHBOARD_TOOLBAR", "1").lower() in {
     "1",
     "true",
@@ -165,16 +167,10 @@ _OPENED_REPORT_JS = """
   } catch (e) {
     try { r.parametersDisplayMode = 1; } catch (e2) {}
   }
-  // Toolbar + Parameters для dashboard (StiDashboardViewerSettings.All = 1023)
+  // Toolbar + Parameters, без ResetAllFilters (256)
   try {
-    if (Stimulsoft.Report.StiDashboardViewerSettings) {
-      r.dashboardViewerSettings = Stimulsoft.Report.StiDashboardViewerSettings.All;
-    } else {
-      r.dashboardViewerSettings = 1023;
-    }
-  } catch (e4) {
-    try { r.dashboardViewerSettings = 1023; } catch (e5) {}
-  }
+    r.dashboardViewerSettings = 671;
+  } catch (e4) {}
   try {
     var dict = r.dictionary;
     var vars = dict && dict.variables;
@@ -232,16 +228,37 @@ window.__stiForceParametersPanel = function () {
   var v = window.__stiFindViewer();
   if (!v || !v.controls) return false;
   var count = window.__stiCountParams(v);
-  if (count < 1) return false;
+  var jo = v.jsObject || v;
+  // native API — показать панель из уже собранных variables
+  if (count > 0 && typeof jo.showParametersPanel === 'function') {
+    try {
+      jo.showParametersPanel(v.options.paramsVariables, jo);
+    } catch (e0) {}
+  }
+  if (v.controls.buttons) {
+    // ResetAllFilters не нужен без canvas-фильтров
+    if (v.controls.buttons.ResetAllFilters) {
+      try { v.controls.buttons.ResetAllFilters.style.display = 'none'; } catch (e1) {}
+    }
+    if (v.controls.buttons.Parameters) {
+      try {
+        v.controls.buttons.Parameters.setEnabled(count > 0);
+        v.controls.buttons.Parameters.style.display = '';
+      } catch (e2) {}
+    }
+  }
+  if (count < 1) {
+    console.log('[viewer] waiting paramsVariables…');
+    return false;
+  }
   if (!v.controls.parametersPanel) return false;
   try {
     v.waitingToShowParameters = true;
     v.controls.parametersPanel.changeVisibleState(true);
     if (v.controls.buttons && v.controls.buttons.Parameters) {
       v.controls.buttons.Parameters.setSelected(true);
-      v.controls.buttons.Parameters.setEnabled(true);
     }
-    console.log('[viewer] parameters panel opened, params=', count);
+    console.log('[viewer] parameters panel opened, params=', count, v.options.paramsVariables);
     return true;
   } catch (e) {
     console.warn('[viewer] open parameters panel', e);
@@ -430,15 +447,15 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     else:
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
 
-    # Dashboard: без ShowToolBar/ShowParametersButton в битовой маске toolbar не виден
+    # Dashboard toolbar: Parameters да, ResetAllFilters нет (путает при 0 canvas-фильтров)
     if FORCE_DASHBOARD_TOOLBAR:
         prev = report.get("DashboardViewerSettings")
         try:
             prev_i = int(prev) if prev is not None else 0
         except (TypeError, ValueError):
             prev_i = 0
-        if prev_i != DASHBOARD_VIEWER_SETTINGS_ALL:
-            report["DashboardViewerSettings"] = DASHBOARD_VIEWER_SETTINGS_ALL
+        if prev_i != DASHBOARD_VIEWER_SETTINGS:
+            report["DashboardViewerSettings"] = DASHBOARD_VIEWER_SETTINGS
             changed = True
         meta["dashboard_viewer_settings"] = report.get("DashboardViewerSettings")
         meta["dashboard_viewer_settings_was"] = prev
