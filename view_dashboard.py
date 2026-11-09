@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """Отдельный viewer Stimulsoft Dashboards.PYTHON для .mrt.
 
-Документация Stimulsoft (панель + Submit):
-  https://stimulsoft.github.io/Stimulsoft.Reports.Dashboards.User.Manual/Dashboards/Data_Filtering/Variables
+Документация Stimulsoft (панель параметров = «панель фильтров»):
+  https://www.stimulsoft.com/en/documentation/online/user-manual/data_data_dictionary_variables.htm
   https://stimulsoft.github.io/Stimulsoft.Reports.Dashboards.Programming.Manual/Reports_and_Dashboards_for_Python/Web_Viewer/Work_with_Parameters
 
-Чтобы была панель фильтров и кнопка Submit/Apply:
-  1) в .mrt у variable: RequestFromUser = true (+ DialogInfo / Items)
-  2) filters элементов ссылаются на {Variable}
-  3) Report.RequestParameters = true  → не рендерить, пока не нажали Submit
-  4) ParametersDisplayMode = Dialog|Panel (Dialog = окно с Submit)
+Чтобы переменная была на панели фильтров + Submit:
+  1) RequestFromUser = true
+  2) ShowOnParametersPanel = true   ← «Show on Parameters Panel» в редакторе
+  3) Report.RequestParameters = true
+  4) ParametersDisplayMode = Panel|Dialog
 
-Canvas ComboBox/TreeView — это ДРУГИЕ фильтры: применяются сразу, БЕЗ Submit.
+Canvas ComboBox/TreeView — другие фильтры (без Submit).
 
-Запуск (путь к .mrt — из .env MRT_PATH):
-  # в .env:  MRT_PATH=/path/to/full.mrt
-  .venv/bin/python view_dashboard.py
+Запуск:
+  MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true в отдаваемом .mrt
-FORCE_PARAMETERS_PANEL=1 — ParametersDisplayMode=Panel (полоса + Submit)
+FORCE_REQUEST_PARAMETERS=1 — RequestParameters=true
+FORCE_PARAMETERS_PANEL=1 — ParametersDisplayMode=Panel
+FORCE_SHOW_ON_PARAMETERS_PANEL=1 — RFU → ShowOnParametersPanel=true
 """
 
 from __future__ import annotations
@@ -38,7 +38,14 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
-from extract_mrt import catalog_from_report, flag_false, flag_true, load_mrt, numbered
+from extract_mrt import (
+    catalog_from_report,
+    flag_false,
+    flag_true,
+    load_mrt,
+    numbered,
+    repair_mrt_json,
+)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -144,6 +151,9 @@ FORCE_PARAMETERS_PANEL = os.environ.get(
     "FORCE_PARAMETERS_PANEL",
     os.environ.get("FORCE_PARAMETERS_DIALOG", "1"),  # старое имя
 ).lower() in {"1", "true", "yes"}
+FORCE_SHOW_ON_PARAMETERS_PANEL = os.environ.get(
+    "FORCE_SHOW_ON_PARAMETERS_PANEL", "1"
+).lower() in {"1", "true", "yes"}
 
 # StiDashboardViewerSettings (биты):
 # ShowToolBar=1 Refresh=2 Open=4 FullScreen=8 Menu=16 Edit=32
@@ -156,7 +166,7 @@ FORCE_DASHBOARD_TOOLBAR = os.environ.get("FORCE_DASHBOARD_TOOLBAR", "1").lower()
     "yes",
 }
 
-# JS после открытия отчёта: Panel + RequestParameters + ShowOnParametersPanel
+# JS: RequestParameters + Panel + ShowOnParametersPanel для RFU
 _OPENED_REPORT_JS = """
 (function () {
   var r = args.report;
@@ -167,10 +177,7 @@ _OPENED_REPORT_JS = """
   } catch (e) {
     try { r.parametersDisplayMode = 1; } catch (e2) {}
   }
-  // Toolbar + Parameters, без ResetAllFilters (256)
-  try {
-    r.dashboardViewerSettings = 671;
-  } catch (e4) {}
+  try { r.dashboardViewerSettings = 671; } catch (e4) {}
   try {
     var dict = r.dictionary;
     var vars = dict && dict.variables;
@@ -180,14 +187,15 @@ _OPENED_REPORT_JS = """
       var v = vars.getByIndex ? vars.getByIndex(i) : null;
       if (!v && vars.list) v = vars.list[i];
       if (!v) continue;
-      if (v.requestFromUser) {
+      // Show on Parameters Panel — главное для полосы фильтров
+      if (v.requestFromUser || v.showOnParametersPanel) {
+        v.requestFromUser = true;
         v.showOnParametersPanel = true;
       }
     }
   } catch (e3) {}
 })();
 """.strip()
-
 # Раскрыть полосу Parameters + Submit только когда paramsVariables уже пришли.
 # Крестик на панели закрывает фильтры — прячем его и сразу открываем панель снова.
 _AFTER_INIT_HEAD = """
@@ -333,6 +341,26 @@ def mrt_looks_anonymized(path: Path) -> bool:
     return len(nonempty) == 0
 
 
+def variable_is_parameters_panel_candidate(variable: dict) -> bool:
+    """Кандидат на полосу фильтров: RFU / ShowOnParametersPanel / ключ после обезлички."""
+    if flag_false(variable.get("RequestFromUser")) and flag_false(
+        variable.get("ShowOnParametersPanel")
+    ):
+        return False
+    if flag_true(variable.get("RequestFromUser")):
+        return True
+    if flag_true(variable.get("ShowOnParametersPanel")):
+        return True
+    # Обезличка стирает true→""; ключ RequestFromUser остаётся у бывших RFU
+    if "RequestFromUser" in variable and not flag_false(variable.get("RequestFromUser")):
+        return True
+    if "ShowOnParametersPanel" in variable and not flag_false(
+        variable.get("ShowOnParametersPanel")
+    ):
+        return True
+    return False
+
+
 def dashboard_debug(path: Path) -> dict:
     """Что Stimulsoft должен показать как фильтры."""
     try:
@@ -344,6 +372,9 @@ def dashboard_debug(path: Path) -> dict:
     for var in catalog.get("variables") or []:
         if not isinstance(var, dict):
             continue
+        show = var.get("show_on_parameters_panel")
+        if show is None and var.get("request_from_user"):
+            show = True
         variables.append(
             {
                 "name": var.get("name"),
@@ -352,6 +383,7 @@ def dashboard_debug(path: Path) -> dict:
                 "category": var.get("category"),
                 "value": var.get("value"),
                 "request_from_user": bool(var.get("request_from_user")),
+                "show_on_parameters_panel": bool(show) if show is not None else None,
                 "sql_parameter": bool(var.get("sql_parameter")),
                 "has_dialog": isinstance(var.get("dialog"), dict),
                 "dialog": var.get("dialog"),
@@ -380,6 +412,11 @@ def dashboard_debug(path: Path) -> dict:
                 )
 
     request_vars = [v for v in variables if v.get("request_from_user")]
+    panel_vars = [
+        v
+        for v in variables
+        if v.get("request_from_user") and v.get("show_on_parameters_panel") is not False
+    ]
     return {
         "ok": True,
         "path": str(path.resolve()),
@@ -387,45 +424,51 @@ def dashboard_debug(path: Path) -> dict:
         "report": catalog.get("report"),
         "request_from_user_variables": request_vars,
         "request_from_user_count": len(request_vars),
+        "show_on_parameters_panel_variables": panel_vars,
+        "show_on_parameters_panel_count": len(panel_vars),
         "all_variables_count": len(variables),
         "variables": variables,
         "filter_elements_on_canvas": filter_elements,
         "filter_elements_count": len(filter_elements),
         "hint": (
-            "Панель + Submit ← request_from_user_variables "
-            "(нужны RequestFromUser=true в .mrt и RequestParameters). "
-            "Canvas ComboBox/TreeView ← filter_elements_on_canvas (без Submit)."
+            "Панель фильтров ← RequestFromUser=true + ShowOnParametersPanel=true "
+            "+ RequestParameters. Canvas ComboBox/TreeView ← filter_elements (без Submit)."
         ),
         "force_request_parameters": FORCE_REQUEST_PARAMETERS,
         "force_parameters_panel": FORCE_PARAMETERS_PANEL,
+        "force_show_on_parameters_panel": FORCE_SHOW_ON_PARAMETERS_PANEL,
     }
 
 
 def mrt_has_request_from_user(report: dict) -> bool:
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
     for variable in numbered(dictionary.get("Variables")):
-        if isinstance(variable, dict) and flag_true(variable.get("RequestFromUser")):
+        if isinstance(variable, dict) and variable_is_parameters_panel_candidate(variable):
             return True
     return False
 
 
 def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
-    """В .mrt: RequestParameters + Panel + ShowOnParametersPanel для RFU.
-
-    Docs: Request Parameters for Dashboards; Variables → Submit на options bar.
-    """
+    """RequestParameters + Panel + ShowOnParametersPanel (+ RFU) для кандидатов панели."""
     meta = {
         "patched": False,
         "request_parameters": False,
         "parameters_display_mode": None,
         "has_request_from_user": False,
+        "rfu_forced": 0,
         "show_on_panel_forced": 0,
+        "panel_candidates": 0,
     }
     try:
         report = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        meta["error"] = f"json: {exc}"
-        return raw, meta
+    except json.JSONDecodeError:
+        try:
+            raw = repair_mrt_json(raw)
+            report = json.loads(raw)
+            meta["json_repaired"] = True
+        except json.JSONDecodeError as exc:
+            meta["error"] = f"json: {exc}"
+            return raw, meta
     if not isinstance(report, dict):
         return raw, meta
 
@@ -439,7 +482,6 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
     if FORCE_PARAMETERS_PANEL:
         mode = report.get("ParametersDisplayMode")
-        # Panel = классическая полоса с Submit (не Dialog-окно)
         if mode not in ("Panel", 1, "1"):
             report["ParametersDisplayMode"] = "Panel"
             changed = True
@@ -447,7 +489,6 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     else:
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
 
-    # Dashboard toolbar: Parameters да, ResetAllFilters нет (путает при 0 canvas-фильтров)
     if FORCE_DASHBOARD_TOOLBAR:
         prev = report.get("DashboardViewerSettings")
         try:
@@ -462,31 +503,35 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     else:
         meta["dashboard_viewer_settings"] = report.get("DashboardViewerSettings")
 
-    # RFU-переменные обязаны быть на панели параметров
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
-    forced = 0
+    rfu_forced = 0
+    show_forced = 0
+    candidates = 0
     for variable in numbered(dictionary.get("Variables")):
         if not isinstance(variable, dict):
             continue
-        if not flag_true(variable.get("RequestFromUser")):
+        if not variable_is_parameters_panel_candidate(variable):
             continue
-        if variable.get("ShowOnParametersPanel") is False or flag_false(
+        candidates += 1
+        if not flag_true(variable.get("RequestFromUser")):
+            variable["RequestFromUser"] = True
+            rfu_forced += 1
+            changed = True
+        if FORCE_SHOW_ON_PARAMETERS_PANEL and not flag_true(
             variable.get("ShowOnParametersPanel")
         ):
             variable["ShowOnParametersPanel"] = True
-            forced += 1
+            show_forced += 1
             changed = True
-        elif "ShowOnParametersPanel" not in variable:
-            variable["ShowOnParametersPanel"] = True
-            forced += 1
-            changed = True
-    meta["show_on_panel_forced"] = forced
+    meta["panel_candidates"] = candidates
+    meta["rfu_forced"] = rfu_forced
+    meta["show_on_panel_forced"] = show_forced
+    meta["has_request_from_user"] = candidates > 0 or meta["has_request_from_user"]
 
     meta["patched"] = changed
     if not changed:
         return raw, meta
     return json.dumps(report, ensure_ascii=False, indent=2) + "\n", meta
-
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
     """Только лог: какие RequestFromUser пришли. Values не трогаем (иначе сбивается dialog)."""
@@ -551,17 +596,23 @@ def debug():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     _, meta = patch_mrt_for_parameters_panel(raw)
     info["mrt_patch"] = meta
-    if info.get("filter_elements_count") == 0 and info.get("request_from_user_count"):
+    if info.get("filter_elements_count") == 0 and (
+        info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
+    ):
+        names = [
+            v.get("name")
+            for v in info.get("show_on_parameters_panel_variables") or []
+        ]
         info["note"] = (
-            "Canvas-фильтров нет (filter_elements_count=0). "
-            "Ожидай полосу Parameters + Submit сверху (RequestFromUser). "
-            f"RFU: {[v.get('name') for v in info.get('request_from_user_variables') or []]}"
+            "Canvas-фильтров нет. Ожидай Parameters panel "
+            "(RequestFromUser + ShowOnParametersPanel). "
+            f"panel vars: {names or meta.get('panel_candidates')}"
         )
-    if not meta.get("has_request_from_user") and not info.get("request_from_user_count"):
+    if not meta.get("panel_candidates") and not info.get("request_from_user_count"):
         info["why_no_submit_panel"] = (
-            "В .mrt нет variables с RequestFromUser=true. "
-            "По докам Stimulsoft панель + Submit появляются только для таких variables. "
-            "Canvas ComboBox/TreeView Submit не показывают."
+            "Нет variables с RequestFromUser / ShowOnParametersPanel. "
+            "В редакторе: Request from User + Show on Parameters Panel. "
+            "Обезличенный test.mrt без имён/true не даст рабочую панель."
         )
     return jsonify(info)
 
@@ -602,8 +653,14 @@ def main() -> None:
     print(f"MRT:     {MRT_PATH.resolve()}")
     print(f"anon:    {info.get('anonymized')}")
     print(f"RFU:     {info.get('request_from_user_count')} variables")
+    print(f"panel:   {info.get('show_on_parameters_panel_count')} ShowOnParametersPanel")
     print(f"filters: {info.get('filter_elements_count')} canvas elements")
-    if info.get("request_from_user_variables"):
+    if info.get("show_on_parameters_panel_variables"):
+        print(
+            "panel names:",
+            [v.get("name") for v in info["show_on_parameters_panel_variables"]],
+        )
+    elif info.get("request_from_user_variables"):
         print(
             "RFU names:",
             [v.get("name") for v in info["request_from_user_variables"]],

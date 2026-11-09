@@ -639,11 +639,16 @@ def variables(node) -> list[dict]:
             "to": text(variable.get("InitByExpressionTo")),
             "selection": text(variable.get("SelectionMode") or variable.get("Selection")),
         }
-        # RequestFromUser = диалог/панель параметров → это и есть «фильтр» для SQL
+        # RequestFromUser + ShowOnParametersPanel → полоса Parameters / фильтры
         if flag_true(variable.get("RequestFromUser")):
             item["request_from_user"] = True
-        if flag_false(variable.get("ShowOnParametersPanel")):
-            item["show_on_parameters_panel"] = False
+        # По умолчанию Stimulsoft показывает RFU на панели; false — явно скрыть
+        if "ShowOnParametersPanel" in variable:
+            item["show_on_parameters_panel"] = not flag_false(
+                variable.get("ShowOnParametersPanel")
+            )
+        elif flag_true(variable.get("RequestFromUser")):
+            item["show_on_parameters_panel"] = True
         if flag_true(variable.get("AllowUseAsSqlParameter")):
             item["sql_parameter"] = True
         if flag_true(variable.get("ReadOnly")):
@@ -943,12 +948,21 @@ def catalog_from_report(report: dict) -> dict:
     return {key: value for key, value in catalog.items() if value not in (None, "", [])}
 
 
+def repair_mrt_json(raw: str) -> str:
+    """Починка артефактов обезлички: \"BorderSize\":\"\".5 → \"BorderSize\":0.5."""
+    # "":0.5  /  "":"".5  после затирания числа в кавычки
+    return re.sub(r'(:\s*)""\.([0-9]+)', r"\1\2", raw)
+
+
 def load_mrt(path: Path) -> dict:
     raw = path.read_text(encoding="utf-8-sig")
     stripped = raw.lstrip()
     if stripped.startswith("<"):
         raise SystemExit(f"{path} is XML. This converter reads JSON .mrt files.")
-    report = json.loads(raw)
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError:
+        report = json.loads(repair_mrt_json(raw))
     if not isinstance(report, dict) or "Dictionary" not in report and "Pages" not in report:
         raise SystemExit(f"{path} is not a Stimulsoft report.")
     return report

@@ -376,7 +376,7 @@
         "4":""
       },
       "DefaultColor":"",
-      "BorderSize":"".5,
+      "BorderSize":0.5,
       "BorderColor":"",
       "ToolTipBrush":"",
       "ToolTipTextBrush":"",
@@ -405,7 +405,7 @@
       },
       "DefaultColor":"",
       "BackColor":"",
-      "BorderSize":"".5,
+      "BorderSize":0.5,
       "BorderColor":"",
       "LabelShadowForeground":"",
       "LabelForeground":"",
