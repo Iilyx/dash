@@ -448,94 +448,89 @@ def _is_number_param(param) -> bool:
 
 
 def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param → no-op/NULL. Только вхождения этого имени, без правок остального SQL."""
+    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
     if not query:
         return query
     pat = re.escape(name)
     # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*@{pat}\s*::\s*\w+",
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"@{pat}\s*::\s*\w+",
+        rf"[@:]{pat}\s*::\s*\w+",
         "NULL",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"CAST\s*\(\s*@{pat}\s+AS\s+[^)]+\)",
+        rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
         "NULL",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*@{pat}\s*\)",
+        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*@{pat}\s*\)",
+        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"[\w.\"`\[\]]+?\s*=\s*@{pat}\b",
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
-    # оставшийся @Param (не сравнение) — NULL, чтобы applyQueryParameters не вшил ''
-    return re.sub(rf"@{pat}\b", "NULL", query, flags=re.IGNORECASE)
-
-
-_EMPTY_NUM_CAST = r"(int|integer|bigint|smallint|numeric|decimal|float|real|double)"
+    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
 
 
 def _soften_inlined_empty_literals(query: str) -> str:
-    """Пустой фильтр уже вшит как '' или \"\" (после unescape) — no-op до PG int \"\"."""
-    if not query:
+    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
+    if not query or "''" not in query:
         return query
-    if "''" not in query and '""' not in query:
-        return query
-    # '' и "" (часто из \"\" после unescape кавычек)
-    for lit in ("''", '""'):
-        query = re.sub(
-            rf"[\w.\"`\[\]]+?\s*=\s*{re.escape(lit)}\s*::\s*{_EMPTY_NUM_CAST}\b",
-            "TRUE",
-            query,
-            flags=re.IGNORECASE,
-        )
-        query = re.sub(
-            rf"{re.escape(lit)}\s*::\s*{_EMPTY_NUM_CAST}\b",
-            "NULL",
-            query,
-            flags=re.IGNORECASE,
-        )
-        query = re.sub(
-            rf"CAST\s*\(\s*{re.escape(lit)}\s+AS\s+{_EMPTY_NUM_CAST}\s*\)",
-            "NULL",
-            query,
-            flags=re.IGNORECASE,
-        )
-        query = re.sub(
-            rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*{re.escape(lit)}\s*\)",
-            "TRUE",
-            query,
-            flags=re.IGNORECASE,
-        )
-        query = re.sub(
-            rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*{re.escape(lit)}\s*\)",
-            "TRUE",
-            query,
-            flags=re.IGNORECASE,
-        )
-        # только col = '' / col = "" — не трогаем coalesce(x,'') и <> ''
-        query = re.sub(rf"[\w.\"`\[\]]+?\s*=\s*{re.escape(lit)}", "TRUE", query)
+    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
+    query = re.sub(r"=\s*''", " = NULL", query)
+    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
     return query
 
 
@@ -548,10 +543,6 @@ def mrt_looks_anonymized(path: Path) -> bool:
 
 def variable_is_parameters_panel_candidate(variable: dict) -> bool:
     """Кандидат на полосу фильтров: RFU / ShowOnParametersPanel / ключ после обезлички."""
-    # без Name Stimulsoft не покажет поле — не форсим пустые
-    name = variable.get("Name")
-    if name is None or (isinstance(name, str) and name.strip() == ""):
-        return False
     if flag_false(variable.get("RequestFromUser")) and flag_false(
         variable.get("ShowOnParametersPanel")
     ):
@@ -657,10 +648,9 @@ def variable_has_dialog_list(variable: dict) -> bool:
     if not isinstance(dialog, dict) or not dialog:
         return False
     keys, _values = _dialog_keys_values(dialog)
-    # Keys есть даже если значения "" (обезличка) — это всё ещё list-dialog
-    if keys:
+    if any(k not in (None, "") for k in keys):
         return True
-    if "KeysColumn" in dialog or "ValuesColumn" in dialog:
+    if dialog.get("KeysColumn") or dialog.get("ValuesColumn"):
         return True
     init = str(dialog.get("ItemsInitializationType") or "").lower()
     return init in {"columns", "items", "1"}
@@ -1023,24 +1013,6 @@ def _sql_at_names(query: str) -> set[str]:
     return {m.group(1) for m in re.finditer(r"@([A-Za-z_][A-Za-z0-9_]*)", query)}
 
 
-def _unescape_sql(query: str) -> str:
-    """Убрать JSON-экранирование из SQL: \\\"test\\\" → \"test\", \\n → перевод строки."""
-    if not query:
-        return query
-    if not any(tok in query for tok in ('\\n', '\\r', '\\t', '\\"', "\\'", "\\\\")):
-        return query
-    # \\ сначала в маркер, чтобы не схлопнуть \\n → \ + n
-    return (
-        query.replace("\\\\", "\0")
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace('\\"', '"')
-        .replace("\\'", "'")
-        .replace("\0", "\\")
-    )
-
-
 def _substitute_sql(query: str, params: dict | None) -> str:
     """Как Stimulsoft: @Param → литерал из values."""
     if not query:
@@ -1068,13 +1040,11 @@ def _refresh_sql_templates(report: dict | None = None) -> dict[str, str]:
         if not isinstance(source, dict):
             continue
         name = (source.get("Name") or "").strip()
-        sql = _unescape_sql(
-            str(
-                source.get("SqlCommand")
-                or source.get("Query")
-                or source.get("SqlQuery")
-                or ""
-            )
+        sql = str(
+            source.get("SqlCommand")
+            or source.get("Query")
+            or source.get("SqlQuery")
+            or ""
         ).strip()
         if name and sql:
             templates[name] = sql
@@ -1187,15 +1157,13 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
-    # клиент часто шлёт SQL уже без @param; иногда с JSON-экранированием \" \\n
-    query_from_client = _unescape_sql(args.queryString or "")
+    # клиент часто шлёт SQL уже без @param
+    query_from_client = args.queryString or ""
     query = query_from_client
-    query_template = _unescape_sql(_lookup_sql_template(src) or "")
+    query_template = _lookup_sql_template(src) or ""
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
-    if query_from_client != (args.queryString or ""):
-        args.queryString = query_from_client
 
     params = args.parameters or {}
     had_empty = False
@@ -1203,9 +1171,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         if not _is_empty(param.value):
             continue
         had_empty = True
-        # убрать @Param до applyQueryParameters (иначе Stimulsoft вшьёт '' → int "")
         query = _soften_empty_param(query, name)
-        # safety: если @ остался, не давать вшить ''
         if _is_number_param(param) or _type_looks_numeric(
             str(param.typeName or ""), name
         ):
@@ -1214,9 +1180,10 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         else:
             param.value = "*"
 
-    # клиент уже вшил пустой фильтр как '' / "" (в т.ч. после unescape \"\")
-    if had_empty or "''" in query or '""' in query:
+    if had_empty or "''" in (query or ""):
         query = _soften_inlined_empty_literals(query)
+        if "''" in query:
+            query = query.replace("''", "NULL")
 
     if query != query_from_client:
         args.queryString = query
@@ -1224,9 +1191,11 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     if not _should_log_sql_command(args):
         return
 
-    # preview того, что уйдёт в PG: наш query после soften + оставшиеся @param
-    # (не подставляем пустые в sql_template заново — иначе снова '' в логе)
-    substituted = _substitute_sql(query, params) if _sql_at_names(query) else query
+    # подстановку делаем по шаблону .mrt, если в нём ещё есть @param
+    fill_base = query_template if _sql_at_names(query_template) else query
+    substituted = _substitute_sql(fill_base, params)
+    if fill_base == query and not _sql_at_names(fill_base):
+        substituted = query
 
     _sql_log_add(
         {
@@ -1239,7 +1208,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "sql_params": _params_dict(params),
             "sql_template": query_template,
             "sql_from_client": query_from_client,
-            "sql_sent": query,
             "sql_substituted": substituted,
         }
     )
