@@ -25,6 +25,7 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, jsonify, request, url_for
+from stimulsoft_data_adapters.StiSqlAdapter import StiSqlAdapter
 from stimulsoft_reports.events import StiDataEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -1152,12 +1153,31 @@ def _json_safe(value: object) -> object:
     return str(value)
 
 
+_SQL_LOG_TEXT_KEYS = (
+    "sql_template",
+    "sql_from_client",
+    "sql_sent",
+    "sql_substituted",
+)
+
+
 def _sql_log_write_file(entry: dict) -> None:
-    """Append одного JSON-события в sql_trace (JSON Lines)."""
+    """JSON-мета + SQL сырым текстом (чтобы \" в файле не путал с реальным SQL)."""
     try:
         SQL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        meta = {k: v for k, v in entry.items() if k not in _SQL_LOG_TEXT_KEYS}
         with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_json_safe(entry), ensure_ascii=False, indent=2))
+            fh.write(json.dumps(_json_safe(meta), ensure_ascii=False, indent=2))
+            fh.write("\n")
+            for key in _SQL_LOG_TEXT_KEYS:
+                val = entry.get(key)
+                if not val:
+                    continue
+                fh.write(f"--- {key} ---\n")
+                fh.write(str(val))
+                if not str(val).endswith("\n"):
+                    fh.write("\n")
+                fh.write(f"--- end {key} ---\n")
             fh.write("\n")
     except Exception as exc:
         print(f"[viewer] sql log file write failed: {exc}", flush=True)
@@ -1240,8 +1260,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     client_already_filled = bool(query_from_client) and not _sql_at_names(
         query_from_client
     )
-    if query_from_client != raw_from_client:
-        args.queryString = query_from_client
 
     params = args.parameters or {}
     had_empty = False
@@ -1263,16 +1281,12 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         if "''" in query:
             query = query.replace("''", "NULL")
 
-    # сами подставляем @param без JS-escape, иначе Stimulsoft снова вшьёт \\ и \'
+    # сами подставляем @param (PG), Stimulsoft больше не трогает parameters
     if params and _sql_at_names(query):
         query = _substitute_sql(query, params)
-        query = _unescape_sql(query)
-        try:
-            args.parameters = {}
-        except Exception:
-            pass
-
+    query = _unescape_sql(query)
     args.queryString = query
+    args.parameters = {}
 
     if not _should_log_sql_command(args):
         return
@@ -1284,6 +1298,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             "connection": connection,
             "command": getattr(args.command, "value", None) or str(args.command or ""),
             "client_already_filled": client_already_filled,
+            "had_backslash_in_raw": "\\" in raw_from_client,
             "params": dict(LAST_VARIABLES),
             "sql_params": _params_dict(params),
             "sql_template": query_template,
@@ -1421,9 +1436,32 @@ def viewer():
     return sti.getFrameworkResponse()
 
 
+def _install_sql_unescape_hooks() -> None:
+    """Последний рубеж: любой SQL в PG проходит через _unescape_sql."""
+    if getattr(StiSqlAdapter, "_pg_unescape_hooks", False):
+        return
+    _orig_apply = StiSqlAdapter.applyQueryParameters
+    _orig_native = StiSqlAdapter.executeNative
+
+    @staticmethod
+    def _apply(query: str, parameters: dict, escape: bool) -> str:
+        # escape=False: не вшивать \\ и \'; escape игнорируем
+        out = _orig_apply(_unescape_sql(query or ""), parameters or {}, False)
+        return _unescape_sql(out)
+
+    def _native(self, queryString: str, maxDataRows: int, result):
+        return _orig_native(self, _unescape_sql(queryString or ""), maxDataRows, result)
+
+    StiSqlAdapter.applyQueryParameters = _apply
+    StiSqlAdapter.executeNative = _native
+    StiSqlAdapter._pg_unescape_hooks = True
+    print("[viewer] SQL unescape hooks on applyQueryParameters/executeNative", flush=True)
+
+
 def main() -> None:
     info = dashboard_debug(MRT_PATH)
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
+    _install_sql_unescape_hooks()
     _reset_sql_trace_file()
     print(f"MRT:     {MRT_PATH.resolve()}")
     print(f"params:  {SQL_LOG_PATH.resolve()}")
