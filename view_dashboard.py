@@ -555,13 +555,24 @@ def _type_looks_numeric(typ: str, name: str = "") -> bool:
     )
 
 
-def default_value_for_variable(variable: dict) -> str:
-    """Дефолт вместо '': сначала Keys из DialogInfo, иначе 0 / * / Today."""
-    dialog = variable.get("DialogInfo") if isinstance(variable.get("DialogInfo"), dict) else {}
-    keys, _values = _dialog_keys_values(dialog) if dialog else ([], [])
-    nonempty_keys = [k for k in keys if k not in (None, "")]
-    if nonempty_keys:
-        return str(nonempty_keys[0])
+def variable_has_dialog_list(variable: dict) -> bool:
+    """Есть DialogInfo со списком (Items/Keys/Columns) — Value не форсим, нужен SelectionMode=First."""
+    dialog = variable.get("DialogInfo")
+    if not isinstance(dialog, dict) or not dialog:
+        return False
+    keys, _values = _dialog_keys_values(dialog)
+    if any(k not in (None, "") for k in keys):
+        return True
+    if dialog.get("KeysColumn") or dialog.get("ValuesColumn"):
+        return True
+    init = str(dialog.get("ItemsInitializationType") or "").lower()
+    return init in {"columns", "items", "1"}
+
+
+def default_value_for_variable(variable: dict) -> str | None:
+    """Дефолт вместо ''. None = не ставить Value (DialogInfo сам выберет First)."""
+    if variable_has_dialog_list(variable):
+        return None
     typ = str(variable.get("Type") or "")
     name = str(variable.get("Name") or "")
     t = typ.lower()
@@ -569,12 +580,10 @@ def default_value_for_variable(variable: dict) -> str:
         return "False"
     if "datetime" in t or t.endswith(".date") or t == "date":
         return "Today"
-    if "list" in t:
-        # Stimulsoft list: пустой список как JSON-ish не шлём ''; первая key если была
-        return "0" if _type_looks_numeric(typ, name) else "*"
     if _type_looks_numeric(typ, name):
         return "0"
-    return "*"
+    # без DialogInfo строковый placeholder; '' нельзя (PG int "")
+    return "0" if _type_looks_numeric(typ, name) else "_"
 
 
 def dashboard_debug(path: Path) -> dict:
@@ -657,9 +666,8 @@ def dashboard_debug(path: Path) -> dict:
         "force_skip_columns_preload": FORCE_SKIP_COLUMNS_PRELOAD,
         "stimulsoft_versions": package_versions(),
         "note_show_on_parameters_panel": (
-            "Панель сверху = Panel + RFU. Пустым Value ставим дефолты (0/*/Today/первый Key). "
-            "DialogInfo Columns не трогаем — списки грузятся SQL. "
-            "FORCE_SKIP_COLUMNS_PRELOAD=1 только если нужно отключить Columns."
+            "Панель сверху = Panel. У DialogInfo → SelectionMode=First (без Value=0/*). "
+            "Списки Keys/Values грузит Columns SQL. Пустые SQL-параметры смягчаем отдельно."
         ),
     }
 
@@ -754,15 +762,25 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
             variable["ShowOnParametersPanel"] = True
             show_forced += 1
             changed = True
-        # DialogInfo не трогаем по умолчанию (Columns сам подтянет Keys/Values)
+        # DialogInfo Columns/Items не режем (кроме явного FORCE_SKIP_COLUMNS_PRELOAD)
         if FORCE_SKIP_COLUMNS_PRELOAD and soften_variable_dialog_for_panel(variable):
             columns_softened += 1
             changed = True
-        # везде дефолты вместо '' — иначе Columns-preload и dashboard SQL падают на int ""
-        if _is_empty(variable.get("Value")):
-            variable["Value"] = default_value_for_variable(variable)
-            defaults_set += 1
-            changed = True
+        if variable_has_dialog_list(variable):
+            # как в Stimulsoft-сэмплах: SelectionMode=First, без Value=0/*
+            if variable.get("SelectionMode") not in ("First", "first", 1, "1"):
+                variable["SelectionMode"] = "First"
+                changed = True
+            if "Value" in variable and _is_empty(variable.get("Value")):
+                del variable["Value"]
+                defaults_set += 1
+                changed = True
+        elif _is_empty(variable.get("Value")):
+            default = default_value_for_variable(variable)
+            if default is not None:
+                variable["Value"] = default
+                defaults_set += 1
+                changed = True
     meta["panel_candidates"] = candidates
     meta["rfu_forced"] = rfu_forced
     meta["show_on_panel_forced"] = show_forced
@@ -777,22 +795,40 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Пустые RFU → дефолты (0 / * / Today), никогда ''."""
+    """Лог RFU. Пустые с DialogInfo не трогаем (SelectionMode=First подставит из списка).
+    Без DialogInfo — безопасный дефолт, не ''."""
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
+    # имена RFU с DialogInfo-списком — из текущего .mrt (сервер знает шаблон)
+    dialog_list_names: set[str] = set()
+    try:
+        report = load_mrt(MRT_PATH)
+        dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+        for variable in numbered(dictionary.get("Variables")):
+            if isinstance(variable, dict) and variable_has_dialog_list(variable):
+                n = variable.get("Name")
+                if n:
+                    dialog_list_names.add(str(n))
+    except Exception as exc:
+        print(f"[viewer] prepare_variables dialog map: {exc}", flush=True)
+
     for name, var in variables.items():
         vtype = var.type.value if getattr(var, "type", None) is not None else "?"
         empty = _is_empty(var.value)
         print(
-            f"[viewer]   var {name} type={vtype} empty={empty} value={var.value!r}",
+            f"[viewer]   var {name} type={vtype} empty={empty} value={var.value!r} "
+            f"dialog_list={name in dialog_list_names}",
             flush=True,
         )
         if not empty:
             continue
+        if name in dialog_list_names:
+            # Stimulsoft выберет First после fillsDialogInfoItems — не затирать 0/*
+            print(f"[viewer]   var {name}: empty + DialogInfo → leave for First", flush=True)
+            continue
         fake = {"Name": name, "Type": vtype, "DialogInfo": {}}
-        default = default_value_for_variable(fake)
-        # числовые типы — int, иначе строка (Stimulsoft сам приведёт)
+        default = default_value_for_variable(fake) or "0"
         if _type_looks_numeric(vtype, name) and "list" not in vtype.lower():
             try:
                 var.value = int(default)
@@ -904,6 +940,11 @@ def viewer():
     # fullScreen ок, но toolbar обязан быть visible (ещё патчим DashboardViewerSettings)
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    # фильтры в одну/несколько колонок в полосе сверху
+    sti.options.appearance.parametersPanelColumnsCount = int(
+        os.environ.get("PARAMETERS_PANEL_COLUMNS", "5") or "5"
+    )
+    sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.toolbar.visible = True
     sti.options.toolbar.autoHide = False
     sti.options.toolbar.showParametersButton = True
