@@ -145,6 +145,15 @@ FORCE_PARAMETERS_PANEL = os.environ.get(
     os.environ.get("FORCE_PARAMETERS_DIALOG", "1"),  # старое имя
 ).lower() in {"1", "true", "yes"}
 
+# StiDashboardViewerSettings.All — иначе toolbar/Parameters скрыты шаблоном
+# ShowToolBar=1 … ShowParametersButton=512 → All=1023
+DASHBOARD_VIEWER_SETTINGS_ALL = 1023
+FORCE_DASHBOARD_TOOLBAR = os.environ.get("FORCE_DASHBOARD_TOOLBAR", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
 # JS после открытия отчёта: Panel + RequestParameters + ShowOnParametersPanel
 _OPENED_REPORT_JS = """
 (function () {
@@ -155,6 +164,16 @@ _OPENED_REPORT_JS = """
     r.parametersDisplayMode = Stimulsoft.Report.StiParametersDisplayMode.Panel;
   } catch (e) {
     try { r.parametersDisplayMode = 1; } catch (e2) {}
+  }
+  // Toolbar + Parameters для dashboard (StiDashboardViewerSettings.All = 1023)
+  try {
+    if (Stimulsoft.Report.StiDashboardViewerSettings) {
+      r.dashboardViewerSettings = Stimulsoft.Report.StiDashboardViewerSettings.All;
+    } else {
+      r.dashboardViewerSettings = 1023;
+    }
+  } catch (e4) {
+    try { r.dashboardViewerSettings = 1023; } catch (e5) {}
   }
   try {
     var dict = r.dictionary;
@@ -379,6 +398,21 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     else:
         meta["parameters_display_mode"] = report.get("ParametersDisplayMode")
 
+    # Dashboard: без ShowToolBar/ShowParametersButton в битовой маске toolbar не виден
+    if FORCE_DASHBOARD_TOOLBAR:
+        prev = report.get("DashboardViewerSettings")
+        try:
+            prev_i = int(prev) if prev is not None else 0
+        except (TypeError, ValueError):
+            prev_i = 0
+        if prev_i != DASHBOARD_VIEWER_SETTINGS_ALL:
+            report["DashboardViewerSettings"] = DASHBOARD_VIEWER_SETTINGS_ALL
+            changed = True
+        meta["dashboard_viewer_settings"] = report.get("DashboardViewerSettings")
+        meta["dashboard_viewer_settings_was"] = prev
+    else:
+        meta["dashboard_viewer_settings"] = report.get("DashboardViewerSettings")
+
     # RFU-переменные обязаны быть на панели параметров
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
     forced = 0
@@ -488,10 +522,14 @@ def debug():
 def viewer():
     sti = StiViewer()
     sti.id = "viewer"
+    # fullScreen ок, но toolbar обязан быть visible (ещё патчим DashboardViewerSettings)
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
     sti.options.toolbar.visible = True
+    sti.options.toolbar.autoHide = False
     sti.options.toolbar.showParametersButton = True
+    sti.options.toolbar.showAboutButton = True
+    sti.options.toolbar.showRefreshButton = True
     sti.javascript.appendHead(_AFTER_INIT_HEAD)
     sti.onAfterInitialize += "__stiAfterInit"
     sti.onPrepareVariables += prepare_variables
