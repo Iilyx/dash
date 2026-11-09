@@ -177,6 +177,11 @@ FORCE_PARAMETERS_PANEL = FORCE_PARAMETERS_MODE is not None  # совместим
 FORCE_SHOW_ON_PARAMETERS_PANEL = os.environ.get(
     "FORCE_SHOW_ON_PARAMETERS_PANEL", "1"
 ).lower() in {"1", "true", "yes"}
+# До панели Stimulsoft для RFU+Columns зовёт connectToDataAsync → SQL с пустыми int →
+# «invalid input syntax for type integer ""» и панель не открывается. Items без SQL.
+FORCE_SKIP_COLUMNS_PRELOAD = os.environ.get(
+    "FORCE_SKIP_COLUMNS_PRELOAD", "1"
+).lower() in {"1", "true", "yes"}
 
 # StiDashboardViewerSettings (биты):
 # ShowToolBar=1 Refresh=2 Open=4 FullScreen=8 Menu=16 Edit=32
@@ -467,6 +472,57 @@ def variable_is_parameters_panel_candidate(variable: dict) -> bool:
     return False
 
 
+def _dialog_keys_values(dialog: dict) -> tuple[list, list]:
+    keys = dialog.get("Keys")
+    values = dialog.get("Values")
+    return numbered(keys) if keys is not None else [], numbered(values) if values is not None else []
+
+
+def _dialog_needs_sql_preload(dialog: dict) -> bool:
+    """Как StiVariablesHelper.fillDialogInfoItems: Columns + пустые Keys → connectToData."""
+    if not isinstance(dialog, dict):
+        return False
+    init = dialog.get("ItemsInitializationType")
+    is_columns = flag_true(init) or str(init).lower() in {"columns", "1"}
+    if not is_columns and not (dialog.get("KeysColumn") or dialog.get("ValuesColumn")):
+        return False
+    keys, values = _dialog_keys_values(dialog)
+    nonempty_keys = [k for k in keys if k not in (None, "")]
+    nonempty_vals = [v for v in values if v not in (None, "")]
+    return not nonempty_keys or not nonempty_vals
+
+
+def soften_variable_dialog_for_panel(variable: dict) -> bool:
+    """Columns→Items + placeholder, чтобы панель открылась без SQL."""
+    dialog = variable.get("DialogInfo")
+    if not isinstance(dialog, dict) or not _dialog_needs_sql_preload(dialog):
+        return False
+    name = variable.get("Name") or "value"
+    dialog["ItemsInitializationType"] = "Items"
+    dialog.pop("KeysColumn", None)
+    dialog.pop("ValuesColumn", None)
+    keys, values = _dialog_keys_values(dialog)
+    nonempty_keys = [k for k in keys if k not in (None, "")]
+    if not nonempty_keys:
+        # числовые фильтры: безопасный placeholder, не ''
+        typ = str(variable.get("Type") or "").lower()
+        if any(h in typ for h in ("int", "long", "decimal", "double", "float", "byte")):
+            dialog["Keys"] = {"0": "0"}
+            dialog["Values"] = {"0": f"(all) {name}"}
+            if _is_empty(variable.get("Value")):
+                variable["Value"] = "0"
+        else:
+            dialog["Keys"] = {"0": "*"}
+            dialog["Values"] = {"0": f"(all) {name}"}
+            if _is_empty(variable.get("Value")):
+                variable["Value"] = "*"
+    elif not any(v not in (None, "") for v in values):
+        dialog["Values"] = {str(i): str(k) for i, k in enumerate(nonempty_keys)}
+    dialog["AllowUserValues"] = True
+    variable["DialogInfo"] = dialog
+    return True
+
+
 def dashboard_debug(path: Path) -> dict:
     """Что Stimulsoft должен показать как фильтры."""
     try:
@@ -544,10 +600,12 @@ def dashboard_debug(path: Path) -> dict:
         "force_parameters_mode": FORCE_PARAMETERS_MODE,
         "force_parameters_panel": FORCE_PARAMETERS_PANEL,
         "force_show_on_parameters_panel": FORCE_SHOW_ON_PARAMETERS_PANEL,
+        "force_skip_columns_preload": FORCE_SKIP_COLUMNS_PRELOAD,
         "stimulsoft_versions": package_versions(),
         "note_show_on_parameters_panel": (
-            "В Stimulsoft JS 2026.x ShowOnParametersPanel — алиас RequestFromUser, "
-            "отдельного свойства нет. Панель = RFU + RequestParameters + Dialog/Panel."
+            "В Stimulsoft JS 2026.x ShowOnParametersPanel — алиас RequestFromUser. "
+            "Панель = RFU + RequestParameters + Dialog. "
+            "RFU+Columns без Keys раньше дергали SQL до панели → integer \"\"."
         ),
     }
 
@@ -623,6 +681,8 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
     rfu_forced = 0
     show_forced = 0
+    columns_softened = 0
+    defaults_set = 0
     candidates = 0
     for variable in numbered(dictionary.get("Variables")):
         if not isinstance(variable, dict):
@@ -640,9 +700,21 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
             variable["ShowOnParametersPanel"] = True
             show_forced += 1
             changed = True
+        if FORCE_SKIP_COLUMNS_PRELOAD and soften_variable_dialog_for_panel(variable):
+            columns_softened += 1
+            changed = True
+        # пустой Value у int RFU → '' в SQL до Submit
+        if _is_empty(variable.get("Value")):
+            typ = str(variable.get("Type") or "").lower()
+            if any(h in typ for h in ("int", "long", "decimal", "double", "float", "byte")):
+                variable["Value"] = "0"
+                defaults_set += 1
+                changed = True
     meta["panel_candidates"] = candidates
     meta["rfu_forced"] = rfu_forced
     meta["show_on_panel_forced"] = show_forced
+    meta["columns_dialog_softened"] = columns_softened
+    meta["empty_defaults_set"] = defaults_set
     meta["has_request_from_user"] = candidates > 0 or meta["has_request_from_user"]
 
     meta["patched"] = changed
