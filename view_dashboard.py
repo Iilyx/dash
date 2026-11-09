@@ -315,23 +315,90 @@ def _is_number_param(param) -> bool:
 
 
 def _soften_empty_param(query: str, name: str) -> str:
-    """Пустой @Param → no-op, не '' (PG: invalid input syntax for type integer \"\")."""
+    """Пустой @Param/@:Param → no-op/NULL, не '' (PG: integer \"\")."""
     if not query:
         return query
     pat = re.escape(name)
+    # касты раньше голого `=` иначе `@p::int` → `TRUE::int`
     query = re.sub(
-        rf"[\w.\"`]+?\s+IN\s*\(\s*@{pat}\s*\)",
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\s*::\s*\w+",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
     query = re.sub(
-        rf"[\w.\"`]+?\s*=\s*@{pat}\b",
+        rf"[@:]{pat}\s*::\s*\w+",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"CAST\s*\(\s*[@:]{pat}\s+AS\s+[^)]+\)",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s+IN\s*\(\s*[@:]{pat}\s*\)",
         "TRUE",
         query,
         flags=re.IGNORECASE,
     )
-    return re.sub(rf"@{pat}\b", "NULL", query, flags=re.IGNORECASE)
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*[@:]{pat}\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        rf"[\w.\"`\[\]]+?\s*=\s*[@:]{pat}\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(rf"[@:]{pat}\b", "NULL", query, flags=re.IGNORECASE)
+
+
+def _soften_inlined_empty_literals(query: str) -> str:
+    """Клиент уже подставил '' — убрать до PG (integer \"\")."""
+    if not query or "''" not in query:
+        return query
+    # касты раньше голого `=` иначе `= ''::int` → `TRUE::int`
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"''\s*::\s*(int|integer|bigint|smallint|numeric|decimal|float|real|double)\b",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"CAST\s*\(\s*''\s+AS\s+(int|integer|bigint|smallint|numeric|decimal|float|real|double)\s*\)",
+        "NULL",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s+IN\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"[\w.\"`\[\]]+?\s*=\s*ANY\s*\(\s*''\s*\)",
+        "TRUE",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"[\w.\"`\[\]]+?\s*=\s*''", "TRUE", query)
+    # выражения вроде f(x) = '' / оставшиеся литералы — не слать '' в int
+    query = re.sub(r"=\s*''", " = NULL", query)
+    query = re.sub(r"IN\s*\(\s*''\s*\)", "IN (NULL)", query, flags=re.IGNORECASE)
+    return query
 
 
 def mrt_looks_anonymized(path: Path) -> bool:
@@ -534,7 +601,7 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
     return json.dumps(report, ensure_ascii=False, indent=2) + "\n", meta
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
-    """Только лог: какие RequestFromUser пришли. Values не трогаем (иначе сбивается dialog)."""
+    """Лог RFU; пустые числовые → None (не ''), чтобы SQL не получил \"\"."""
     variables = args.variables or {}
     names = list(variables.keys())
     print(f"[viewer] onPrepareVariables count={len(names)} names={names}", flush=True)
@@ -545,22 +612,26 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
             f"[viewer]   var {name} type={vtype} empty={empty} value={var.value!r}",
             flush=True,
         )
+        if not empty:
+            continue
+        # '' в int/number ломает PG; None безопаснее до выбора на панели
+        if isinstance(var.value, str) and var.value.strip() == "":
+            var.value = None
+            print(f"[viewer]   var {name}: '' → None", flush=True)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Connection string из .env; пустые @Param не слать как ''."""
+    """Connection string из .env; пустые params → TRUE/NULL, никогда ''."""
     if PG_CONN and args.connectionString is not None:
         args.connectionString = PG_CONN
 
     src = args.dataSource or "?"
-    qpreview = (args.queryString or "")[:180].replace("\n", " ")
+    query = args.queryString or ""
+    qpreview = query[:180].replace("\n", " ")
     print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
 
     params = args.parameters or {}
-    if not params:
-        return
-
-    query = args.queryString or ""
+    had_empty = False
     for name, param in params.items():
         print(
             f"[viewer]   @{name} typeGroup={param.typeGroup!r} "
@@ -569,13 +640,29 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         )
         if not _is_empty(param.value):
             continue
+        had_empty = True
         kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
         query = _soften_empty_param(query, name)
-        param.value = None
-        print(f"[viewer] empty @{name} ({kind}) on {src} → no-op", flush=True)
+        # StiSqlAdapter.applyQueryParameters после события:
+        #   number → str(value); иначе → 'value' / '' при None
+        # Пустой number/string с '' даёт PG: invalid input syntax for type integer ""
+        # Если @name ещё остался — вставить NULL без кавычек.
+        param.typeGroup = "number"
+        param.value = "NULL"
+        print(f"[viewer] empty @{name} ({kind}) on {src} → soften + NULL", flush=True)
+
+    if had_empty or "''" in (query or ""):
+        before = query
+        query = _soften_inlined_empty_literals(query)
+        if query != before:
+            print(f"[viewer] softened inlined '' on {src}", flush=True)
 
     if query != (args.queryString or ""):
         args.queryString = query
+        print(
+            f"[viewer] SQL after soften q={(query[:180]).replace(chr(10), ' ')!r}",
+            flush=True,
+        )
 
 
 @app.get("/mrt")
