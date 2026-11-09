@@ -117,10 +117,48 @@ def stimulsoft_pg_connection_string(url: str) -> str:
     host = parsed.hostname
     port = parsed.port or 5432
     database = parsed.path.lstrip("/").split("?", 1)[0]
+    # Stimulsoft PostgreSQL adapter: host/port/database/user id/password
     return (
         f"Host={host}; Port={port}; Database={database}; "
         f"User Id={user}; Password={password};"
     )
+
+
+def mask_pg_conn(conn: str) -> str:
+    if not conn:
+        return ""
+    return re.sub(r"(Password|Pwd)\s*=\s*[^;]*", r"\1=***", conn, flags=re.IGNORECASE)
+
+
+def probe_database() -> dict:
+    """Проверка, что Postgres из .env реально отвечает."""
+    url = database_url()
+    info = {
+        "configured": bool(url),
+        "pg_conn": bool(PG_CONN),
+        "pg_conn_masked": mask_pg_conn(PG_CONN),
+        "ok": False,
+        "error": None,
+    }
+    if not url:
+        info["error"] = (
+            "Нет DATABASE_URL / POSTGRES_USER+PASSWORD+DB в .env — "
+            "viewer не подставит connection string."
+        )
+        return info
+    try:
+        import psycopg
+
+        with psycopg.connect(url, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_database(), current_user")
+                db, user = cur.fetchone()
+        info["ok"] = True
+        info["database"] = db
+        info["user"] = user
+    except Exception as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
 
 
 def resolve_mrt_path() -> Path:
@@ -892,11 +930,25 @@ def prepare_variables(args: StiVariablesEventArgs) -> None:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Connection string из .env; пустые params → дефолт/TRUE, никогда ''."""
-    if PG_CONN and args.connectionString is not None:
-        args.connectionString = PG_CONN
-
+    """Connection string из .env (всегда); пустые params → дефолт/TRUE, никогда ''."""
     src = args.dataSource or "?"
+    # Важно: connectionString часто None/"" из .mrt — всё равно форсим .env
+    if PG_CONN:
+        was = args.connectionString
+        args.connectionString = PG_CONN
+        print(
+            f"[viewer] DB force conn source={src} "
+            f"was={mask_pg_conn(was or '')!r} now={mask_pg_conn(PG_CONN)!r} "
+            f"database={getattr(args.database, 'value', args.database)!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[viewer] DB MISSING .env — source={src} "
+            f"conn={mask_pg_conn(args.connectionString or '')!r}",
+            flush=True,
+        )
+
     query = args.queryString or ""
     qpreview = query[:180].replace("\n", " ")
     print(f"[viewer] SQL source={src} q={qpreview!r}", flush=True)
@@ -963,6 +1015,7 @@ def debug():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     _, meta = patch_mrt_for_parameters_panel(raw)
     info["mrt_patch"] = meta
+    info["database"] = probe_database()
     if info.get("filter_elements_count") == 0 and (
         info.get("show_on_parameters_panel_count") or meta.get("panel_candidates")
     ):
@@ -1051,9 +1104,21 @@ def main() -> None:
                 for e in info["filter_elements_on_canvas"]
             ],
         )
-    print(f"DB:      {'yes' if PG_CONN else 'no'}")
+    db = probe_database()
+    print(f"DB:      configured={db.get('configured')} ok={db.get('ok')}")
+    print(f"DB conn: {db.get('pg_conn_masked') or '(empty)'}")
+    if db.get("error"):
+        print(f"DB ERR:  {db.get('error')}", flush=True)
+    elif db.get("ok"):
+        print(f"DB user: {db.get('user')} @ {db.get('database')}", flush=True)
     print(f"Open:    {url}")
     print(f"Debug:   {url}debug")
+    if not db.get("configured"):
+        print(
+            "WARNING: нет Postgres в .env — DialogInfo Columns и SQL не смогут "
+            "подтянуть данные. Задай POSTGRES_* или DATABASE_URL.",
+            flush=True,
+        )
     if info.get("anonymized"):
         print(
             "WARNING: .mrt обезличен (пустые строки) — фильтров не будет. "
