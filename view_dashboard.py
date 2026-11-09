@@ -262,16 +262,7 @@ _OPENED_REPORT_JS = f"""
         }}
       }}
     }}
-    // SQL DataSources — подключаться при открытии
-    var dss = dict && dict.dataSources;
-    if (dss) {{
-      var n = dss.count || 0;
-      for (var j = 0; j < n; j++) {{
-        var ds = dss.getByIndex ? dss.getByIndex(j) : (dss.list && dss.list[j]);
-        if (!ds) continue;
-        try {{ ds.connectOnStart = true; }} catch (e6) {{}}
-      }}
-    }}
+    // ConnectOnStart не форсим — SQL только когда source реально используется
   }} catch (e3) {{}}
 }})();
 """.strip()
@@ -827,35 +818,8 @@ def patch_mrt_for_parameters_panel(raw: str) -> tuple[str, dict]:
 
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
 
-    # DataSources: ConnectOnStart=true, чтобы dashboard реально ходил в SQL
-    connect_forced = 0
-    for source in numbered(dictionary.get("DataSources")):
-        if not isinstance(source, dict):
-            continue
-        ident = str(source.get("Ident") or "")
-        # SqlCommand может быть ключом даже с пустым телом (обезличка)
-        has_sql_key = any(k in source for k in ("SqlCommand", "Query", "SqlQuery"))
-        has_sql = bool(
-            source.get("SqlCommand") or source.get("Query") or source.get("SqlQuery")
-        )
-        is_sql = (
-            "Sql" in ident
-            or has_sql
-            or has_sql_key
-            or bool(source.get("NameInSource"))
-            or bool(source.get("Connection"))
-        )
-        if not is_sql:
-            continue
-        if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            connect_forced += 1
-            changed = True
-        elif "ConnectOnStart" not in source or not flag_true(source.get("ConnectOnStart")):
-            source["ConnectOnStart"] = True
-            connect_forced += 1
-            changed = True
-    meta["connect_on_start_forced"] = connect_forced
+    # ConnectOnStart не трогаем: SQL source считаем только когда Stimulsoft его реально дергает
+    meta["connect_on_start_forced"] = 0
     rfu_forced = 0
     show_forced = 0
     columns_softened = 0
@@ -1199,7 +1163,7 @@ def _should_log_sql_command(args: StiDataEventArgs) -> bool:
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подмена connection string; пустые params → no-op; лог JSON: шаблон .mrt + SQL."""
+    """Connection string всегда. SQL трогаем только при реальном Execute этого source."""
     src = args.dataSource or "?"
     connection = args.connection or "?"
     if PG_CONN:
@@ -1210,8 +1174,12 @@ def begin_process_data(args: StiDataEventArgs) -> None:
             flush=True,
         )
 
-    # клиент часто шлёт SQL уже без @param + с \" / \\n
+    cmd = getattr(args.command, "value", None) or str(args.command or "")
     raw_from_client = args.queryString or ""
+    # schema / unused / пустой запрос — SqlCommand не трогаем
+    if cmd not in {"ExecuteQuery", "Execute", "GetData"} or not raw_from_client.strip():
+        return
+
     query_from_client = _unescape_sql(raw_from_client)
     query = query_from_client
     query_template = _unescape_sql(_lookup_sql_template(src) or "")
@@ -1220,35 +1188,32 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     )
 
     params = args.parameters or {}
-    for name, param in params.items():
-        if not _is_empty(param.value):
-            continue
-        # только пустой @Param → TRUE/NULL; литералы '' в SqlCommand не трогаем
-        query = _soften_empty_param(query, name)
-        if _is_number_param(param) or _type_looks_numeric(
-            str(param.typeName or ""), name
-        ):
-            param.typeGroup = "number"
-            param.value = 0
-        else:
-            param.value = "*"
-
-    # сами подставляем @param (PG), Stimulsoft больше не трогает parameters
+    # подстановка только если в SQL ещё есть @param (иначе клиент уже посчитал)
     if params and _sql_at_names(query):
-        query = _substitute_sql(query, params)
+        for name, param in params.items():
+            if not _is_empty(param.value):
+                continue
+            query = _soften_empty_param(query, name)
+            if _is_number_param(param) or _type_looks_numeric(
+                str(param.typeName or ""), name
+            ):
+                param.typeGroup = "number"
+                param.value = 0
+            else:
+                param.value = "*"
+        if _sql_at_names(query):
+            query = _substitute_sql(query, params)
+        args.parameters = {}
+
     query = _unescape_sql(query)
     args.queryString = query
-    args.parameters = {}
-
-    if not _should_log_sql_command(args):
-        return
 
     _sql_log_add(
         {
             "phase": "sql",
             "source": src,
             "connection": connection,
-            "command": getattr(args.command, "value", None) or str(args.command or ""),
+            "command": cmd,
             "client_already_filled": client_already_filled,
             "had_backslash_in_raw": "\\" in raw_from_client,
             "params": dict(LAST_VARIABLES),
