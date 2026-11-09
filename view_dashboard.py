@@ -18,7 +18,7 @@ Canvas ComboBox/TreeView — другие фильтры (без Submit).
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
   # http://127.0.0.1:8040/  и  /debug
 
-FORCE_REQUEST_PARAMETERS=1 — ждать Submit (передать выбранные фильтры в SQL)
+FORCE_REQUEST_PARAMETERS=0 — сразу грузить карту/таблицу; 1 = ждать Submit
 FORCE_ALLOW_SQL_PARAMETER=1 — AllowUseAsSqlParameter у RFU (иначе @param пустой)
 FORCE_PARAMETERS_MODE=Panel|Dialog — по умолчанию Panel (сверху)
 FORCE_SKIP_COLUMNS_PRELOAD=0 — не трогать DialogInfo Columns
@@ -233,10 +233,9 @@ OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 
-# RequestParameters=true → SQL после Submit (с выбранными фильтрами).
-# По умолчанию 1: иначе первый запрос уходит с пустыми @param (soften→TRUE),
-# и кажется, что выбранное «не передаётся» в источники.
-FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "1").lower() in {
+# RequestParameters=true → SQL только после Submit (карта/таблица пустые до кнопки).
+# По умолчанию 0: сразу грузим данные; фильтры применяем на Submit через inject.
+FORCE_REQUEST_PARAMETERS = os.environ.get("FORCE_REQUEST_PARAMETERS", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -1027,20 +1026,19 @@ def _inject_variables_into_sql_params(
     at_in_query = _sql_at_names(query)
     at_in_template = _sql_at_names(template) if template else set()
 
-    # Restore: query без @ / parameters={} → шаблон из .mrt с @param
+    # Restore шаблона ТОЛЬКО если есть реальные значения с панели.
+    # Иначе не трогаем query клиента (пустой restore + value=0 давал 0 строк → пустые карта/таблица).
     if template and at_in_template:
         params_empty = not args.parameters
         values_lower = {k.lower(): v for k, v in values.items()}
         has_values_for_template = any(
             not _is_empty(values_lower.get(n.lower())) for n in at_in_template
         )
-        if (not at_in_query and at_in_template) or (
-            params_empty and has_values_for_template
-        ):
+        if has_values_for_template and (not at_in_query or params_empty):
             if query.strip() != template.strip():
                 print(
                     f"[viewer] restore SQL template for {args.dataSource!r} "
-                    f"(@params={sorted(at_in_template)})",
+                    f"(@params={sorted(at_in_template)}) values={ {n: values_lower.get(n.lower()) for n in at_in_template} }",
                     flush=True,
                 )
             query = template
@@ -1237,12 +1235,12 @@ def _patch_postgres_dictionary(dictionary: dict) -> dict:
             source["Ident"] = "StiPostgreSQLSource"
             meta["source_ident_forced"] += 1
             meta["changed"] = True
+        # NameInSource не перетираем (Receipts и т.п.) — только если пусто
         nis = (source.get("NameInSource") or "").strip()
-        if primary and (not nis or (db_names and nis not in db_names and len(db_names) == 1)):
-            if nis != primary:
-                source["NameInSource"] = primary
-                meta["name_in_source_forced"] += 1
-                meta["changed"] = True
+        if primary and not nis:
+            source["NameInSource"] = primary
+            meta["name_in_source_forced"] += 1
+            meta["changed"] = True
         if source.get("ConnectOnStart") is False or flag_false(source.get("ConnectOnStart")):
             source["ConnectOnStart"] = True
             meta["connect_on_start_forced"] += 1
@@ -1600,8 +1598,9 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     params = args.parameters or {}
     param_dump = {}
     had_empty = False
-    # Не смягчаем @param, если только что восстановили шаблон и подставили значения
-    for name, param in params.items():
+    drop_params: list[str] = []
+    # Пустой @param → TRUE/NULL в SQL, НЕ value=0/"*" (иначе WHERE x=0 / LIMIT 0 → пустая карта/таблица)
+    for name, param in list(params.items()):
         param_dump[name] = {
             "typeGroup": param.typeGroup,
             "typeName": param.typeName,
@@ -1617,18 +1616,40 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         had_empty = True
         kind = "number" if _is_number_param(param) else (param.typeGroup or "value")
         query = _soften_empty_param(query, name)
-        if _is_number_param(param) or _type_looks_numeric(
-            str(param.typeName or ""), name
-        ):
-            param.typeGroup = "number"
-            param.value = 0
-        else:
-            param.value = "*"
-        param_dump[name]["value_after"] = param.value
+        drop_params.append(name)
+        param_dump[name]["value_after"] = None
+        param_dump[name]["softened"] = True
         print(
-            f"[viewer] empty @{name} ({kind}) on {src} → soften + default={param.value!r}",
+            f"[viewer] empty @{name} ({kind}) on {src} → soften + drop param "
+            f"(no 0/* defaults)",
             flush=True,
         )
+
+    # @param в SQL без записи в parameters — тоже смягчить
+    for at_name in list(_sql_at_names(query)):
+        if any(str(k).lower() == at_name.lower() for k in params):
+            # уже обработан выше или имеет значение
+            existing = next(
+                (params[k] for k in params if str(k).lower() == at_name.lower()),
+                None,
+            )
+            if existing is not None and not _is_empty(existing.value):
+                continue
+            if at_name in drop_params or any(
+                d.lower() == at_name.lower() for d in drop_params
+            ):
+                continue
+        had_empty = True
+        query = _soften_empty_param(query, at_name)
+        print(f"[viewer] orphan @{at_name} on {src} → soften", flush=True)
+
+    for name in drop_params:
+        if name in params:
+            del params[name]
+        # case-insensitive cleanup
+        for k in list(params):
+            if str(k).lower() == name.lower():
+                del params[k]
 
     if had_empty or "''" in (query or ""):
         before = query
