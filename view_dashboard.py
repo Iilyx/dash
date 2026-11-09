@@ -119,7 +119,7 @@ def resolve_mrt_path() -> Path:
         return path_of(sys.argv[1])
     if env_path:
         return path_of(env_path)
-    return path_of("PatientHealthKPI.mrt")
+    return path_of("test.mrt")
 
 
 load_env()

@@ -315,7 +315,7 @@ async def execute_dialog_sources(
 def ensure_catalog() -> None:
     catalog_path = path_of(os.environ.get("CATALOG_PATH", "catalog.json"))
     pages_dir = path_of(os.environ.get("CATALOG_PAGES_DIR", "catalog_pages"))
-    mrt = path_of(os.environ.get("MRT_PATH", "SalesOfProducts.mrt"))
+    mrt = path_of(os.environ.get("MRT_PATH", "test.mrt"))
     if mrt.is_file():
         catalog = catalog_from_report(load_mrt(mrt))
         catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
