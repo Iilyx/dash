@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """Минимальный viewer + designer: .mrt + Postgres connection.
 
-Как в Samples-Dashboards.Python:
+Stimulsoft Dashboards.PYTHON 2024.x
   StiViewer / StiDesigner + loadFile(.mrt) + onBeginProcessData(connectionString).
   Save в designer пишет обратно в MRT_PATH.
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
-  Открой /designer — правь дашборд, Save → тот же .mrt.
+  / — viewer, /designer — правка дашборда.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import webbrowser
-from collections import deque
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
@@ -34,8 +31,6 @@ from stimulsoft_reports.viewer.enums import (
     StiParametersPanelPosition,
     StiToolbarDisplayMode,
 )
-
-from extract_mrt import catalog_from_report, load_mrt
 
 ROOT = Path(__file__).resolve().parent
 
@@ -95,145 +90,6 @@ def resolve_mrt_path() -> Path:
     return path_of("test.mrt")
 
 
-def numbered(node) -> list:
-    if node is None:
-        return []
-    if isinstance(node, list):
-        return node
-    if isinstance(node, dict):
-        if all(str(k).isdigit() for k in node):
-            return [node[k] for k in sorted(node, key=lambda x: int(x))]
-        return [node]
-    return []
-
-
-def mrt_summary(path: Path) -> dict:
-    """Короткий диагноз шаблона (полный .mrt тоже ок)."""
-    raw = path.read_text(encoding="utf-8-sig")
-    try:
-        report = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"json: {exc}", "bytes": len(raw)}
-    dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
-    sources = []
-    for src in numbered(dictionary.get("DataSources")):
-        if not isinstance(src, dict):
-            continue
-        sql = src.get("SqlCommand") or ""
-        cols = src.get("Columns")
-        col_count = len(cols) if isinstance(cols, (dict, list)) else 0
-        ident = src.get("Ident") or ""
-        name_in_source = src.get("NameInSource") or ""
-        sources.append(
-            {
-                "name": src.get("Name") or "",
-                "ident": ident,
-                "name_in_source": name_in_source,
-                "sql_len": len(sql) if isinstance(sql, str) else 0,
-                "columns": col_count,
-                "connect_on_start": src.get("ConnectOnStart"),
-                "ok_pg": ident == "StiPostgreSQLSource",
-            }
-        )
-    databases = []
-    for db in numbered(dictionary.get("Databases")):
-        if isinstance(db, dict):
-            ident = db.get("Ident") or ""
-            databases.append(
-                {
-                    "name": db.get("Name") or "",
-                    "ident": ident,
-                    "has_conn": bool(
-                        db.get("ConnectionString") or db.get("ConnectionStringEncrypted")
-                    ),
-                    "ok_pg": ident == "StiPostgreSQLDatabase",
-                }
-            )
-    rfu = 0
-    for var in numbered(dictionary.get("Variables")):
-        if isinstance(var, dict) and str(var.get("RequestFromUser")).lower() in {
-            "true",
-            "1",
-        }:
-            rfu += 1
-    hints: list[str] = []
-    bad_db = [d for d in databases if not d.get("ok_pg")]
-    bad_src = [s for s in sources if not s.get("ok_pg")]
-    if bad_db or bad_src:
-        hints.append(
-            "Postgres Ident: Database=StiPostgreSQLDatabase, Source=StiPostgreSQLSource. "
-            f"bad_db={[d.get('ident') for d in bad_db]} "
-            f"bad_src={[(s.get('name'), s.get('ident')) for s in bad_src]}"
-        )
-    db_names = {d.get("name") for d in databases if d.get("name")}
-    orphan = [
-        (s.get("name"), s.get("name_in_source"))
-        for s in sources
-        if s.get("name_in_source") and s.get("name_in_source") not in db_names
-    ]
-    if orphan and db_names:
-        hints.append(
-            f"NameInSource ≠ Databases.Name: {orphan} (db={sorted(db_names)})"
-        )
-    # RegionMap / индикаторы: Label (N1) vs Expression (Receipts.Field)
-    meters: list[dict] = []
-
-    def walk_meters(node, path: str = "") -> None:
-        if isinstance(node, dict):
-            for meter_key in ("KeyMeter", "NameMeter", "ValueMeter"):
-                m = node.get(meter_key)
-                if isinstance(m, dict) and (
-                    m.get("Expression") or m.get("Label") or m.get("Ident")
-                ):
-                    meters.append(
-                        {
-                            "path": f"{path}.{meter_key}" if path else meter_key,
-                            "ident": m.get("Ident") or "",
-                            "label": m.get("Label") or "",
-                            "expression": m.get("Expression") or "",
-                        }
-                    )
-            for k, v in node.items():
-                walk_meters(v, f"{path}.{k}" if path else str(k))
-        elif isinstance(node, list):
-            for i, v in enumerate(node):
-                walk_meters(v, f"{path}[{i}]")
-
-    walk_meters(report.get("Pages"))
-    label_only = [
-        m
-        for m in meters
-        if m.get("label") and not (m.get("expression") or "").strip()
-    ]
-    if label_only:
-        hints.append(
-            "Есть Label без Expression (на карте часто виден N1/N2 без числа): "
-            f"{[(m.get('label'), m.get('path')) for m in label_only[:8]]}"
-        )
-
-    panels: list[dict] = []
-    try:
-        catalog = catalog_from_report(report)
-        panels = catalog.get("panels") or []
-    except Exception as exc:
-        hints.append(f"panels extract failed: {exc}")
-
-    return {
-        "ok": True,
-        "bytes": len(raw),
-        "request_parameters": report.get("RequestParameters"),
-        "parameters_display_mode": report.get("ParametersDisplayMode"),
-        "databases": databases,
-        "sources": sources,
-        "request_from_user_count": rfu,
-        "meters": meters[:40],
-        "meters_count": len(meters),
-        "panels": panels,
-        "panels_count": len(panels),
-        "hints": hints,
-    }
-
-
 load_env()
 
 MRT_PATH = resolve_mrt_path()
@@ -243,17 +99,10 @@ if not MRT_PATH.is_file():
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
-# панель фильтров: иначе дефолт Stimulsoft (min=5) кладёт поля построчно
 PARAMETERS_PANEL_COLUMNS = int(os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") or "3")
 PARAMETERS_PANEL_MAX_HEIGHT = int(
     os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
 )
-_sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
-SQL_LOG_PATH = path_of(_sql_log_raw)
-SQL_LOG: deque[dict] = deque(maxlen=100)
-# последний ответ адаптера по имени DataSource → что реально «попало» в метры
-LAST_SOURCE_DATA: dict[str, dict] = {}
-SAMPLE_ROWS = int(os.environ.get("SQL_SAMPLE_ROWS", "5") or "5")
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
@@ -265,391 +114,13 @@ if not PG_CONN:
 app = Flask(__name__)
 
 
-def _params_preview(params: object) -> dict:
-    out: dict = {}
-    if not params:
-        return out
-    items = params.items() if hasattr(params, "items") else []
-    for name, param in items:
-        if hasattr(param, "value"):
-            out[str(name)] = getattr(param, "value", None)
-        else:
-            out[str(name)] = param
-    return out
-
-
-def _json_safe(value: object) -> object:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    return str(value)
-
-
-def _sql_log_write(entry: dict) -> None:
-    row = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"), **entry}
-    row = _json_safe(row)
-    SQL_LOG.appendleft(row)
-    try:
-        with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        print(f"[viewer] sql_log write failed: {exc}", flush=True)
-
-
-def _reset_sql_log() -> None:
-    LAST_SOURCE_DATA.clear()
-    try:
-        SQL_LOG_PATH.write_text(
-            json.dumps(
-                {
-                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "phase": "session",
-                    "mrt": str(MRT_PATH.resolve()),
-                    "format": "JSONL: begin(sql,params) → end(rows,cols,sample_rows,notice)",
-                },
-                ensure_ascii=False,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        print(f"[viewer] sql_log reset failed: {exc}", flush=True)
-
-
-def _source_names_from_component(comp: dict) -> list[str]:
-    """Имена DataSource, на которые ссылается компонент (data_source + Expression)."""
-    names: list[str] = []
-    ds = comp.get("data_source")
-    if isinstance(ds, str) and ds.strip():
-        names.append(ds.strip())
-    for expr in comp.get("expressions") or []:
-        if not isinstance(expr, str):
-            continue
-        # Sum(Receipts.Amount) / Receipts.Field / {Receipts.Field}
-        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.", expr):
-            name = m.group(1)
-            if name not in names and name.lower() not in {
-                "sum",
-                "count",
-                "avg",
-                "min",
-                "max",
-                "round",
-                "switch",
-                "abs",
-            }:
-                names.append(name)
-    for bucket in (comp.get("meters") or {}).values():
-        if not isinstance(bucket, list):
-            continue
-        for meter in bucket:
-            if not isinstance(meter, dict):
-                continue
-            expr = meter.get("expression")
-            if not isinstance(expr, str):
-                continue
-            for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.", expr):
-                name = m.group(1)
-                if name not in names and name.lower() not in {
-                    "sum",
-                    "count",
-                    "avg",
-                    "min",
-                    "max",
-                    "round",
-                    "switch",
-                    "abs",
-                }:
-                    names.append(name)
-    return names
-
-
-def _panels_with_source_data(panels_list: list[dict]) -> list[dict]:
-    """Панель → компоненты → что пришло из SQL по связанным источникам."""
-    out = []
-    for panel in panels_list:
-        if not isinstance(panel, dict):
-            continue
-        comps_out = []
-        for comp in panel.get("components") or []:
-            if not isinstance(comp, dict):
-                continue
-            sources = _source_names_from_component(comp)
-            from_sources = []
-            for name in sources:
-                hit = LAST_SOURCE_DATA.get(name)
-                if hit is None:
-                    from_sources.append(
-                        {
-                            "source": name,
-                            "loaded": False,
-                            "hint": "источник ещё не запрашивался или имя не совпало",
-                        }
-                    )
-                else:
-                    from_sources.append(
-                        {
-                            "source": name,
-                            "loaded": True,
-                            "success": hit.get("success"),
-                            "rows": hit.get("rows"),
-                            "columns": hit.get("columns"),
-                            "sample_rows": hit.get("sample_rows"),
-                            "notice": hit.get("notice"),
-                            "params": hit.get("params"),
-                            "sql": hit.get("sql"),
-                            "put": (
-                                "пусто — в компонент нечего ставить"
-                                if not hit.get("rows")
-                                else f"пришло {hit.get('rows')} строк, cols={hit.get('columns')}"
-                            ),
-                        }
-                    )
-            meters_view = []
-            for bucket, items in (comp.get("meters") or {}).items():
-                if not isinstance(items, list):
-                    continue
-                for meter in items:
-                    if not isinstance(meter, dict):
-                        continue
-                    meters_view.append(
-                        {
-                            "meter": bucket,
-                            "label": meter.get("label"),
-                            "expression": meter.get("expression"),
-                            "wants_fields": re.findall(
-                                r"\b[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)",
-                                str(meter.get("expression") or ""),
-                            ),
-                        }
-                    )
-            comps_out.append(
-                {
-                    "name": comp.get("name"),
-                    "type": comp.get("type"),
-                    "role": comp.get("role"),
-                    "title": comp.get("title"),
-                    "meters": meters_view or comp.get("meters"),
-                    "expressions": comp.get("expressions"),
-                    "sources_used": sources,
-                    "from_sources": from_sources,
-                }
-            )
-        out.append(
-            {
-                "page": panel.get("page"),
-                "panel": panel.get("panel"),
-                "path": panel.get("path"),
-                "components_count": len(comps_out),
-                "components": comps_out,
-            }
-        )
-    return out
-
-
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подставить Postgres connection; SQL/параметры — как в .mrt.
-
-    Клиент шлёт database='PostgreSQL' только если в .mrt:
-      Databases[].Ident = StiPostgreSQLDatabase
-      DataSources[].Ident = StiPostgreSQLSource
-      DataSources[].NameInSource = Databases[].Name
-    Иначе адаптер «не понимает» source.
-    """
-    src = getattr(args, "dataSource", None) or "?"
-    cmd = getattr(args, "command", None) or "?"
-    db = getattr(args, "database", None) or "?"
-    conn = getattr(args, "connection", None) or "?"
-    q = getattr(args, "queryString", None) or ""
-    params = getattr(args, "parameters", None) or {}
-    preview = _params_preview(params)
-    # запомним SQL на endProcessData (rows=0 → показать запрос)
-    args._viewer_sql = q  # noqa: SLF001
-    args._viewer_params = preview  # noqa: SLF001
-    print(
-        f"[viewer] beginProcessData cmd={cmd} database={db!r} connection={conn!r} "
-        f"source={src!r} sql_len={len(q)} params={preview}",
-        flush=True,
-    )
-    if str(db) not in {"PostgreSQL", "?", ""} and "postgres" not in str(db).lower():
-        print(
-            f"[viewer] WARN database={db!r} — нужен PostgreSQL. "
-            "В .mrt Ident должен быть StiPostgreSQLDatabase / StiPostgreSQLSource",
-            flush=True,
-        )
-    if not q.strip() and str(cmd).lower() in {
-        "executequery",
-        "executesql",
-        "select",
-        "stiexecutequery",
-    }:
-        print("[viewer] пустой SqlCommand — метры/Expression не на чем считать", flush=True)
-    _sql_log_write(
-        {
-            "phase": "begin",
-            "command": str(cmd),
-            "database": str(db),
-            "connection": str(conn),
-            "source": str(src),
-            "params": preview,
-            "sql": q,
-            "sql_len": len(q),
-        }
-    )
     if PG_CONN:
         args.connectionString = PG_CONN
 
 
-def end_process_data(args: StiDataEventArgs) -> None:
-    """Лог результата: rows=0 → карта остаётся с Label N1/N2 без чисел."""
-    src = getattr(args, "dataSource", None) or "?"
-    result = getattr(args, "result", None)
-    sql = getattr(args, "_viewer_sql", None) or getattr(args, "queryString", "") or ""
-    preview = getattr(args, "_viewer_params", None) or _params_preview(
-        getattr(args, "parameters", None)
-    )
-    if result is None:
-        entry = {
-            "phase": "end",
-            "source": str(src),
-            "success": None,
-            "rows": None,
-            "columns": [],
-            "notice": None,
-            "params": preview,
-            "sql": sql,
-        }
-        _sql_log_write(entry)
-        print(f"[viewer] endProcessData source={src!r} result=None", flush=True)
-        return
-    ok = getattr(result, "success", None)
-    notice = getattr(result, "notice", None)
-    count = getattr(result, "count", None)
-    cols = getattr(result, "columns", None) or []
-    # Stimulsoft иногда отдаёт list[str], иногда объекты с .name
-    col_names: list[str] = []
-    for c in cols:
-        if isinstance(c, str):
-            col_names.append(c)
-        else:
-            col_names.append(
-                str(
-                    getattr(c, "name", None)
-                    or getattr(c, "Name", None)
-                    or c
-                )
-            )
-    raw_rows = getattr(result, "rows", None) or []
-    sample_rows: list = []
-    if isinstance(raw_rows, list) and raw_rows:
-        for row in raw_rows[: max(0, SAMPLE_ROWS)]:
-            sample_rows.append(_json_safe(row))
-    entry = {
-        "phase": "end",
-        "source": str(src),
-        "success": ok,
-        "rows": count,
-        "columns": col_names,
-        "sample_rows": sample_rows,
-        "notice": notice,
-        "params": preview,
-        "sql": sql,
-    }
-    _sql_log_write(entry)
-    if src and src != "?":
-        LAST_SOURCE_DATA[str(src)] = {
-            "success": ok,
-            "rows": count,
-            "columns": col_names,
-            "sample_rows": sample_rows,
-            "notice": notice,
-            "params": preview,
-            "sql": sql,
-        }
-    print(
-        f"[viewer] endProcessData source={src!r} success={ok} "
-        f"rows={count} cols={col_names} notice={notice!r}",
-        flush=True,
-    )
-    if count == 0 or count == "0":
-        print(
-            f"[viewer] rows=0 → в панели/метры из {src!r} ничего не поставилось. "
-            f"params={preview} → /panels или {SQL_LOG_PATH.name}",
-            flush=True,
-        )
-    elif ok and src and src != "?" and col_names:
-        print(
-            f"[viewer] в {src!r} пришло rows={count}, sample={len(sample_rows)} "
-            f"→ /panels покажет что ушло в компоненты",
-            flush=True,
-        )
-
-
-@app.get("/mrt")
-def serve_mrt():
-    """Отдать .mrt как есть (relative URL, как в сэмпле Stimulsoft)."""
-    raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    # .mrt JSON; text/plain тоже ок, json удобнее в DevTools
-    resp = Response(raw, mimetype="application/json; charset=utf-8")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.get("/debug")
-def debug():
-    """Что в текущем MRT_PATH: sources/RequestParameters + последние SQL."""
-    info = mrt_summary(MRT_PATH)
-    info["mrt_path"] = str(MRT_PATH.resolve())
-    info["pg_conn_set"] = bool(PG_CONN)
-    info["sql_log_path"] = str(SQL_LOG_PATH.resolve())
-    info["sql_log"] = list(SQL_LOG)[:40]
-    if info.get("request_parameters") in (True, "true", "True", 1, "1"):
-        info.setdefault("hints", []).append(
-            "RequestParameters=true → SQL/метры ждут Submit; до Submit часто только Label (N1)."
-        )
-    return info
-
-
-@app.get("/sql")
-def sql_trace():
-    """Последние SQL из памяти + путь к JSONL-файлу."""
-    return {
-        "path": str(SQL_LOG_PATH.resolve()),
-        "count": len(SQL_LOG),
-        "entries": list(SQL_LOG)[:80],
-    }
-
-
-@app.get("/panels")
-def panels():
-    """Панель → компоненты → что реально пришло из DataSources (SQL sample_rows).
-
-    Сначала открой /, дождись запросов, потом /panels — иначе from_sources.loaded=false.
-    """
-    try:
-        catalog = catalog_from_report(load_mrt(MRT_PATH))
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "mrt_path": str(MRT_PATH.resolve())}
-    panels_list = catalog.get("panels") or []
-    enriched = _panels_with_source_data(panels_list)
-    return {
-        "ok": True,
-        "mrt_path": str(MRT_PATH.resolve()),
-        "panels_count": len(enriched),
-        "sources_loaded": sorted(LAST_SOURCE_DATA.keys()),
-        "note": (
-            "from_sources = что адаптер вернул по имени source из Expression/data_source. "
-            "rows=0 → в компонент Stimulsoft ничего не поставил (остаётся Label N1/N2)."
-        ),
-        "panels": enriched,
-    }
-
-
 def save_report(args: StiReportEventArgs):
-    """Save / Save As из designer → MRT_PATH (тот же файл, что смотрит viewer)."""
+    """Save / Save As из designer → MRT_PATH."""
     if args.report is None:
         return StiResult.getError("пустой report — нечего сохранять")
     try:
@@ -657,23 +128,26 @@ def save_report(args: StiReportEventArgs):
         MRT_PATH.write_text(text + "\n", encoding="utf-8")
     except OSError as exc:
         return StiResult.getError(str(exc))
-    name = args.fileName or MRT_PATH.name
-    print(f"[designer] saved → {MRT_PATH.resolve()} (as {name!r})", flush=True)
     return f"Сохранено в {MRT_PATH.name}"
+
+
+@app.get("/mrt")
+def serve_mrt():
+    raw = MRT_PATH.read_text(encoding="utf-8-sig")
+    resp = Response(raw, mimetype="application/json; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
-    """HTML5 designer: правь дашборд, Save пишет в MRT_PATH."""
     sti = StiDesigner()
     sti.id = "designer"
     sti.options.appearance.fullScreenMode = True
     sti.options.toolbar.showFileMenuExit = True
     sti.onBeginProcessData += begin_process_data
-    sti.onEndProcessData += end_process_data
     sti.onSaveReport += save_report
     sti.onSaveAsReport += save_report
-    # Exit → обратно во viewer
     sti.javascript.appendHead(
         '<script>function designerExit(){ window.location = "/"; }</script>'
     )
@@ -700,9 +174,7 @@ def viewer():
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
     sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
     sti.options.toolbar.showDesignButton = True
-    # как в Samples: handler только на viewer
     sti.onBeginProcessData += begin_process_data
-    sti.onEndProcessData += end_process_data
     sti.javascript.appendHead(
         '<script>function goDesigner(){ window.location = "/designer"; }</script>'
     )
@@ -712,7 +184,6 @@ def viewer():
         return sti.getFrameworkResponse()
 
     report = StiReport()
-    # relative /mrt — без _external (localhost vs 127.0.0.1 ломал loadFile)
     report.loadFile(url_for("serve_mrt"))
     sti.report = report
     return sti.getFrameworkResponse()
@@ -720,59 +191,9 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    _reset_sql_log()
-    summary = mrt_summary(MRT_PATH)
-    print(f"MRT:  {MRT_PATH.resolve()} ({summary.get('bytes')} bytes)", flush=True)
-    print(f"DB:   connection string from .env", flush=True)
-    print(f"SQL:  {SQL_LOG_PATH.resolve()} (JSONL)", flush=True)
-    if summary.get("ok"):
-        print(
-            f"MRT:  RequestParameters={summary.get('request_parameters')} "
-            f"RFU={summary.get('request_from_user_count')} "
-            f"sources={len(summary.get('sources') or [])}",
-            flush=True,
-        )
-        for db in summary.get("databases") or []:
-            mark = "OK" if db.get("ok_pg") else "BAD"
-            print(
-                f"  db[{mark}] name={db.get('name')!r} ident={db.get('ident')!r} "
-                f"has_conn={db.get('has_conn')}",
-                flush=True,
-            )
-        for src in summary.get("sources") or []:
-            mark = "OK" if src.get("ok_pg") else "BAD"
-            print(
-                f"  src[{mark}] name={src.get('name')!r} ident={src.get('ident')!r} "
-                f"NameInSource={src.get('name_in_source')!r} "
-                f"sql_len={src.get('sql_len')} cols={src.get('columns')} "
-                f"ConnectOnStart={src.get('connect_on_start')!r}",
-                flush=True,
-            )
-        for hint in summary.get("hints") or []:
-            print(f"NOTE: {hint}", flush=True)
-        if summary.get("request_parameters") in (True, "true", "True", 1, "1"):
-            print(
-                "NOTE: RequestParameters=true — нажми Submit, иначе метры без данных (виден Label N1)",
-                flush=True,
-            )
-        if all((s.get("sql_len") or 0) == 0 for s in (summary.get("sources") or [1])):
-            print(
-                "WARNING: у всех DataSources sql_len=0 — похоже на scrubbed/не тот MRT_PATH",
-                flush=True,
-            )
-    else:
-        print(f"MRT ERROR: {summary.get('error')}", flush=True)
+    print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
     print(f"Open:     {url}", flush=True)
-    print(f"Designer: {url}designer  (правка дашборда, Save → MRT_PATH)", flush=True)
-    print(f"Debug:    {url}debug", flush=True)
-    print(f"SQL:      {url}sql", flush=True)
-    print(
-        f"Panels:   {url}panels  (панель → компоненты ← данные из SQL sources)",
-        flush=True,
-    )
-
-    if summary.get("panels_count"):
-        print(f"Panels in MRT: {summary.get('panels_count')}", flush=True)
+    print(f"Designer: {url}designer", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
