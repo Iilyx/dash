@@ -6,5 +6,5 @@ mcp==2.3.0
 
 # Stimulsoft Dashboards.PYTHON viewer (view_dashboard.py)
 flask>=3.0
-stimulsoft-dashboards==2024.4.5
+stimulsoft-dashboards==2024.2.6
 psycopg[binary]>=3.1

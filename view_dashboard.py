@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Минимальный viewer: .mrt + Postgres connection.
 
-Stimulsoft Dashboards.PYTHON 2024.x
+Stimulsoft Dashboards.PYTHON 2024.2.6
   StiViewer + loadFile(.mrt) + onBeginProcessData(connectionString).
 
 Запуск:
-  MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
+  # в .env: MRT_PATH=.../dashboard.mrt
+  .venv/bin/python view_dashboard.py
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request, url_for
-from stimulsoft_reports import StiLicense
+from stimulsoft_reports.classes.StiLicenseStatic import StiLicenseStatic as StiLicense
 from stimulsoft_reports.events import StiDataEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
@@ -29,6 +30,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def load_env() -> None:
+    """Читает .env; значения из файла перекрывают уже заданные в окружении."""
     path = ROOT / ".env"
     if not path.is_file():
         return
@@ -37,7 +39,7 @@ def load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+        os.environ[k.strip()] = v.strip().strip("'\"")
 
 
 def path_of(raw: str) -> Path:
@@ -75,29 +77,33 @@ def stimulsoft_pg_connection_string(url: str) -> str:
 
 
 def resolve_mrt_path() -> Path:
-    env_path = os.environ.get("MRT_PATH", "").strip()
+    """Путь к .mrt из MRT_PATH в .env (опционально: argv перекрывает)."""
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         return path_of(sys.argv[1])
-    if env_path:
-        return path_of(env_path)
-    return path_of("test.mrt")
+    env_path = os.environ.get("MRT_PATH", "").strip()
+    if not env_path:
+        raise SystemExit("Задай MRT_PATH в .env — путь к .mrt")
+    return path_of(env_path)
 
 
-def apply_license() -> None:
-    """Ключ из .env — иначе Stimulsoft идёт как trial (часто без регистрации)."""
+def apply_license() -> str:
+    """Ключ из .env → Stimulsoft.Base.StiLicense. Пусто = trial."""
     key = os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
     key_file = os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
     if key:
         StiLicense.setKey(key)
-        return
+        return f"key ({len(key)} chars)"
     if key_file:
         path = path_of(key_file)
         if path.is_file():
-            StiLicense.setFile(str(path))
+            StiLicense.setFile(str(path.resolve()))
+            return f"file ({path.name})"
+        return f"file missing: {path}"
+    return "not set (trial)"
 
 
 load_env()
-apply_license()
+LICENSE_STATUS = apply_license()
 
 MRT_PATH = resolve_mrt_path()
 if not MRT_PATH.is_file():
@@ -142,7 +148,6 @@ def viewer():
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
     sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
-    sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
     sti.onBeginProcessData += begin_process_data
 
@@ -157,8 +162,9 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    print(f"MRT:  {MRT_PATH.resolve()}", flush=True)
-    print(f"Open: {url}", flush=True)
+    print(f"MRT:     {MRT_PATH.resolve()}", flush=True)
+    print(f"License: {LICENSE_STATUS}", flush=True)
+    print(f"Open:    {url}", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
