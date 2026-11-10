@@ -22,6 +22,7 @@ from flask import Flask, Response, request, url_for
 from stimulsoft_reports.events import StiDataEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
 ROOT = Path(__file__).resolve().parent
 
@@ -90,6 +91,11 @@ if not MRT_PATH.is_file():
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
+# панель фильтров: иначе дефолт Stimulsoft (min=5) кладёт поля построчно
+PARAMETERS_PANEL_COLUMNS = int(os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") or "3")
+PARAMETERS_PANEL_MAX_HEIGHT = int(
+    os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
+)
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
@@ -122,6 +128,10 @@ def viewer():
     sti = StiViewer()
     sti.id = "viewer"
     sti.options.appearance.fullScreenMode = True
+    sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
+    sti.options.appearance.minParametersCountForMultiColumns = 1
+    sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
     sti.onBeginProcessData += begin_process_data
 
     if sti.processRequest(request):
