@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import webbrowser
 from collections import deque
@@ -243,6 +244,9 @@ PARAMETERS_PANEL_MAX_HEIGHT = int(
 _sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
 SQL_LOG_PATH = path_of(_sql_log_raw)
 SQL_LOG: deque[dict] = deque(maxlen=100)
+# последний ответ адаптера по имени DataSource → что реально «попало» в метры
+LAST_SOURCE_DATA: dict[str, dict] = {}
+SAMPLE_ROWS = int(os.environ.get("SQL_SAMPLE_ROWS", "5") or "5")
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
@@ -289,6 +293,7 @@ def _sql_log_write(entry: dict) -> None:
 
 
 def _reset_sql_log() -> None:
+    LAST_SOURCE_DATA.clear()
     try:
         SQL_LOG_PATH.write_text(
             json.dumps(
@@ -296,7 +301,7 @@ def _reset_sql_log() -> None:
                     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "phase": "session",
                     "mrt": str(MRT_PATH.resolve()),
-                    "format": "JSONL: begin(sql,params) → end(rows,cols,notice)",
+                    "format": "JSONL: begin(sql,params) → end(rows,cols,sample_rows,notice)",
                 },
                 ensure_ascii=False,
             )
@@ -305,6 +310,137 @@ def _reset_sql_log() -> None:
         )
     except OSError as exc:
         print(f"[viewer] sql_log reset failed: {exc}", flush=True)
+
+
+def _source_names_from_component(comp: dict) -> list[str]:
+    """Имена DataSource, на которые ссылается компонент (data_source + Expression)."""
+    names: list[str] = []
+    ds = comp.get("data_source")
+    if isinstance(ds, str) and ds.strip():
+        names.append(ds.strip())
+    for expr in comp.get("expressions") or []:
+        if not isinstance(expr, str):
+            continue
+        # Sum(Receipts.Amount) / Receipts.Field / {Receipts.Field}
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.", expr):
+            name = m.group(1)
+            if name not in names and name.lower() not in {
+                "sum",
+                "count",
+                "avg",
+                "min",
+                "max",
+                "round",
+                "switch",
+                "abs",
+            }:
+                names.append(name)
+    for bucket in (comp.get("meters") or {}).values():
+        if not isinstance(bucket, list):
+            continue
+        for meter in bucket:
+            if not isinstance(meter, dict):
+                continue
+            expr = meter.get("expression")
+            if not isinstance(expr, str):
+                continue
+            for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.", expr):
+                name = m.group(1)
+                if name not in names and name.lower() not in {
+                    "sum",
+                    "count",
+                    "avg",
+                    "min",
+                    "max",
+                    "round",
+                    "switch",
+                    "abs",
+                }:
+                    names.append(name)
+    return names
+
+
+def _panels_with_source_data(panels_list: list[dict]) -> list[dict]:
+    """Панель → компоненты → что пришло из SQL по связанным источникам."""
+    out = []
+    for panel in panels_list:
+        if not isinstance(panel, dict):
+            continue
+        comps_out = []
+        for comp in panel.get("components") or []:
+            if not isinstance(comp, dict):
+                continue
+            sources = _source_names_from_component(comp)
+            from_sources = []
+            for name in sources:
+                hit = LAST_SOURCE_DATA.get(name)
+                if hit is None:
+                    from_sources.append(
+                        {
+                            "source": name,
+                            "loaded": False,
+                            "hint": "источник ещё не запрашивался или имя не совпало",
+                        }
+                    )
+                else:
+                    from_sources.append(
+                        {
+                            "source": name,
+                            "loaded": True,
+                            "success": hit.get("success"),
+                            "rows": hit.get("rows"),
+                            "columns": hit.get("columns"),
+                            "sample_rows": hit.get("sample_rows"),
+                            "notice": hit.get("notice"),
+                            "params": hit.get("params"),
+                            "sql": hit.get("sql"),
+                            "put": (
+                                "пусто — в компонент нечего ставить"
+                                if not hit.get("rows")
+                                else f"пришло {hit.get('rows')} строк, cols={hit.get('columns')}"
+                            ),
+                        }
+                    )
+            meters_view = []
+            for bucket, items in (comp.get("meters") or {}).items():
+                if not isinstance(items, list):
+                    continue
+                for meter in items:
+                    if not isinstance(meter, dict):
+                        continue
+                    meters_view.append(
+                        {
+                            "meter": bucket,
+                            "label": meter.get("label"),
+                            "expression": meter.get("expression"),
+                            "wants_fields": re.findall(
+                                r"\b[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)",
+                                str(meter.get("expression") or ""),
+                            ),
+                        }
+                    )
+            comps_out.append(
+                {
+                    "name": comp.get("name"),
+                    "type": comp.get("type"),
+                    "role": comp.get("role"),
+                    "title": comp.get("title"),
+                    "meters": meters_view or comp.get("meters"),
+                    "expressions": comp.get("expressions"),
+                    "sources_used": sources,
+                    "from_sources": from_sources,
+                }
+            )
+        out.append(
+            {
+                "page": panel.get("page"),
+                "panel": panel.get("panel"),
+                "path": panel.get("path"),
+                "components_count": len(comps_out),
+                "components": comps_out,
+            }
+        )
+    return out
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
@@ -399,17 +535,33 @@ def end_process_data(args: StiDataEventArgs) -> None:
                     or c
                 )
             )
+    raw_rows = getattr(result, "rows", None) or []
+    sample_rows: list = []
+    if isinstance(raw_rows, list) and raw_rows:
+        for row in raw_rows[: max(0, SAMPLE_ROWS)]:
+            sample_rows.append(_json_safe(row))
     entry = {
         "phase": "end",
         "source": str(src),
         "success": ok,
         "rows": count,
         "columns": col_names,
+        "sample_rows": sample_rows,
         "notice": notice,
         "params": preview,
         "sql": sql,
     }
     _sql_log_write(entry)
+    if src and src != "?":
+        LAST_SOURCE_DATA[str(src)] = {
+            "success": ok,
+            "rows": count,
+            "columns": col_names,
+            "sample_rows": sample_rows,
+            "notice": notice,
+            "params": preview,
+            "sql": sql,
+        }
     print(
         f"[viewer] endProcessData source={src!r} success={ok} "
         f"rows={count} cols={col_names} notice={notice!r}",
@@ -417,13 +569,14 @@ def end_process_data(args: StiDataEventArgs) -> None:
     )
     if count == 0 or count == "0":
         print(
-            f"[viewer] rows=0 → метры/карта без значений (виден только Label). "
-            f"params={preview} → см. {SQL_LOG_PATH.name}",
+            f"[viewer] rows=0 → в панели/метры из {src!r} ничего не поставилось. "
+            f"params={preview} → /panels или {SQL_LOG_PATH.name}",
             flush=True,
         )
     elif ok and src and src != "?" and col_names:
         print(
-            f"[viewer] map/метры: Expression Sum({src}.<поле>), поле ∈ {col_names}",
+            f"[viewer] в {src!r} пришло rows={count}, sample={len(sample_rows)} "
+            f"→ /panels покажет что ушло в компоненты",
             flush=True,
         )
 
@@ -465,17 +618,26 @@ def sql_trace():
 
 @app.get("/panels")
 def panels():
-    """Каждый StiPanelElement → значения дочерних компонентов (meters/expressions/…)."""
+    """Панель → компоненты → что реально пришло из DataSources (SQL sample_rows).
+
+    Сначала открой /, дождись запросов, потом /panels — иначе from_sources.loaded=false.
+    """
     try:
         catalog = catalog_from_report(load_mrt(MRT_PATH))
     except Exception as exc:
         return {"ok": False, "error": str(exc), "mrt_path": str(MRT_PATH.resolve())}
     panels_list = catalog.get("panels") or []
+    enriched = _panels_with_source_data(panels_list)
     return {
         "ok": True,
         "mrt_path": str(MRT_PATH.resolve()),
-        "panels_count": len(panels_list),
-        "panels": panels_list,
+        "panels_count": len(enriched),
+        "sources_loaded": sorted(LAST_SOURCE_DATA.keys()),
+        "note": (
+            "from_sources = что адаптер вернул по имени source из Expression/data_source. "
+            "rows=0 → в компонент Stimulsoft ничего не поставил (остаётся Label N1/N2)."
+        ),
+        "panels": enriched,
     }
 
 
@@ -550,7 +712,11 @@ def main() -> None:
     print(f"Open:   {url}", flush=True)
     print(f"Debug:  {url}debug", flush=True)
     print(f"SQL:    {url}sql", flush=True)
-    print(f"Panels: {url}panels  (StiPanelElement → components)", flush=True)
+    print(
+        f"Panels: {url}panels  (панель → компоненты ← данные из SQL sources)",
+        flush=True,
+    )
+
     if summary.get("panels_count"):
         print(f"Panels in MRT: {summary.get('panels_count')}", flush=True)
     if OPEN_BROWSER:
