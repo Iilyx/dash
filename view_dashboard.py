@@ -238,6 +238,19 @@ if not PG_CONN:
 app = Flask(__name__)
 
 
+def _params_preview(params: object) -> dict:
+    out: dict = {}
+    if not params:
+        return out
+    items = params.items() if hasattr(params, "items") else []
+    for name, param in items:
+        if hasattr(param, "value"):
+            out[str(name)] = getattr(param, "value", None)
+        else:
+            out[str(name)] = param
+    return out
+
+
 def begin_process_data(args: StiDataEventArgs) -> None:
     """Подставить Postgres connection; SQL/параметры — как в .mrt.
 
@@ -253,9 +266,13 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     conn = getattr(args, "connection", None) or "?"
     q = getattr(args, "queryString", None) or ""
     params = getattr(args, "parameters", None) or {}
+    preview = _params_preview(params)
+    # запомним SQL на endProcessData (rows=0 → показать запрос)
+    args._viewer_sql = q  # noqa: SLF001
+    args._viewer_params = preview  # noqa: SLF001
     print(
         f"[viewer] beginProcessData cmd={cmd} database={db!r} connection={conn!r} "
-        f"source={src!r} sql_len={len(q)} params={list(params) if params else []}",
+        f"source={src!r} sql_len={len(q)} params={preview}",
         flush=True,
     )
     if str(db) not in {"PostgreSQL", "?", ""} and "postgres" not in str(db).lower():
@@ -276,7 +293,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """Лог результата адаптера — имена колонок = то, что видит Expression Receipts.поле."""
+    """Лог результата: rows=0 → карта остаётся с Label N1/N2 без чисел."""
     src = getattr(args, "dataSource", None) or "?"
     result = getattr(args, "result", None)
     if result is None:
@@ -304,10 +321,24 @@ def end_process_data(args: StiDataEventArgs) -> None:
         f"rows={count} cols={col_names} notice={notice!r}",
         flush=True,
     )
-    if ok and src and src != "?" and col_names:
+    if count == 0 or count == "0":
+        sql = getattr(args, "_viewer_sql", None) or getattr(args, "queryString", "") or ""
+        preview = getattr(args, "_viewer_params", None) or _params_preview(
+            getattr(args, "parameters", None)
+        )
         print(
-            f"[viewer] map/метры ждут Expression вроде Sum({src}.<поле>) — "
-            f"поле должно быть в cols выше",
+            f"[viewer] rows=0 → метры/карта без значений (виден только Label). "
+            f"params={preview}",
+            flush=True,
+        )
+        if sql:
+            one_line = " ".join(str(sql).split())
+            if len(one_line) > 500:
+                one_line = one_line[:500] + "…"
+            print(f"[viewer] sql={one_line}", flush=True)
+    elif ok and src and src != "?" and col_names:
+        print(
+            f"[viewer] map/метры: Expression Sum({src}.<поле>), поле ∈ {col_names}",
             flush=True,
         )
 
