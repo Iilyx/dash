@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Минимальный viewer: .mrt + Postgres connection.
+"""Минимальный viewer + designer: .mrt + Postgres connection.
 
 Как в Samples-Dashboards.Python:
-  StiViewer + loadFile(.mrt) + onBeginProcessData(connectionString).
+  StiViewer / StiDesigner + loadFile(.mrt) + onBeginProcessData(connectionString).
+  Save в designer пишет обратно в MRT_PATH.
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
+  Открой /designer — правь дашборд, Save → тот же .mrt.
 """
 
 from __future__ import annotations
@@ -23,10 +25,15 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request, url_for
-from stimulsoft_reports.events import StiDataEventArgs
+from stimulsoft_reports import StiResult
+from stimulsoft_reports.designer import StiDesigner
+from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
-from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
+from stimulsoft_reports.viewer.enums import (
+    StiParametersPanelPosition,
+    StiToolbarDisplayMode,
+)
 
 from extract_mrt import catalog_from_report, load_mrt
 
@@ -641,6 +648,46 @@ def panels():
     }
 
 
+def save_report(args: StiReportEventArgs):
+    """Save / Save As из designer → MRT_PATH (тот же файл, что смотрит viewer)."""
+    if args.report is None:
+        return StiResult.getError("пустой report — нечего сохранять")
+    try:
+        text = json.dumps(args.report, ensure_ascii=False, indent=2)
+        MRT_PATH.write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        return StiResult.getError(str(exc))
+    name = args.fileName or MRT_PATH.name
+    print(f"[designer] saved → {MRT_PATH.resolve()} (as {name!r})", flush=True)
+    return f"Сохранено в {MRT_PATH.name}"
+
+
+@app.route("/designer", methods=["GET", "POST"])
+def designer():
+    """HTML5 designer: правь дашборд, Save пишет в MRT_PATH."""
+    sti = StiDesigner()
+    sti.id = "designer"
+    sti.options.appearance.fullScreenMode = True
+    sti.options.toolbar.showFileMenuExit = True
+    sti.onBeginProcessData += begin_process_data
+    sti.onEndProcessData += end_process_data
+    sti.onSaveReport += save_report
+    sti.onSaveAsReport += save_report
+    # Exit → обратно во viewer
+    sti.javascript.appendHead(
+        '<script>function designerExit(){ window.location = "/"; }</script>'
+    )
+    sti.onExit += "designerExit"
+
+    if sti.processRequest(request):
+        return sti.getFrameworkResponse()
+
+    report = StiReport()
+    report.loadFile(url_for("serve_mrt"))
+    sti.report = report
+    return sti.getFrameworkResponse()
+
+
 @app.route("/", methods=["GET", "POST"])
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
@@ -651,9 +698,15 @@ def viewer():
     sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
     sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
+    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
+    sti.options.toolbar.showDesignButton = True
     # как в Samples: handler только на viewer
     sti.onBeginProcessData += begin_process_data
     sti.onEndProcessData += end_process_data
+    sti.javascript.appendHead(
+        '<script>function goDesigner(){ window.location = "/designer"; }</script>'
+    )
+    sti.onDesignReport += "goDesigner"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -709,11 +762,12 @@ def main() -> None:
             )
     else:
         print(f"MRT ERROR: {summary.get('error')}", flush=True)
-    print(f"Open:   {url}", flush=True)
-    print(f"Debug:  {url}debug", flush=True)
-    print(f"SQL:    {url}sql", flush=True)
+    print(f"Open:     {url}", flush=True)
+    print(f"Designer: {url}designer  (правка дашборда, Save → MRT_PATH)", flush=True)
+    print(f"Debug:    {url}debug", flush=True)
+    print(f"SQL:      {url}sql", flush=True)
     print(
-        f"Panels: {url}panels  (панель → компоненты ← данные из SQL sources)",
+        f"Panels:   {url}panels  (панель → компоненты ← данные из SQL sources)",
         flush=True,
     )
 
