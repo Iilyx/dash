@@ -14,6 +14,8 @@ import json
 import os
 import sys
 import webbrowser
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
@@ -227,6 +229,9 @@ PARAMETERS_PANEL_COLUMNS = int(os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") o
 PARAMETERS_PANEL_MAX_HEIGHT = int(
     os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
 )
+_sql_log_raw = os.environ.get("SQL_LOG_PATH", "sql_trace.json").strip() or "sql_trace.json"
+SQL_LOG_PATH = path_of(_sql_log_raw)
+SQL_LOG: deque[dict] = deque(maxlen=100)
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
@@ -249,6 +254,46 @@ def _params_preview(params: object) -> dict:
         else:
             out[str(name)] = param
     return out
+
+
+def _json_safe(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _sql_log_write(entry: dict) -> None:
+    row = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"), **entry}
+    row = _json_safe(row)
+    SQL_LOG.appendleft(row)
+    try:
+        with SQL_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"[viewer] sql_log write failed: {exc}", flush=True)
+
+
+def _reset_sql_log() -> None:
+    try:
+        SQL_LOG_PATH.write_text(
+            json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "phase": "session",
+                    "mrt": str(MRT_PATH.resolve()),
+                    "format": "JSONL: begin(sql,params) → end(rows,cols,notice)",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"[viewer] sql_log reset failed: {exc}", flush=True)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
@@ -288,6 +333,18 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         "stiexecutequery",
     }:
         print("[viewer] пустой SqlCommand — метры/Expression не на чем считать", flush=True)
+    _sql_log_write(
+        {
+            "phase": "begin",
+            "command": str(cmd),
+            "database": str(db),
+            "connection": str(conn),
+            "source": str(src),
+            "params": preview,
+            "sql": q,
+            "sql_len": len(q),
+        }
+    )
     if PG_CONN:
         args.connectionString = PG_CONN
 
@@ -296,7 +353,22 @@ def end_process_data(args: StiDataEventArgs) -> None:
     """Лог результата: rows=0 → карта остаётся с Label N1/N2 без чисел."""
     src = getattr(args, "dataSource", None) or "?"
     result = getattr(args, "result", None)
+    sql = getattr(args, "_viewer_sql", None) or getattr(args, "queryString", "") or ""
+    preview = getattr(args, "_viewer_params", None) or _params_preview(
+        getattr(args, "parameters", None)
+    )
     if result is None:
+        entry = {
+            "phase": "end",
+            "source": str(src),
+            "success": None,
+            "rows": None,
+            "columns": [],
+            "notice": None,
+            "params": preview,
+            "sql": sql,
+        }
+        _sql_log_write(entry)
         print(f"[viewer] endProcessData source={src!r} result=None", flush=True)
         return
     ok = getattr(result, "success", None)
@@ -316,26 +388,28 @@ def end_process_data(args: StiDataEventArgs) -> None:
                     or c
                 )
             )
+    entry = {
+        "phase": "end",
+        "source": str(src),
+        "success": ok,
+        "rows": count,
+        "columns": col_names,
+        "notice": notice,
+        "params": preview,
+        "sql": sql,
+    }
+    _sql_log_write(entry)
     print(
         f"[viewer] endProcessData source={src!r} success={ok} "
         f"rows={count} cols={col_names} notice={notice!r}",
         flush=True,
     )
     if count == 0 or count == "0":
-        sql = getattr(args, "_viewer_sql", None) or getattr(args, "queryString", "") or ""
-        preview = getattr(args, "_viewer_params", None) or _params_preview(
-            getattr(args, "parameters", None)
-        )
         print(
             f"[viewer] rows=0 → метры/карта без значений (виден только Label). "
-            f"params={preview}",
+            f"params={preview} → см. {SQL_LOG_PATH.name}",
             flush=True,
         )
-        if sql:
-            one_line = " ".join(str(sql).split())
-            if len(one_line) > 500:
-                one_line = one_line[:500] + "…"
-            print(f"[viewer] sql={one_line}", flush=True)
     elif ok and src and src != "?" and col_names:
         print(
             f"[viewer] map/метры: Expression Sum({src}.<поле>), поле ∈ {col_names}",
@@ -355,15 +429,27 @@ def serve_mrt():
 
 @app.get("/debug")
 def debug():
-    """Что в текущем MRT_PATH: sources/RequestParameters."""
+    """Что в текущем MRT_PATH: sources/RequestParameters + последние SQL."""
     info = mrt_summary(MRT_PATH)
     info["mrt_path"] = str(MRT_PATH.resolve())
     info["pg_conn_set"] = bool(PG_CONN)
+    info["sql_log_path"] = str(SQL_LOG_PATH.resolve())
+    info["sql_log"] = list(SQL_LOG)[:40]
     if info.get("request_parameters") in (True, "true", "True", 1, "1"):
         info.setdefault("hints", []).append(
             "RequestParameters=true → SQL/метры ждут Submit; до Submit часто только Label (N1)."
         )
     return info
+
+
+@app.get("/sql")
+def sql_trace():
+    """Последние SQL из памяти + путь к JSONL-файлу."""
+    return {
+        "path": str(SQL_LOG_PATH.resolve()),
+        "count": len(SQL_LOG),
+        "entries": list(SQL_LOG)[:80],
+    }
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -392,9 +478,11 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
+    _reset_sql_log()
     summary = mrt_summary(MRT_PATH)
     print(f"MRT:  {MRT_PATH.resolve()} ({summary.get('bytes')} bytes)", flush=True)
     print(f"DB:   connection string from .env", flush=True)
+    print(f"SQL:  {SQL_LOG_PATH.resolve()} (JSONL)", flush=True)
     if summary.get("ok"):
         print(
             f"MRT:  RequestParameters={summary.get('request_parameters')} "
@@ -434,6 +522,7 @@ def main() -> None:
         print(f"MRT ERROR: {summary.get('error')}", flush=True)
     print(f"Open: {url}", flush=True)
     print(f"Debug: {url}debug", flush=True)
+    print(f"SQL:   {url}sql", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
