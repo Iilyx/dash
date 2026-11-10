@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Минимальный viewer: .mrt + Postgres connection.
 
-Stimulsoft Dashboards.PYTHON 2024.2.6
+Stimulsoft Dashboards.PYTHON 2026.x
   StiViewer + loadFile(.mrt) + onBeginProcessData(connectionString).
 
 Запуск:
@@ -20,11 +20,17 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request, url_for
-from stimulsoft_reports.classes.StiLicenseStatic import StiLicenseStatic as StiLicense
 from stimulsoft_reports.events import StiDataEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
+
+try:
+    from stimulsoft_reports import StiLicense
+except ImportError:  # старые 2024.x
+    from stimulsoft_reports.classes.StiLicenseStatic import (  # type: ignore
+        StiLicenseStatic as StiLicense,
+    )
 
 ROOT = Path(__file__).resolve().parent
 
@@ -148,6 +154,8 @@ def viewer():
     sti.options.appearance.fullScreenMode = True
     sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
     sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
+    if hasattr(sti.options.appearance, "minParametersCountForMultiColumns"):
+        sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
     sti.onBeginProcessData += begin_process_data
 
