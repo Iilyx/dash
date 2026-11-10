@@ -407,6 +407,8 @@ def data_transformation(node: dict | None) -> dict | None:
 def element_role(ident: str | None) -> str | None:
     if not ident:
         return None
+    if ident == "StiPanelElement":
+        return "panel"
     if ident in FILTER_ELEMENT_IDENTS:
         return "filter"
     if ident in VIZ_ELEMENT_IDENTS:
@@ -414,6 +416,79 @@ def element_role(ident: str | None) -> str | None:
     if ident and ident.endswith("Element"):
         return "element"
     return None
+
+
+def component_values(el: dict) -> dict:
+    """Компактные «значения» компонента: meters/expressions/filters/interaction."""
+    if not isinstance(el, dict):
+        return {}
+    out = {
+        "name": el.get("name"),
+        "alias": el.get("alias"),
+        "type": el.get("type"),
+        "role": el.get("role"),
+        "title": el.get("title"),
+        "text": el.get("text"),
+        "data_source": el.get("data_source"),
+        "meters": el.get("meters"),
+        "expressions": el.get("expressions"),
+        "named_expressions": el.get("named_expressions"),
+        "filters": el.get("filters"),
+        "interaction": el.get("interaction"),
+        "group": el.get("group"),
+        "parent": el.get("parent"),
+    }
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
+def is_panel_element(el: dict) -> bool:
+    """StiPanelElement или узел с вложенными Components (дети-элементы)."""
+    if not isinstance(el, dict):
+        return False
+    if el.get("type") == "StiPanelElement" or el.get("role") == "panel":
+        return True
+    children = el.get("elements")
+    return isinstance(children, list) and len(children) > 0
+
+
+def panels_from_pages(pages_list: list[dict]) -> list[dict]:
+    """Отдельно: каждый StiPanelElement → значения его компонентов."""
+    result: list[dict] = []
+
+    def walk(el: dict, page_name: str | None, trail: list[str]) -> None:
+        if not isinstance(el, dict):
+            return
+        name = el.get("name") or el.get("alias") or el.get("type") or "?"
+        next_trail = trail + [str(name)]
+        if is_panel_element(el):
+            children = el.get("elements") if isinstance(el.get("elements"), list) else []
+            result.append(
+                {
+                    "page": page_name,
+                    "panel": el.get("name"),
+                    "alias": el.get("alias"),
+                    "type": el.get("type") or "StiPanelElement",
+                    "path": " / ".join(next_trail),
+                    "components_count": len(children),
+                    "components": [component_values(child) for child in children],
+                }
+            )
+            for child in children:
+                if is_panel_element(child):
+                    walk(child, page_name, next_trail)
+            return
+        for child in el.get("elements") or []:
+            if isinstance(child, dict):
+                walk(child, page_name, next_trail)
+
+    for page in pages_list:
+        if not isinstance(page, dict):
+            continue
+        page_name = page.get("alias") or page.get("name")
+        for el in page.get("elements") or []:
+            if isinstance(el, dict):
+                walk(el, page_name, [])
+    return result
 
 
 def format_of(node: dict) -> dict:
@@ -898,11 +973,35 @@ def element(node: dict) -> dict:
     return {key: value for key, value in parsed.items() if value not in (None, "", [])}
 
 
+def _looks_like_element(item: dict) -> bool:
+    if item.get("Name") or item.get("Ident"):
+        return True
+    if isinstance(item.get("Components"), (dict, list)) and item.get("Components"):
+        return True
+    # scrubbed .mrt: имена пустые, но метры/текст остаются
+    markers = (
+        "KeyMeter",
+        "NameMeter",
+        "ValueMeter",
+        "Values",
+        "Arguments",
+        "DataFilters",
+        "Title",
+        "Text",
+        "Image",
+        "DashboardInteraction",
+        "Rows",
+        "Summaries",
+        "Columns",
+    )
+    return any(item.get(k) not in (None, "", {}) for k in markers)
+
+
 def elements(node) -> list[dict]:
     return [
         element(item)
         for item in numbered(node)
-        if isinstance(item, dict) and (item.get("Name") or item.get("Ident"))
+        if isinstance(item, dict) and _looks_like_element(item)
     ]
 
 
@@ -929,6 +1028,8 @@ def pages(node) -> list[dict]:
 
 def catalog_from_report(report: dict) -> dict:
     dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+    pages_list = pages(report.get("Pages"))
+    panels = panels_from_pages(pages_list)
     catalog = {
         "report": {
             "name": report.get("ReportName"),
@@ -942,7 +1043,9 @@ def catalog_from_report(report: dict) -> dict:
         "business_objects": business_objects(dictionary.get("BusinessObjects")),
         "resources": resources(dictionary.get("Resources")),
         "functions": functions(dictionary.get("UserFunctions")),
-        "pages": pages(report.get("Pages")),
+        "pages": pages_list,
+        # отдельно: каждый StiPanelElement + значения его компонентов
+        "panels": panels,
     }
     catalog["report"] = {key: value for key, value in catalog["report"].items() if value}
     return {key: value for key, value in catalog.items() if value not in (None, "", [])}

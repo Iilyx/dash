@@ -27,6 +27,8 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
+from extract_mrt import catalog_from_report, load_mrt
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -201,6 +203,13 @@ def mrt_summary(path: Path) -> dict:
             f"{[(m.get('label'), m.get('path')) for m in label_only[:8]]}"
         )
 
+    panels: list[dict] = []
+    try:
+        catalog = catalog_from_report(report)
+        panels = catalog.get("panels") or []
+    except Exception as exc:
+        hints.append(f"panels extract failed: {exc}")
+
     return {
         "ok": True,
         "bytes": len(raw),
@@ -211,6 +220,8 @@ def mrt_summary(path: Path) -> dict:
         "request_from_user_count": rfu,
         "meters": meters[:40],
         "meters_count": len(meters),
+        "panels": panels,
+        "panels_count": len(panels),
         "hints": hints,
     }
 
@@ -452,6 +463,22 @@ def sql_trace():
     }
 
 
+@app.get("/panels")
+def panels():
+    """Каждый StiPanelElement → значения дочерних компонентов (meters/expressions/…)."""
+    try:
+        catalog = catalog_from_report(load_mrt(MRT_PATH))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "mrt_path": str(MRT_PATH.resolve())}
+    panels_list = catalog.get("panels") or []
+    return {
+        "ok": True,
+        "mrt_path": str(MRT_PATH.resolve()),
+        "panels_count": len(panels_list),
+        "panels": panels_list,
+    }
+
+
 @app.route("/", methods=["GET", "POST"])
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
@@ -520,9 +547,12 @@ def main() -> None:
             )
     else:
         print(f"MRT ERROR: {summary.get('error')}", flush=True)
-    print(f"Open: {url}", flush=True)
-    print(f"Debug: {url}debug", flush=True)
-    print(f"SQL:   {url}sql", flush=True)
+    print(f"Open:   {url}", flush=True)
+    print(f"Debug:  {url}debug", flush=True)
+    print(f"SQL:    {url}sql", flush=True)
+    print(f"Panels: {url}panels  (StiPanelElement → components)", flush=True)
+    if summary.get("panels_count"):
+        print(f"Panels in MRT: {summary.get('panels_count')}", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
