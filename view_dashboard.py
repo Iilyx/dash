@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import webbrowser
@@ -82,6 +83,70 @@ def resolve_mrt_path() -> Path:
     return path_of("test.mrt")
 
 
+def numbered(node) -> list:
+    if node is None:
+        return []
+    if isinstance(node, list):
+        return node
+    if isinstance(node, dict):
+        if all(str(k).isdigit() for k in node):
+            return [node[k] for k in sorted(node, key=lambda x: int(x))]
+        return [node]
+    return []
+
+
+def mrt_summary(path: Path) -> dict:
+    """Короткий диагноз шаблона (полный .mrt тоже ок)."""
+    raw = path.read_text(encoding="utf-8-sig")
+    try:
+        report = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": f"json: {exc}", "bytes": len(raw)}
+    dictionary = report.get("Dictionary") if isinstance(report.get("Dictionary"), dict) else {}
+    sources = []
+    for src in numbered(dictionary.get("DataSources")):
+        if not isinstance(src, dict):
+            continue
+        sql = src.get("SqlCommand") or ""
+        cols = src.get("Columns")
+        col_count = len(cols) if isinstance(cols, (dict, list)) else 0
+        sources.append(
+            {
+                "name": src.get("Name") or "",
+                "ident": src.get("Ident") or "",
+                "sql_len": len(sql) if isinstance(sql, str) else 0,
+                "columns": col_count,
+                "connect_on_start": src.get("ConnectOnStart"),
+            }
+        )
+    databases = []
+    for db in numbered(dictionary.get("Databases")):
+        if isinstance(db, dict):
+            databases.append(
+                {
+                    "name": db.get("Name") or "",
+                    "ident": db.get("Ident") or "",
+                    "has_conn": bool(db.get("ConnectionString") or db.get("ConnectionStringEncrypted")),
+                }
+            )
+    rfu = 0
+    for var in numbered(dictionary.get("Variables")):
+        if isinstance(var, dict) and str(var.get("RequestFromUser")).lower() in {
+            "true",
+            "1",
+        }:
+            rfu += 1
+    return {
+        "ok": True,
+        "bytes": len(raw),
+        "request_parameters": report.get("RequestParameters"),
+        "parameters_display_mode": report.get("ParametersDisplayMode"),
+        "databases": databases,
+        "sources": sources,
+        "request_from_user_count": rfu,
+    }
+
+
 load_env()
 
 MRT_PATH = resolve_mrt_path()
@@ -110,8 +175,7 @@ app = Flask(__name__)
 def begin_process_data(args: StiDataEventArgs) -> None:
     """Подставить Postgres connection; SQL/параметры — как в .mrt.
 
-    Sum/Switch/Round в ValueMeter.Expression считает JS-движок Stimulsoft
-    уже после ответа адаптера — Python их не выполняет.
+    Sum/Switch/Round в ValueMeter.Expression считает JS после ответа адаптера.
     """
     src = getattr(args, "dataSource", None) or "?"
     cmd = getattr(args, "command", None) or "?"
@@ -121,7 +185,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         f"[viewer] beginProcessData cmd={cmd} db={db} source={src} sql_len={len(q)}",
         flush=True,
     )
-    if not q.strip():
+    if not q.strip() and str(cmd).lower() in {"executequery", "executesql", "select"}:
         print("[viewer] пустой SqlCommand — метры/Expression не на чем считать", flush=True)
     if PG_CONN:
         args.connectionString = PG_CONN
@@ -129,11 +193,26 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 @app.get("/mrt")
 def serve_mrt():
-    """Отдать .mrt как есть."""
+    """Отдать .mrt как есть (relative URL, как в сэмпле Stimulsoft)."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    resp = Response(raw, mimetype="application/json")
+    # .mrt JSON; text/plain тоже ок, json удобнее в DevTools
+    resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.get("/debug")
+def debug():
+    """Что в текущем MRT_PATH: sources/RequestParameters."""
+    info = mrt_summary(MRT_PATH)
+    info["mrt_path"] = str(MRT_PATH.resolve())
+    info["pg_conn_set"] = bool(PG_CONN)
+    if info.get("request_parameters") in (True, "true", "True", 1, "1"):
+        info["hint"] = (
+            "RequestParameters=true → dashboard SQL/метры ждут Submit на панели. "
+            "До Submit часто виден только Label (N1), без числа."
+        )
+    return info
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -146,23 +225,52 @@ def viewer():
     sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
     sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
+    # как в Samples: handler только на viewer
     sti.onBeginProcessData += begin_process_data
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
 
     report = StiReport()
-    report.onBeginProcessData += begin_process_data
-    report.loadFile(url_for("serve_mrt", _external=True))
+    # relative /mrt — без _external (localhost vs 127.0.0.1 ломал loadFile)
+    report.loadFile(url_for("serve_mrt"))
     sti.report = report
     return sti.getFrameworkResponse()
 
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    print(f"MRT:  {MRT_PATH.resolve()}")
-    print(f"DB:   Host=…; Database=… (from .env)")
-    print(f"Open: {url}")
+    summary = mrt_summary(MRT_PATH)
+    print(f"MRT:  {MRT_PATH.resolve()} ({summary.get('bytes')} bytes)", flush=True)
+    print(f"DB:   connection string from .env", flush=True)
+    if summary.get("ok"):
+        print(
+            f"MRT:  RequestParameters={summary.get('request_parameters')} "
+            f"RFU={summary.get('request_from_user_count')} "
+            f"sources={len(summary.get('sources') or [])}",
+            flush=True,
+        )
+        for src in summary.get("sources") or []:
+            print(
+                f"  source name={src.get('name')!r} ident={src.get('ident')!r} "
+                f"sql_len={src.get('sql_len')} cols={src.get('columns')} "
+                f"ConnectOnStart={src.get('connect_on_start')!r}",
+                flush=True,
+            )
+        if summary.get("request_parameters") in (True, "true", "True", 1, "1"):
+            print(
+                "NOTE: RequestParameters=true — нажми Submit, иначе метры без данных (виден Label N1)",
+                flush=True,
+            )
+        if all((s.get("sql_len") or 0) == 0 for s in (summary.get("sources") or [1])):
+            print(
+                "WARNING: у всех DataSources sql_len=0 — похоже на scrubbed/не тот MRT_PATH",
+                flush=True,
+            )
+    else:
+        print(f"MRT ERROR: {summary.get('error')}", flush=True)
+    print(f"Open: {url}", flush=True)
+    print(f"Debug: {url}debug", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
