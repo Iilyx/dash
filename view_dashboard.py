@@ -163,6 +163,42 @@ def mrt_summary(path: Path) -> dict:
         hints.append(
             f"NameInSource ≠ Databases.Name: {orphan} (db={sorted(db_names)})"
         )
+    # RegionMap / индикаторы: Label (N1) vs Expression (Receipts.Field)
+    meters: list[dict] = []
+
+    def walk_meters(node, path: str = "") -> None:
+        if isinstance(node, dict):
+            for meter_key in ("KeyMeter", "NameMeter", "ValueMeter"):
+                m = node.get(meter_key)
+                if isinstance(m, dict) and (
+                    m.get("Expression") or m.get("Label") or m.get("Ident")
+                ):
+                    meters.append(
+                        {
+                            "path": f"{path}.{meter_key}" if path else meter_key,
+                            "ident": m.get("Ident") or "",
+                            "label": m.get("Label") or "",
+                            "expression": m.get("Expression") or "",
+                        }
+                    )
+            for k, v in node.items():
+                walk_meters(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk_meters(v, f"{path}[{i}]")
+
+    walk_meters(report.get("Pages"))
+    label_only = [
+        m
+        for m in meters
+        if m.get("label") and not (m.get("expression") or "").strip()
+    ]
+    if label_only:
+        hints.append(
+            "Есть Label без Expression (на карте часто виден N1/N2 без числа): "
+            f"{[(m.get('label'), m.get('path')) for m in label_only[:8]]}"
+        )
+
     return {
         "ok": True,
         "bytes": len(raw),
@@ -171,6 +207,8 @@ def mrt_summary(path: Path) -> dict:
         "databases": databases,
         "sources": sources,
         "request_from_user_count": rfu,
+        "meters": meters[:40],
+        "meters_count": len(meters),
         "hints": hints,
     }
 
@@ -238,7 +276,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 
 def end_process_data(args: StiDataEventArgs) -> None:
-    """Лог результата адаптера — видно, понял ли Postgres source."""
+    """Лог результата адаптера — имена колонок = то, что видит Expression Receipts.поле."""
     src = getattr(args, "dataSource", None) or "?"
     result = getattr(args, "result", None)
     if result is None:
@@ -247,12 +285,31 @@ def end_process_data(args: StiDataEventArgs) -> None:
     ok = getattr(result, "success", None)
     notice = getattr(result, "notice", None)
     count = getattr(result, "count", None)
-    cols = getattr(result, "columns", None)
+    cols = getattr(result, "columns", None) or []
+    # Stimulsoft иногда отдаёт list[str], иногда объекты с .name
+    col_names: list[str] = []
+    for c in cols:
+        if isinstance(c, str):
+            col_names.append(c)
+        else:
+            col_names.append(
+                str(
+                    getattr(c, "name", None)
+                    or getattr(c, "Name", None)
+                    or c
+                )
+            )
     print(
         f"[viewer] endProcessData source={src!r} success={ok} "
-        f"rows={count} cols={len(cols) if cols else 0} notice={notice!r}",
+        f"rows={count} cols={col_names} notice={notice!r}",
         flush=True,
     )
+    if ok and src and src != "?" and col_names:
+        print(
+            f"[viewer] map/метры ждут Expression вроде Sum({src}.<поле>) — "
+            f"поле должно быть в cols выше",
+            flush=True,
+        )
 
 
 @app.get("/mrt")
