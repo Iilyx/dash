@@ -148,10 +148,8 @@ def designer():
     sti.onBeginProcessData += begin_process_data
     sti.onSaveReport += save_report
     sti.onSaveAsReport += save_report
-    sti.javascript.appendHead(
-        '<script>function designerExit(){ window.location = "/"; }</script>'
-    )
-    sti.onExit += "designerExit"
+    # 2024.x: нет javascript.appendHead — не-идентификатор вставляется как raw JS
+    sti.onExit += "window.location = '/';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -175,10 +173,7 @@ def viewer():
     sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
     sti.options.toolbar.showDesignButton = True
     sti.onBeginProcessData += begin_process_data
-    sti.javascript.appendHead(
-        '<script>function goDesigner(){ window.location = "/designer"; }</script>'
-    )
-    sti.onDesignReport += "goDesigner"
+    sti.onDesignReport += "window.location = '/designer';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
