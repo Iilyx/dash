@@ -108,7 +108,21 @@ app = Flask(__name__)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    """Подставить Postgres connection; SQL/параметры — как в .mrt."""
+    """Подставить Postgres connection; SQL/параметры — как в .mrt.
+
+    Sum/Switch/Round в ValueMeter.Expression считает JS-движок Stimulsoft
+    уже после ответа адаптера — Python их не выполняет.
+    """
+    src = getattr(args, "dataSource", None) or "?"
+    cmd = getattr(args, "command", None) or "?"
+    db = getattr(args, "database", None) or "?"
+    q = getattr(args, "queryString", None) or ""
+    print(
+        f"[viewer] beginProcessData cmd={cmd} db={db} source={src} sql_len={len(q)}",
+        flush=True,
+    )
+    if not q.strip():
+        print("[viewer] пустой SqlCommand — метры/Expression не на чем считать", flush=True)
     if PG_CONN:
         args.connectionString = PG_CONN
 
