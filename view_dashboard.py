@@ -110,23 +110,31 @@ def mrt_summary(path: Path) -> dict:
         sql = src.get("SqlCommand") or ""
         cols = src.get("Columns")
         col_count = len(cols) if isinstance(cols, (dict, list)) else 0
+        ident = src.get("Ident") or ""
+        name_in_source = src.get("NameInSource") or ""
         sources.append(
             {
                 "name": src.get("Name") or "",
-                "ident": src.get("Ident") or "",
+                "ident": ident,
+                "name_in_source": name_in_source,
                 "sql_len": len(sql) if isinstance(sql, str) else 0,
                 "columns": col_count,
                 "connect_on_start": src.get("ConnectOnStart"),
+                "ok_pg": ident == "StiPostgreSQLSource",
             }
         )
     databases = []
     for db in numbered(dictionary.get("Databases")):
         if isinstance(db, dict):
+            ident = db.get("Ident") or ""
             databases.append(
                 {
                     "name": db.get("Name") or "",
-                    "ident": db.get("Ident") or "",
-                    "has_conn": bool(db.get("ConnectionString") or db.get("ConnectionStringEncrypted")),
+                    "ident": ident,
+                    "has_conn": bool(
+                        db.get("ConnectionString") or db.get("ConnectionStringEncrypted")
+                    ),
+                    "ok_pg": ident == "StiPostgreSQLDatabase",
                 }
             )
     rfu = 0
@@ -136,6 +144,25 @@ def mrt_summary(path: Path) -> dict:
             "1",
         }:
             rfu += 1
+    hints: list[str] = []
+    bad_db = [d for d in databases if not d.get("ok_pg")]
+    bad_src = [s for s in sources if not s.get("ok_pg")]
+    if bad_db or bad_src:
+        hints.append(
+            "Postgres Ident: Database=StiPostgreSQLDatabase, Source=StiPostgreSQLSource. "
+            f"bad_db={[d.get('ident') for d in bad_db]} "
+            f"bad_src={[(s.get('name'), s.get('ident')) for s in bad_src]}"
+        )
+    db_names = {d.get("name") for d in databases if d.get("name")}
+    orphan = [
+        (s.get("name"), s.get("name_in_source"))
+        for s in sources
+        if s.get("name_in_source") and s.get("name_in_source") not in db_names
+    ]
+    if orphan and db_names:
+        hints.append(
+            f"NameInSource ≠ Databases.Name: {orphan} (db={sorted(db_names)})"
+        )
     return {
         "ok": True,
         "bytes": len(raw),
@@ -144,6 +171,7 @@ def mrt_summary(path: Path) -> dict:
         "databases": databases,
         "sources": sources,
         "request_from_user_count": rfu,
+        "hints": hints,
     }
 
 
@@ -175,20 +203,56 @@ app = Flask(__name__)
 def begin_process_data(args: StiDataEventArgs) -> None:
     """Подставить Postgres connection; SQL/параметры — как в .mrt.
 
-    Sum/Switch/Round в ValueMeter.Expression считает JS после ответа адаптера.
+    Клиент шлёт database='PostgreSQL' только если в .mrt:
+      Databases[].Ident = StiPostgreSQLDatabase
+      DataSources[].Ident = StiPostgreSQLSource
+      DataSources[].NameInSource = Databases[].Name
+    Иначе адаптер «не понимает» source.
     """
     src = getattr(args, "dataSource", None) or "?"
     cmd = getattr(args, "command", None) or "?"
     db = getattr(args, "database", None) or "?"
+    conn = getattr(args, "connection", None) or "?"
     q = getattr(args, "queryString", None) or ""
+    params = getattr(args, "parameters", None) or {}
     print(
-        f"[viewer] beginProcessData cmd={cmd} db={db} source={src} sql_len={len(q)}",
+        f"[viewer] beginProcessData cmd={cmd} database={db!r} connection={conn!r} "
+        f"source={src!r} sql_len={len(q)} params={list(params) if params else []}",
         flush=True,
     )
-    if not q.strip() and str(cmd).lower() in {"executequery", "executesql", "select"}:
+    if str(db) not in {"PostgreSQL", "?", ""} and "postgres" not in str(db).lower():
+        print(
+            f"[viewer] WARN database={db!r} — нужен PostgreSQL. "
+            "В .mrt Ident должен быть StiPostgreSQLDatabase / StiPostgreSQLSource",
+            flush=True,
+        )
+    if not q.strip() and str(cmd).lower() in {
+        "executequery",
+        "executesql",
+        "select",
+        "stiexecutequery",
+    }:
         print("[viewer] пустой SqlCommand — метры/Expression не на чем считать", flush=True)
     if PG_CONN:
         args.connectionString = PG_CONN
+
+
+def end_process_data(args: StiDataEventArgs) -> None:
+    """Лог результата адаптера — видно, понял ли Postgres source."""
+    src = getattr(args, "dataSource", None) or "?"
+    result = getattr(args, "result", None)
+    if result is None:
+        print(f"[viewer] endProcessData source={src!r} result=None", flush=True)
+        return
+    ok = getattr(result, "success", None)
+    notice = getattr(result, "notice", None)
+    count = getattr(result, "count", None)
+    cols = getattr(result, "columns", None)
+    print(
+        f"[viewer] endProcessData source={src!r} success={ok} "
+        f"rows={count} cols={len(cols) if cols else 0} notice={notice!r}",
+        flush=True,
+    )
 
 
 @app.get("/mrt")
@@ -208,9 +272,8 @@ def debug():
     info["mrt_path"] = str(MRT_PATH.resolve())
     info["pg_conn_set"] = bool(PG_CONN)
     if info.get("request_parameters") in (True, "true", "True", 1, "1"):
-        info["hint"] = (
-            "RequestParameters=true → dashboard SQL/метры ждут Submit на панели. "
-            "До Submit часто виден только Label (N1), без числа."
+        info.setdefault("hints", []).append(
+            "RequestParameters=true → SQL/метры ждут Submit; до Submit часто только Label (N1)."
         )
     return info
 
@@ -227,6 +290,7 @@ def viewer():
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
     # как в Samples: handler только на viewer
     sti.onBeginProcessData += begin_process_data
+    sti.onEndProcessData += end_process_data
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -250,13 +314,24 @@ def main() -> None:
             f"sources={len(summary.get('sources') or [])}",
             flush=True,
         )
-        for src in summary.get("sources") or []:
+        for db in summary.get("databases") or []:
+            mark = "OK" if db.get("ok_pg") else "BAD"
             print(
-                f"  source name={src.get('name')!r} ident={src.get('ident')!r} "
+                f"  db[{mark}] name={db.get('name')!r} ident={db.get('ident')!r} "
+                f"has_conn={db.get('has_conn')}",
+                flush=True,
+            )
+        for src in summary.get("sources") or []:
+            mark = "OK" if src.get("ok_pg") else "BAD"
+            print(
+                f"  src[{mark}] name={src.get('name')!r} ident={src.get('ident')!r} "
+                f"NameInSource={src.get('name_in_source')!r} "
                 f"sql_len={src.get('sql_len')} cols={src.get('columns')} "
                 f"ConnectOnStart={src.get('connect_on_start')!r}",
                 flush=True,
             )
+        for hint in summary.get("hints") or []:
+            print(f"NOTE: {hint}", flush=True)
         if summary.get("request_parameters") in (True, "true", "True", 1, "1"):
             print(
                 "NOTE: RequestParameters=true — нажми Submit, иначе метры без данных (виден Label N1)",
