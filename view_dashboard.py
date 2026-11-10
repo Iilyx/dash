@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Минимальный viewer + designer: .mrt + Postgres connection.
+"""Минимальный viewer: .mrt + Postgres connection.
 
 Stimulsoft Dashboards.PYTHON 2024.x
-  StiViewer / StiDesigner + loadFile(.mrt) + onBeginProcessData(connectionString).
-  Save в designer пишет обратно в MRT_PATH.
+  StiViewer + loadFile(.mrt) + onBeginProcessData(connectionString).
 
 Запуск:
   MRT_PATH=full.mrt .venv/bin/python view_dashboard.py
-  / — viewer, /designer — правка дашборда.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import webbrowser
@@ -22,15 +19,11 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request, url_for
-from stimulsoft_reports import StiResult
-from stimulsoft_reports.designer import StiDesigner
-from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
+from stimulsoft_reports import StiLicense
+from stimulsoft_reports.events import StiDataEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
-from stimulsoft_reports.viewer.enums import (
-    StiParametersPanelPosition,
-    StiToolbarDisplayMode,
-)
+from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
 
 ROOT = Path(__file__).resolve().parent
 
@@ -90,7 +83,21 @@ def resolve_mrt_path() -> Path:
     return path_of("test.mrt")
 
 
+def apply_license() -> None:
+    """Ключ из .env — иначе Stimulsoft идёт как trial (часто без регистрации)."""
+    key = os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
+    key_file = os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
+    if key:
+        StiLicense.setKey(key)
+        return
+    if key_file:
+        path = path_of(key_file)
+        if path.is_file():
+            StiLicense.setFile(str(path))
+
+
 load_env()
+apply_license()
 
 MRT_PATH = resolve_mrt_path()
 if not MRT_PATH.is_file():
@@ -119,45 +126,12 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         args.connectionString = PG_CONN
 
 
-def save_report(args: StiReportEventArgs):
-    """Save / Save As из designer → MRT_PATH."""
-    if args.report is None:
-        return StiResult.getError("пустой report — нечего сохранять")
-    try:
-        text = json.dumps(args.report, ensure_ascii=False, indent=2)
-        MRT_PATH.write_text(text + "\n", encoding="utf-8")
-    except OSError as exc:
-        return StiResult.getError(str(exc))
-    return f"Сохранено в {MRT_PATH.name}"
-
-
 @app.get("/mrt")
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
-
-@app.route("/designer", methods=["GET", "POST"])
-def designer():
-    sti = StiDesigner()
-    sti.id = "designer"
-    sti.options.appearance.fullScreenMode = True
-    sti.options.toolbar.showFileMenuExit = True
-    sti.onBeginProcessData += begin_process_data
-    sti.onSaveReport += save_report
-    sti.onSaveAsReport += save_report
-    # 2024.x: нет javascript.appendHead — не-идентификатор вставляется как raw JS
-    sti.onExit += "window.location = '/';"
-
-    if sti.processRequest(request):
-        return sti.getFrameworkResponse()
-
-    report = StiReport()
-    report.loadFile(url_for("serve_mrt"))
-    sti.report = report
-    return sti.getFrameworkResponse()
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -170,10 +144,7 @@ def viewer():
     sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
     sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
-    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
-    sti.options.toolbar.showDesignButton = True
     sti.onBeginProcessData += begin_process_data
-    sti.onDesignReport += "window.location = '/designer';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -186,9 +157,8 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
-    print(f"Open:     {url}", flush=True)
-    print(f"Designer: {url}designer", flush=True)
+    print(f"MRT:  {MRT_PATH.resolve()}", flush=True)
+    print(f"Open: {url}", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
