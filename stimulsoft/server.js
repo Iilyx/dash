@@ -1,12 +1,15 @@
 // Official sample:
 // https://github.com/stimulsoft/Samples-Dashboards.JS-for-Node.js/tree/master/Using%20with%20Express
+// + SQL adapter same-origin /data (Postgres)
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
+const adapter = require("stimulsoft-data-adapter");
 
 const ROOT = __dirname;
 const REPORTS_SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-reports-js", "Scripts");
 const DASH_SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Scripts");
+const DASH_CSS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Css");
 const port = Number(process.env.PORT || process.env.DESIGNER_PORT || 8040);
 
 function loadEnv() {
@@ -65,7 +68,9 @@ const PREVIEW_MRT = path.join(ROOT, ".preview.mrt");
 const LICENSE =
   (process.env.STIMULSOFT_DASHBOARDS_LICENSE_KEY || "").trim() ||
   (process.env.STIMULSOFT_REPORTS_LICENSE_KEY || "").trim();
-const ADAPTER_URL = (process.env.DATA_ADAPTER_URL || "http://localhost:9615").trim();
+// same-origin по умолчанию; :9615 только если явно задали DATA_ADAPTER_URL
+const ADAPTER_URL = (process.env.DATA_ADAPTER_URL || "").trim();
+const PG = pgConn();
 
 function envFlag(name, def) {
   const v = (process.env[name] != null ? process.env[name] : def);
@@ -81,6 +86,74 @@ const FORCE_DASHBOARD_TOOLBAR = envFlag("FORCE_DASHBOARD_TOOLBAR", "1");
 const DASHBOARD_VIEWER_SETTINGS = 671; // toolbar + parameters panel
 
 const app = express();
+
+// темы — без CSS холст часто белый
+if (fs.existsSync(DASH_CSS)) {
+  app.use("/Css", express.static(DASH_CSS));
+}
+
+// stimulsoft-data-adapter сравнивает database строго с "PostgreSQL"
+function forcePg(command) {
+  if (!command || typeof command !== "object") return command;
+  if (PG) {
+    command.connectionString = PG;
+    command.database = "PostgreSQL";
+  }
+  return command;
+}
+
+function dataCors(res) {
+  res.set({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Origin, X-Requested-With, Content-Type, Accept",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Cache-Control": "no-cache",
+  });
+}
+
+app.options("/data", (_req, res) => {
+  dataCors(res);
+  res.sendStatus(204);
+});
+
+// raw body — НЕ express.json/text (ломают encrypted payload)
+app.post("/data", (req, res) => {
+  dataCors(res);
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    const raw = Buffer.concat(chunks).toString("utf8");
+    let command;
+    try {
+      command = forcePg(adapter.getCommand(raw || "{}"));
+    } catch (err) {
+      console.error("[/data] getCommand", err && err.message ? err.message : err);
+      res.end(
+        adapter.getResponse({
+          success: false,
+          notice: String(err && err.message ? err.message : err),
+          encryptData: false,
+        })
+      );
+      return;
+    }
+    console.log(
+      "[/data]",
+      command.command,
+      command.database,
+      (command.queryString && String(command.queryString).slice(0, 160)) || ""
+    );
+    adapter.process(command, (result) => {
+      if (result && result.success === false) {
+        console.error("[/data] fail", result.notice || result);
+      } else {
+        const rows = (result && result.rows && result.rows.length) || 0;
+        console.log("[/data] ok rows=", rows);
+      }
+      res.type("text/plain").end(adapter.getResponse(result));
+    });
+  });
+});
 
 // raw body for preview snapshot (не express.json — большие .mrt)
 app.post(
@@ -105,7 +178,8 @@ app.get("/config.js", (_req, res) => {
       "window.__STI__=" +
         JSON.stringify({
           licenseKey: LICENSE,
-          pgConn: pgConn(),
+          pgConn: PG,
+          // пусто → клиент возьмёт location.origin + "/data"
           dataAdapterUrl: ADAPTER_URL,
         }) +
         ";\n"
@@ -413,8 +487,9 @@ app.listen(port, "0.0.0.0", () => {
   console.log("Navigate to http://localhost:" + port + "/viewer to show Viewer");
   console.log("Navigate to http://localhost:" + port + "/designer to show Designer");
   console.log("MRT: " + MRT);
-  console.log("PG conn: " + (pgConn() ? "ok" : "MISSING — set POSTGRES_* or DATABASE_URL"));
+  console.log("PG conn: " + (PG ? "ok" : "MISSING — set POSTGRES_* or DATABASE_URL"));
   console.log("License: " + (LICENSE ? "set" : "empty (trial)"));
   console.log("stimulsoft-reports-js / stimulsoft-dashboards-js 2024.3.3");
-  console.log("Data adapter must be running: npm run adapter  (port 9615)");
+  console.log("SQL adapter: same-origin POST /data (force PostgreSQL)");
+  console.log("Css: " + (fs.existsSync(DASH_CSS) ? "ok /Css" : "missing"));
 });
