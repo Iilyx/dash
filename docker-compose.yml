@@ -18,24 +18,5 @@ services:
       timeout: 5s
       retries: 10
 
-  designer:
-    build: ./sti
-    container_name: mcp_pg_bi_designer
-    env_file:
-      - .env
-    environment:
-      # внутри сети compose всегда postgres:5432
-      PORT: "8040"
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      MRT_PATH: /workspace/${MRT_FILE:-test.mrt}
-    ports:
-      - "${VIEWER_PORT:-8040}:8040"
-    volumes:
-      - .:/workspace
-    depends_on:
-      postgres:
-        condition: service_healthy
-
 volumes:
   pgdata67:

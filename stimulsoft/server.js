@@ -1,5 +1,6 @@
 "use strict";
 
+// Express + designer (офиц. sample) + stimulsoft-data-adapter (Postgres)
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
@@ -8,25 +9,20 @@ const adapter = require("stimulsoft-data-adapter");
 const ROOT = __dirname;
 const SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Scripts");
 const PORT = Number(process.env.PORT || 8040);
-
-function mrtPath() {
-  const raw = (process.env.MRT_PATH || "/data/dashboard.mrt").trim();
-  return path.isAbsolute(raw) ? raw : path.resolve(ROOT, raw);
-}
+const MRT = process.env.MRT_PATH || path.join(ROOT, "dashboard.mrt");
 
 function pgConn() {
-  const user = (process.env.POSTGRES_USER || "").trim();
-  const password = (process.env.POSTGRES_PASSWORD || "").trim();
-  const db = (process.env.POSTGRES_DB || "").trim();
-  const host = (process.env.POSTGRES_HOST || "postgres").trim() || "postgres";
-  const port = (process.env.POSTGRES_PORT || "5432").trim() || "5432";
+  const user = process.env.POSTGRES_USER || "";
+  const password = process.env.POSTGRES_PASSWORD || "";
+  const db = process.env.POSTGRES_DB || "";
+  const host = process.env.POSTGRES_HOST || "postgres";
+  const port = process.env.POSTGRES_PORT || "5432";
   if (!user || !password || !db) {
     throw new Error("Need POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB");
   }
   return `Host=${host}; Port=${port}; Database=${db}; User Id=${user}; Password=${password};`;
 }
 
-const MRT = mrtPath();
 const PG = pgConn();
 const LICENSE =
   (process.env.STIMULSOFT_DASHBOARDS_LICENSE_KEY || "").trim() ||
@@ -41,32 +37,29 @@ app.get("/config.js", (_req, res) => {
     .set("Cache-Control", "no-store")
     .send(
       "window.__STI__=" +
-        JSON.stringify({
-          licenseKey: LICENSE,
-          pgConn: PG,
-          dataAdapterUrl: "/data",
-        }) +
+        JSON.stringify({ licenseKey: LICENSE, pgConn: PG }) +
         ";\n"
     );
 });
 
-app.get("/mrt", (_req, res) => {
+app.get("/dashboard", (_req, res) => {
   if (!fs.existsSync(MRT)) {
-    return res.status(404).type("text/plain").send("MRT not found: " + MRT);
+    return res.status(404).send("MRT not found: " + MRT);
   }
-  res.type("application/json").set("Cache-Control", "no-store").send(fs.readFileSync(MRT, "utf8"));
+  res.type("application/json").set("Cache-Control", "no-store").send(fs.readFileSync(MRT));
 });
 
-app.post("/mrt", (req, res) => {
+app.post("/dashboard", (req, res) => {
   try {
     const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-    fs.writeFileSync(MRT, JSON.stringify(JSON.parse(body), null, 2) + "\n", "utf8");
+    fs.writeFileSync(MRT, JSON.stringify(JSON.parse(body), null, 2) + "\n");
     res.json({ success: true });
   } catch (err) {
     res.status(400).json({ success: false, notice: String(err.message || err) });
   }
 });
 
+// https://www.stimulsoft.com/en/samples/dashboards-js/nodejs/starting-sql-adapters-from-the-http-server
 function forcePg(command) {
   if (!command || typeof command !== "object") return command;
   const db = String(command.database || "").toLowerCase();
@@ -82,7 +75,7 @@ app.options("/data", (_req, res) => {
     "Access-Control-Allow-Headers": "Origin, X-Requested-With, Content-Type, Accept",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
   });
-  res.status(204).end();
+  res.sendStatus(204);
 });
 
 app.post("/data", (req, res) => {
@@ -90,17 +83,13 @@ app.post("/data", (req, res) => {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Origin, X-Requested-With, Content-Type, Accept",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-cache",
   });
   const raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
-  try {
-    const command = forcePg(adapter.getCommand(raw));
-    adapter.process(command, (result) => {
-      res.type("application/json").send(adapter.getResponse(result));
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, notice: String(err.message || err) });
-  }
+  const command = forcePg(adapter.getCommand(raw));
+  adapter.process(command, (result) => {
+    res.type("application/json").send(adapter.getResponse(result));
+  });
 });
 
 for (const name of [
@@ -113,13 +102,13 @@ for (const name of [
   app.get("/" + name, (_req, res) => res.sendFile(path.join(SCRIPTS, name)));
 }
 
-app.use(express.static(path.join(ROOT, "public")));
 app.get(["/", "/designer"], (_req, res) => {
-  res.sendFile(path.join(ROOT, "public", "designer.html"));
+  res.sendFile(path.join(ROOT, "designer.html"));
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Stimulsoft Dashboards.JS 2024.3.3");
+  console.log("Dashboards.JS 2024.3.3 designer + Postgres adapter");
   console.log("MRT:", MRT);
-  console.log("http://0.0.0.0:" + PORT + "/");
+  console.log("http://0.0.0.0:" + PORT + "/designer");
+  console.log('StiOptions.WebServer.url = "' + "http://localhost:" + PORT + '/data"');
 });

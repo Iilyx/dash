@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Stimulsoft Dashboards.JS Designer</title>
+  <script src="/stimulsoft.reports.js"></script>
+  <script src="/stimulsoft.dashboards.js"></script>
+  <script src="/stimulsoft.viewer.js"></script>
+  <script src="/stimulsoft.designer.js"></script>
+  <script src="/stimulsoft.blockly.editor.js"></script>
+  <script src="/config.js"></script>
+</head>
+<body>
+  <div id="designer"></div>
+  <script>
+    var cfg = window.__STI__ || {};
+
+    // лицензия
+    if (cfg.licenseKey) {
+      Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+    }
+
+    // SQL adapter (Postgres) — до создания designer
+    // https://www.stimulsoft.com/en/documentation/online/programming-manual/reports_js_engine_connecting_sql_data_bases.htm
+    Stimulsoft.Base.StiOptions.WebServer.url = window.location.origin + "/data";
+
+    var options = new Stimulsoft.Designer.StiDesignerOptions();
+    options.appearance.fullScreenMode = true;
+    var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
+
+    // подмена connection string на Postgres из .env
+    designer.onBeginProcessData = function (args) {
+      if (/postgres|npgsql/i.test(String(args.database || "")) && cfg.pgConn) {
+        args.connectionString = cfg.pgConn;
+      }
+    };
+
+    designer.onSaveReport = function (args) {
+      args.preventDefault = true;
+      fetch("/dashboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: args.report.saveToJsonString(),
+      });
+    };
+    designer.onSaveAsReport = designer.onSaveReport;
+
+    designer.renderHtml("designer");
+
+    var report = Stimulsoft.Report.StiReport.createNewDashboard();
+    report.loadFile("/dashboard");
+    designer.report = report;
+  </script>
+</body>
+</html>

@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .env
 node_modules/
-sti/node_modules/
 
 # generated / local
 catalog.json
