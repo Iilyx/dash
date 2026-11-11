@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Stimulsoft Dashboards.PYTHON 2024.3.3 — официальные Flask samples.
-
-Версия пакетов = ReportVersion / лицензия шаблона (2024.3.3), не latest.
+"""Stimulsoft Dashboards.PYTHON — по официальным sample Flask.
 
 Docs / samples:
   Editing a Dashboard Template in the Designer
@@ -171,7 +169,7 @@ def viewer():
 
 
 def main() -> None:
-    print("Stimulsoft Dashboards.PYTHON 2024.3.3 — official Flask wiring", flush=True)
+    print("Stimulsoft Dashboards.PYTHON (latest) — official Flask wiring", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
