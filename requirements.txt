@@ -3,3 +3,9 @@ uvicorn==0.38.0
 httpx==0.28.1
 pydantic>=2
 mcp==2.3.0
+
+# Stimulsoft Dashboards.PYTHON 2026 (PyPI)
+flask>=3.0
+stimulsoft-reports==2026.4.3
+stimulsoft-dashboards==2026.4.3
+psycopg[binary]>=3.1
