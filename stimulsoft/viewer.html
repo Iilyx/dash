@@ -2,83 +2,54 @@
 <html>
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-  <title>Dashboard viewer</title>
+  <title>Stimulsoft Dashboards.js Viewer</title>
+
+  <!-- Official: Scripts of Dashboards.JS Package -->
   <script src="/stimulsoft.reports.js" type="text/javascript"></script>
   <script src="/stimulsoft.dashboards.js" type="text/javascript"></script>
   <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
   <script src="/config.js" type="text/javascript"></script>
+
+  <script type="text/javascript">
+    var cfg = window.__STI__ || {};
+
+    // Connecting SQL Databases — ДО создания report/viewer
+    // https://www.stimulsoft.com/en/documentation/online/programming-manual/reports_js_engine_connecting_sql_data_bases.htm
+    StiOptions.WebServer.url = cfg.dataAdapterUrl || "http://localhost:9615";
+
+    if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
+      Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+    }
+
+    // Official sample: Using with Express / Full-Screen Mode
+    console.log("Set full screen mode for the viewer");
+    var options = new Stimulsoft.Viewer.StiViewerOptions();
+    options.appearance.fullScreenMode = true;
+
+    console.log("Create the dashboard viewer with specified options");
+    var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
+
+    // Docs: replace connection string in onBeginProcessData
+    viewer.onBeginProcessData = function (args) {
+      if (cfg.pgConn && args.database === "PostgreSQL") {
+        args.connectionString = cfg.pgConn;
+      }
+    };
+
+    console.log("Create a new dashboard instance");
+    var report = Stimulsoft.Report.StiReport.createNewDashboard();
+
+    console.log("Load dashboard from url");
+    report.loadFile("/dashboard");
+
+    console.log("Show dashboard template in the viewer");
+    viewer.report = report;
+  </script>
 </head>
 <body>
   <script type="text/javascript">
-    (async function () {
-      var cfg = window.__STI__ || {};
-      try {
-        if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense)
-          Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
-      } catch (e) {}
-
-      StiOptions.WebServer.url = window.location.origin + "/data";
-      StiOptions.WebServer.encryptData = false;
-      StiOptions.WebServer.checkDataAdaptersVersion = false;
-
-      var options = new Stimulsoft.Viewer.StiViewerOptions();
-      options.appearance.fullScreenMode = true;
-      options.toolbar.showParametersButton = false;
-
-      var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
-
-      var text = await (await fetch("/dashboard", { cache: "no-store" })).text();
-      var report = Stimulsoft.Report.StiReport.createNewDashboard();
-      report.load(text);
-
-      // выключить ожидание Submit (из .mrt часто RequestParameters=true)
-      report.requestParameters = false;
-      try {
-        var vars = report.dictionary.variables;
-        for (var i = 0; i < (vars.count || 0); i++) {
-          var v = vars.getByIndex(i);
-          if (!v) continue;
-          v.requestFromUser = false;
-        }
-      } catch (e) {}
-
-      report.onBeginProcessData = function (args) {
-        if (cfg.pgConn) args.connectionString = cfg.pgConn;
-      };
-      viewer.onBeginProcessData = function (args) {
-        if (cfg.pgConn) args.connectionString = cfg.pgConn;
-      };
-
-      viewer.report = report;
-      viewer.renderHtml();
-
-      // На скрине всё ещё панель Submit + пустой холст.
-      // Даже если requestParameters не сбросилcя — жмём Submit сами.
-      function kick() {
-        try {
-          var js = viewer.jsObject;
-          if (!js) return;
-          if (js.postAction) {
-            js.postAction("Submit");
-            js.postAction("GetPages");
-            js.postAction("Refresh");
-          }
-        } catch (e) {}
-        try {
-          var nodes = document.querySelectorAll("a, button, input, div, span");
-          for (var i = 0; i < nodes.length; i++) {
-            var t = (nodes[i].innerText || nodes[i].value || "").trim();
-            if (t === "Submit" || t === "Применить") {
-              nodes[i].click();
-              break;
-            }
-          }
-        } catch (e) {}
-      }
-      setTimeout(kick, 300);
-      setTimeout(kick, 1000);
-      setTimeout(kick, 2500);
-    })();
+    console.log("Render Viewer");
+    viewer.renderHtml();
   </script>
 </body>
 </html>

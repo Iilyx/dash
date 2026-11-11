@@ -16,7 +16,7 @@ services:
       timeout: 5s
       retries: 10
 
-  designer:
+  app:
     build: .
     env_file: .env
     environment:
@@ -26,6 +26,7 @@ services:
       MRT_PATH: /data/dashboard.mrt
     ports:
       - "${DESIGNER_PORT:-8040}:8040"
+      - "9615:9615"
     volumes:
       - ${MRT_FILE:-./dashboard.mrt}:/data/dashboard.mrt
     depends_on:

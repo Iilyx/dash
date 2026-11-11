@@ -2,8 +2,7 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 COPY package.json ./
 RUN npm install
-COPY server.js designer.html viewer.html ./
-COPY public ./public
+COPY adapter.js server.js start.js viewer.html designer.html ./
 ENV PORT=8040
-EXPOSE 8040
-CMD ["node", "server.js"]
+EXPOSE 8040 9615
+CMD ["node", "start.js"]
