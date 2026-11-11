@@ -23,6 +23,7 @@
     console.log("Set full screen mode for the designer");
     var options = new Stimulsoft.Designer.StiDesignerOptions();
     options.appearance.fullScreenMode = true;
+    options.toolbar.showPreviewButton = true;
 
     console.log("Create the dashboard designer with specified options");
     var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
@@ -31,6 +32,26 @@
       if (cfg.pgConn && args.database === "PostgreSQL") {
         args.connectionString = cfg.pgConn;
       }
+    };
+
+    // Встроенный Preview в Dashboards.JS часто белый / только фильтры.
+    // Уводим Preview на полноценный /viewer с актуальным шаблоном.
+    designer.onPreviewReport = function (args) {
+      args.preventDefault = true;
+      var json = args.report.saveToJsonString();
+      fetch("/preview-mrt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: json,
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("preview save failed");
+          window.location = "/viewer?from=preview";
+        })
+        .catch(function (err) {
+          console.error(err);
+          window.location = "/viewer";
+        });
     };
 
     console.log("Create a new dashboard instance");

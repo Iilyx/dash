@@ -38,8 +38,10 @@
     console.log("Create a new dashboard instance");
     var report = Stimulsoft.Report.StiReport.createNewDashboard();
 
-    console.log("Load dashboard from url");
-    report.loadFile("/dashboard");
+    var fromPreview = /(?:\?|&)from=preview(?:&|$)/.test(location.search || "");
+    var mrtUrl = fromPreview ? "/dashboard-preview" : "/dashboard";
+    console.log("Load dashboard from url", mrtUrl);
+    report.loadFile(mrtUrl);
 
     console.log("Show dashboard template in the viewer");
     viewer.report = report;

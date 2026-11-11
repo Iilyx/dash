@@ -61,12 +61,28 @@ function pgConn() {
 }
 
 const MRT = mrtPath();
+const PREVIEW_MRT = path.join(ROOT, ".preview.mrt");
 const LICENSE =
   (process.env.STIMULSOFT_DASHBOARDS_LICENSE_KEY || "").trim() ||
   (process.env.STIMULSOFT_REPORTS_LICENSE_KEY || "").trim();
 const ADAPTER_URL = (process.env.DATA_ADAPTER_URL || "http://localhost:9615").trim();
 
 const app = express();
+
+// raw body for preview snapshot (не express.json — большие .mrt)
+app.post(
+  "/preview-mrt",
+  express.text({ type: "*/*", limit: "50mb" }),
+  (req, res) => {
+    const body = typeof req.body === "string" ? req.body : "";
+    if (!body.trim()) {
+      res.status(400).json({ ok: false, error: "empty preview body" });
+      return;
+    }
+    fs.writeFileSync(PREVIEW_MRT, body, "utf8");
+    res.json({ ok: true });
+  }
+);
 
 app.get("/config.js", (_req, res) => {
   res
@@ -102,6 +118,16 @@ app.get("/dashboard", (_req, res) => {
   }
   res.set("Cache-Control", "no-store");
   res.sendFile(MRT);
+});
+
+// снимок из Designer Preview → /viewer?from=preview
+app.get("/dashboard-preview", (_req, res) => {
+  if (!fs.existsSync(PREVIEW_MRT)) {
+    res.status(404).type("application/json").send(JSON.stringify({ error: "no preview snapshot" }));
+    return;
+  }
+  res.set("Cache-Control", "no-store");
+  res.type("application/json").send(fs.readFileSync(PREVIEW_MRT, "utf8"));
 });
 
 function sendScript(dir, name) {
