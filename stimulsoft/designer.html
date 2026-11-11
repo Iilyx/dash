@@ -54,8 +54,27 @@
         }
       }
 
-      function patchPg(report) {
+      // Preview без панели фильтров / без ожидания Submit
+      function patchForPreview(report) {
         report.requestParameters = false;
+        try {
+          if (report.parametersDisplayMode != null) report.parametersDisplayMode = 0;
+        } catch (e) {}
+
+        try {
+          var vars = report.dictionary.variables;
+          for (var i = 0; i < (vars.count || 0); i++) {
+            var v = vars.getByIndex(i);
+            if (!v) continue;
+            v.requestFromUser = false;
+            try {
+              if ("showOnParametersPanel" in v) v.showOnParametersPanel = false;
+            } catch (e2) {}
+          }
+        } catch (e) {
+          console.warn("[sti] variables patch", e);
+        }
+
         try {
           var dbs = report.dictionary.databases;
           for (var i = 0; i < (dbs.count || 0); i++) {
@@ -63,10 +82,15 @@
             if (db && cfg.pgConn) db.connectionString = cfg.pgConn;
           }
         } catch (e) {}
+
         report.onBeginProcessData = function (args) {
           console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
           if (cfg.pgConn) args.connectionString = cfg.pgConn;
         };
+      }
+
+      function patchPg(report) {
+        patchForPreview(report);
       }
 
       // Живой demo с Postgres, если .mrt scrubbed
@@ -120,13 +144,38 @@
 
       var options = new Stimulsoft.Designer.StiDesignerOptions();
       options.appearance.fullScreenMode = true;
+      // preview-viewer внутри дизайнера — без кнопки Parameters
+      try {
+        if (options.viewerOptions && options.viewerOptions.toolbar) {
+          options.viewerOptions.toolbar.showParametersButton = false;
+        }
+      } catch (e) {}
+
       var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
 
       designer.onBeginProcessData = function (args) {
         if (cfg.pgConn) args.connectionString = cfg.pgConn;
       };
       designer.onPreviewReport = function (args) {
-        patchPg(args.report);
+        patchForPreview(args.report);
+        // дашборд: форсируем отрисовку страниц без Submit по фильтрам
+        setTimeout(function () {
+          try {
+            var js =
+              (designer.jsObject &&
+                designer.jsObject.options &&
+                designer.jsObject.options.viewer &&
+                designer.jsObject.options.viewer.jsObject) ||
+              (designer.viewer && designer.viewer.jsObject) ||
+              null;
+            if (js && js.postAction) {
+              js.postAction("GetPages");
+              console.log("[sti] preview GetPages");
+            }
+          } catch (e) {
+            console.warn("[sti] GetPages", e);
+          }
+        }, 300);
       };
       designer.onSaveReport = function (args) {
         args.preventDefault = true;
