@@ -9,15 +9,15 @@
   <script src="/config.js"></script>
   <script src="/sti-common.js"></script>
   <style>
-    html, body { margin: 0; height: 100%; background: #111; color: #eee; }
+    html, body { margin: 0; height: 100%; }
     #banner {
-      position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
-      padding: 8px 12px; background: #245b2e; color: #fff;
-      font: 13px/1.4 system-ui, sans-serif;
+      position: fixed; z-index: 99999; left: 8px; right: 8px; top: 8px;
+      padding: 6px 10px; background: rgba(36,91,46,.92); color: #fff;
+      font: 12px/1.4 system-ui, sans-serif; border-radius: 4px;
+      pointer-events: none;
     }
-    #banner a { color: #cfc; }
-    #banner.err { background: #7a1f1f; }
-    #viewer { position: absolute; inset: 36px 0 0 0; }
+    #banner a { color: #cfc; pointer-events: auto; }
+    #banner.err { background: rgba(122,31,31,.95); pointer-events: auto; }
   </style>
 </head>
 <body>
@@ -32,49 +32,64 @@
       }
 
       try {
-        if (typeof Stimulsoft === "undefined") throw new Error("Stimulsoft scripts not loaded");
-        if (typeof StiOptions === "undefined") throw new Error("StiOptions missing");
+        if (typeof Stimulsoft === "undefined") throw new Error("Stimulsoft not loaded");
         if (!window.StiApp) throw new Error("sti-common.js not loaded");
 
         var cfg = window.__STI__ || {};
         window.StiApp.applyLicense(cfg);
         window.StiApp.setupAdapter();
 
+        // как в доке: сначала report, потом renderHtml
         var options = new Stimulsoft.Viewer.StiViewerOptions();
-        options.appearance.fullScreenMode = false;
+        options.appearance.fullScreenMode = true;
         options.toolbar.showParametersButton = false;
-        options.appearance.scrollbarsMode = true;
+        options.appearance.showTooltips = true;
 
         var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
         viewer.onBeginProcessData = function (args) {
+          console.log("[viewer] data", args.command, args.database, args.dataSource);
           if (cfg.pgConn) args.connectionString = cfg.pgConn;
         };
-        viewer.renderHtml("viewer");
 
         var loaded = await window.StiApp.loadReport(cfg);
-        viewer.report = loaded.report;
-
+        var report = loaded.report;
         var s = loaded.stats;
+
+        // порядок из sample: assign report → renderHtml
+        viewer.report = report;
+        viewer.renderHtml("viewer");
+
         info(
           (loaded.mode === "mrt" ? "MRT" : "JSON-DEMO") +
             " · pages=" + s.pages +
             " comps=" + s.comps +
             " db=" + s.dbs +
             " ds=" + s.dss +
-            " · <a href='/designer'>designer</a>" +
-            (loaded.mode !== "mrt"
-              ? " · scrubbed .mrt → demo table (положи полный MRT_PATH)"
-              : " · без Request Parameters"),
-          s.pages === 0 || s.comps === 0
+            " · <a href='/designer'>designer</a>",
+          false
         );
 
-        setTimeout(function () {
+        function kick() {
           try {
-            if (viewer.jsObject && viewer.jsObject.postAction) {
-              viewer.jsObject.postAction("GetPages");
-            }
-          } catch (e) {}
-        }, 500);
+            var js = viewer.jsObject;
+            if (!js || !js.postAction) return;
+            // Submit/GetPages/Refresh — иначе дашборд часто остаётся серым
+            js.postAction("Submit");
+            js.postAction("GetPages");
+            js.postAction("Refresh");
+            console.log("[viewer] Submit/GetPages/Refresh");
+          } catch (e) {
+            console.warn("[viewer] kick", e);
+          }
+        }
+
+        setTimeout(kick, 200);
+        setTimeout(kick, 800);
+        setTimeout(kick, 2000);
+
+        viewer.onEndProcessData = function (args) {
+          console.log("[viewer] endProcessData", args && args.dataSource, args);
+        };
       } catch (e) {
         console.error(e);
         info("Viewer error: " + (e && e.message ? e.message : e), true);

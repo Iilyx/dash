@@ -122,14 +122,19 @@ window.StiApp = {
     var mode = "demo-json";
 
     if (json && !window.StiApp.isScrubbed(json)) {
+      // load принимает JSON-строку шаблона
       report.load(json);
       mode = "mrt";
       window.StiApp.patchPg(report, cfg);
+      // на всякий случай ещё раз до назначения в viewer
+      report.requestParameters = false;
     } else {
       window.StiApp.buildJsonDemo(report);
       window.StiApp.disableParameterPrompt(report);
     }
 
-    return { report: report, mode: mode, stats: window.StiApp.stats(report) };
+    var stats = window.StiApp.stats(report);
+    console.log("[sti] loaded", mode, stats);
+    return { report: report, mode: mode, stats: stats };
   },
 };
