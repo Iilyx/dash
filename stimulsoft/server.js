@@ -23,6 +23,7 @@ function loadEnv() {
 loadEnv();
 
 const SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Scripts");
+const CSS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Css");
 const PORT = Number(process.env.PORT || process.env.DESIGNER_PORT || 8040);
 const MRT = (() => {
   const raw = (process.env.MRT_PATH || path.join(ROOT, "dashboard.mrt")).trim();
@@ -150,6 +151,9 @@ for (const name of [
 ]) {
   app.get("/" + name, (_req, res) => res.sendFile(path.join(SCRIPTS, name)));
 }
+
+// темы viewer/designer — без CSS Stimulsoft часто рисует пустой белый холст
+app.use("/Css", express.static(CSS));
 
 app.get("/sti-common.js", (_req, res) => {
   res.sendFile(path.join(ROOT, "public", "sti-common.js"));

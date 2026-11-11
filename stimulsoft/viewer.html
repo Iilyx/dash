@@ -3,96 +3,94 @@
 <head>
   <meta charset="UTF-8" />
   <title>Stimulsoft Dashboards.JS Viewer</title>
+  <link rel="stylesheet" type="text/css" href="/Css/stimulsoft.viewer.office2013.whiteblue.css" />
   <script src="/stimulsoft.reports.js"></script>
   <script src="/stimulsoft.dashboards.js"></script>
   <script src="/stimulsoft.viewer.js"></script>
   <script src="/config.js"></script>
   <script src="/sti-common.js"></script>
   <style>
-    html, body { margin: 0; height: 100%; }
+    html, body { margin: 0; height: 100%; overflow: hidden; }
     #banner {
-      position: fixed; z-index: 99999; left: 8px; right: 8px; top: 8px;
-      padding: 6px 10px; background: rgba(36,91,46,.92); color: #fff;
+      position: fixed; z-index: 99999; left: 8px; top: 8px; max-width: 80%;
+      padding: 6px 10px; background: rgba(36,91,46,.9); color: #fff;
       font: 12px/1.4 system-ui, sans-serif; border-radius: 4px;
-      pointer-events: none;
     }
-    #banner a { color: #cfc; pointer-events: auto; }
-    #banner.err { background: rgba(122,31,31,.95); pointer-events: auto; }
+    #banner a { color: #cfc; }
+    #banner.err { background: rgba(122,31,31,.95); }
   </style>
 </head>
 <body>
   <div id="banner">loading…</div>
-  <div id="viewer"></div>
+  <div id="viewerContent"></div>
   <script>
     (async function () {
       var banner = document.getElementById("banner");
-      function info(html, isErr) {
-        banner.className = isErr ? "err" : "";
-        banner.innerHTML = html;
+      function info(t, err) {
+        banner.className = err ? "err" : "";
+        banner.innerHTML = t;
       }
 
       try {
-        if (typeof Stimulsoft === "undefined") throw new Error("Stimulsoft not loaded");
-        if (!window.StiApp) throw new Error("sti-common.js not loaded");
+        if (!window.Stimulsoft) throw new Error("Stimulsoft scripts missing");
+        if (!window.StiApp) throw new Error("sti-common.js missing");
 
         var cfg = window.__STI__ || {};
         window.StiApp.applyLicense(cfg);
         window.StiApp.setupAdapter();
 
-        // как в доке: сначала report, потом renderHtml
+        // 1) готовим report (как в sample: createNewDashboard + loadFile)
+        var report = Stimulsoft.Report.StiReport.createNewDashboard();
+        report.loadFile("/dashboard");
+
+        var mode = "mrt";
+        var firstDb = null;
+        try {
+          firstDb = report.dictionary.databases.getByIndex(0);
+        } catch (e) {}
+
+        if (!firstDb || !String(firstDb.name || "").trim()) {
+          mode = "demo-json";
+          window.StiApp.buildJsonDemo(report);
+          window.StiApp.disableParameterPrompt(report);
+        } else {
+          window.StiApp.patchPg(report, cfg);
+        }
+
+        var s = window.StiApp.stats(report);
+
+        // 2) viewer: report → renderHtml (дока Stimulsoft)
         var options = new Stimulsoft.Viewer.StiViewerOptions();
         options.appearance.fullScreenMode = true;
         options.toolbar.showParametersButton = false;
-        options.appearance.showTooltips = true;
 
         var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
         viewer.onBeginProcessData = function (args) {
-          console.log("[viewer] data", args.command, args.database, args.dataSource);
           if (cfg.pgConn) args.connectionString = cfg.pgConn;
         };
-
-        var loaded = await window.StiApp.loadReport(cfg);
-        var report = loaded.report;
-        var s = loaded.stats;
-
-        // порядок из sample: assign report → renderHtml
         viewer.report = report;
-        viewer.renderHtml("viewer");
+        viewer.renderHtml("viewerContent");
 
         info(
-          (loaded.mode === "mrt" ? "MRT" : "JSON-DEMO") +
+          mode.toUpperCase() +
             " · pages=" + s.pages +
             " comps=" + s.comps +
-            " db=" + s.dbs +
-            " ds=" + s.dss +
-            " · <a href='/designer'>designer</a>",
-          false
+            " · <a href='/designer'>designer</a>" +
+            " · css=ok",
+          s.comps === 0
         );
 
-        function kick() {
+        setTimeout(function () {
           try {
-            var js = viewer.jsObject;
-            if (!js || !js.postAction) return;
-            // Submit/GetPages/Refresh — иначе дашборд часто остаётся серым
-            js.postAction("Submit");
-            js.postAction("GetPages");
-            js.postAction("Refresh");
-            console.log("[viewer] Submit/GetPages/Refresh");
-          } catch (e) {
-            console.warn("[viewer] kick", e);
-          }
-        }
-
-        setTimeout(kick, 200);
-        setTimeout(kick, 800);
-        setTimeout(kick, 2000);
-
-        viewer.onEndProcessData = function (args) {
-          console.log("[viewer] endProcessData", args && args.dataSource, args);
-        };
+            if (viewer.jsObject && viewer.jsObject.postAction) {
+              viewer.jsObject.postAction("Submit");
+              viewer.jsObject.postAction("GetPages");
+            }
+          } catch (e) {}
+        }, 400);
       } catch (e) {
         console.error(e);
-        info("Viewer error: " + (e && e.message ? e.message : e), true);
+        info("Error: " + (e && e.message ? e.message : e), true);
       }
     })();
   </script>
