@@ -62,9 +62,7 @@
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
       report.load(text);
       report.onBeginProcessData = bindConn;
-      try {
-        report.requestParameters = false;
-      } catch (e) {}
+      // RequestFromUser / parameters panel не сбрасываем — иначе нет фильтров
 
       designer.report = report;
       designer.renderHtml("designer");

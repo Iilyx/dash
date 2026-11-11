@@ -27,6 +27,10 @@
 
       var options = new Stimulsoft.Viewer.StiViewerOptions();
       options.appearance.fullScreenMode = true;
+      // панель параметров (RequestFromUser) — фильтры month/year/…
+      try {
+        options.toolbar.showParametersButton = true;
+      } catch (e) {}
 
       var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
 
@@ -51,18 +55,8 @@
       report.load(text);
       report.onBeginProcessData = bindConn;
 
-      // RequestParameters / RequestFromUser → белый холст до Submit
-      report.requestParameters = false;
-      try {
-        var vars = report.dictionary.variables;
-        for (var i = 0; i < (vars.count || 0); i++) {
-          var v = vars.getByIndex(i);
-          if (!v) continue;
-          try {
-            v.requestFromUser = false;
-          } catch (e) {}
-        }
-      } catch (e) {}
+      // Фильтры оставляем (RequestFromUser / parameters panel).
+      // requestParameters=true → холст пустой до Submit — жмём Submit ниже, флаги не трогаем.
 
       viewer.report = report;
       viewer.renderHtml();
