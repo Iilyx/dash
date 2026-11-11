@@ -164,6 +164,11 @@ def serve_mrt():
     return resp
 
 
+def preview_report(args: StiReportEventArgs):
+    """Preview в designer: данные уже идут через onBeginProcessData."""
+    return None
+
+
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
     sti = StiDesigner()
@@ -171,20 +176,10 @@ def designer():
     sti.options.appearance.fullScreenMode = True
     sti.options.toolbar.showFileMenuExit = True
     sti.options.toolbar.showPreviewButton = True
-    # превью внутри designer — те же опции, что у /viewer
-    sti.options.viewerOptions.appearance.fullScreenMode = True
-    sti.options.viewerOptions.appearance.parametersPanelPosition = (
-        StiParametersPanelPosition.TOP
-    )
-    sti.options.viewerOptions.appearance.parametersPanelColumnsCount = (
-        PARAMETERS_PANEL_COLUMNS
-    )
-    sti.options.viewerOptions.appearance.parametersPanelMaxHeight = (
-        PARAMETERS_PANEL_MAX_HEIGHT
-    )
+    # НЕ трогать viewerOptions.appearance в 2024.2.6:
+    # getHtml пишет в designerOptions.appearance и ломает Preview.
     sti.onBeginProcessData += begin_process_data
-    # без callback Preview в 2024.2.x не вешает handler → кнопка «молчит»
-    sti.onPreviewReport += True
+    sti.onPreviewReport += preview_report
     sti.onSaveReport += save_report
     sti.onSaveAsReport += save_report
     # 2024.2.x: нет javascript.appendHead — raw JS в callback
