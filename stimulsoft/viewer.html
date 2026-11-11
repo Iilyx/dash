@@ -9,24 +9,89 @@
   <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
   <script src="/config.js" type="text/javascript"></script>
   <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #e8e8e8; }
-    #stiStatus {
-      position: fixed; z-index: 99999; left: 8px; bottom: 8px;
-      background: rgba(0,0,0,.8); color: #fff; font: 12px/1.4 monospace;
-      padding: 8px 10px; border-radius: 6px; max-width: 70vw;
+    html, body { margin: 0; height: 100%; background: #d0d0d0; }
+    #viewerHost {
+      position: absolute; left: 0; right: 0; top: 0; bottom: 48px;
     }
+    #stiStatus {
+      position: absolute; left: 0; right: 0; bottom: 0; height: 48px;
+      background: #111; color: #0f0; font: 12px/48px monospace;
+      padding: 0 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      z-index: 99999;
+    }
+    #stiStatus.err { color: #f66; }
   </style>
 </head>
 <body>
+  <div id="viewerHost"></div>
   <div id="stiStatus">loading…</div>
   <script type="text/javascript">
     (async function () {
       var status = document.getElementById("stiStatus");
       var dataHits = 0;
-      function info(msg) {
+      var dataOk = 0;
+      var dataFail = 0;
+      var lastData = "";
+
+      function info(msg, isErr) {
         console.log("[viewer]", msg);
-        if (status) status.textContent = msg + " | /data hits=" + dataHits;
+        status.textContent = msg;
+        status.className = isErr ? "err" : "";
       }
+
+      // перехват /data — видно, уходит ли SQL и что ответил adapter
+      (function () {
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          this.__stiUrl = url;
+          return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function () {
+          var xhr = this;
+          if (String(xhr.__stiUrl || "").indexOf("/data") >= 0) {
+            xhr.addEventListener("load", function () {
+              dataHits += 1;
+              var body = "";
+              try {
+                body = xhr.responseText || "";
+              } catch (e) {}
+              var fail =
+                /"success"\s*:\s*false/i.test(body) ||
+                /notice/i.test(body) && /error|fail|exception/i.test(body);
+              if (xhr.status >= 400 || fail) {
+                dataFail += 1;
+                lastData = "FAIL " + body.slice(0, 120);
+                info(
+                  "hits=" +
+                    dataHits +
+                    " ok=" +
+                    dataOk +
+                    " fail=" +
+                    dataFail +
+                    " | " +
+                    lastData,
+                  true
+                );
+              } else {
+                dataOk += 1;
+                lastData = "OK " + body.slice(0, 80);
+                info(
+                  "hits=" +
+                    dataHits +
+                    " ok=" +
+                    dataOk +
+                    " fail=" +
+                    dataFail +
+                    " | " +
+                    lastData
+                );
+              }
+            });
+          }
+          return origSend.apply(this, arguments);
+        };
+      })();
 
       var cfg = window.__STI__ || {};
       StiOptions.WebServer.url =
@@ -41,14 +106,14 @@
       }
 
       var options = new Stimulsoft.Viewer.StiViewerOptions();
-      options.appearance.fullScreenMode = true;
+      // без fullScreen — явный контейнер, иначе холст часто 0px под панелью
+      options.appearance.fullScreenMode = false;
       try {
         options.appearance.scrollbarsMode = true;
       } catch (e) {}
       try {
         options.toolbar.showParametersButton = true;
       } catch (e) {}
-      // панель фильтров сверху, но НЕ на весь экран
       try {
         if (Stimulsoft.Viewer && Stimulsoft.Viewer.StiParametersPanelPosition) {
           options.appearance.parametersPanelPosition =
@@ -56,7 +121,7 @@
         }
       } catch (e) {}
       try {
-        options.appearance.parametersPanelMaxHeight = 160;
+        options.appearance.parametersPanelMaxHeight = 140;
       } catch (e) {}
       try {
         options.appearance.parametersPanelColumnsCount = 3;
@@ -64,23 +129,19 @@
       try {
         options.appearance.minParametersCountForMultiColumns = 1;
       } catch (e) {}
+      try {
+        options.height = "100%";
+      } catch (e) {}
 
       var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
 
       function bindConn(args) {
-        dataHits += 1;
         if (cfg.pgConn) {
           args.connectionString = cfg.pgConn;
           try {
             args.database = "PostgreSQL";
           } catch (e) {}
         }
-        info(
-          "SQL " +
-            (args.dataSource || args.command || "") +
-            " " +
-            String(args.queryString || "").slice(0, 80)
-        );
       }
       viewer.onBeginProcessData = bindConn;
 
@@ -90,17 +151,11 @@
       var resp = await fetch(mrtUrl, { cache: "no-store" });
       if (!resp.ok) throw new Error(mrtUrl + " HTTP " + resp.status);
       var text = await resp.text();
-      if (!text.trim()) throw new Error("empty MRT");
 
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
       report.load(text);
       report.onBeginProcessData = bindConn;
-
-      // критично: иначе холст ждёт Submit и остаётся белым
       report.requestParameters = false;
-      try {
-        report.reportPass = "First";
-      } catch (e) {}
 
       try {
         if (Stimulsoft.Report && Stimulsoft.Report.StiParametersDisplayMode) {
@@ -121,9 +176,7 @@
         var vars = report.dictionary.variables;
         for (var i = 0; i < (vars.count || 0); i++) {
           var v = vars.getByIndex(i);
-          if (!v) continue;
-          var name = String(v.name || "").trim();
-          if (!name) continue;
+          if (!v || !String(v.name || "").trim()) continue;
           if (v.requestFromUser || v.showOnParametersPanel) {
             v.requestFromUser = true;
             v.showOnParametersPanel = true;
@@ -141,17 +194,21 @@
         }
       } catch (e) {}
 
-      info("loaded pages=" + pages + " comps=" + comps);
+      info(
+        "pages=" +
+          pages +
+          " comps=" +
+          comps +
+          " pg=" +
+          (cfg.pgConn ? "yes" : "NO") +
+          " → " +
+          StiOptions.WebServer.url
+      );
+      if (!comps) throw new Error("MRT without components");
 
-      if (!pages || !comps) {
-        throw new Error("MRT empty: pages=" + pages + " comps=" + comps);
-      }
-
-      // как в рабочем коммите: сначала report, потом renderHtml
       viewer.report = report;
-      viewer.renderHtml();
+      viewer.renderHtml("viewerHost");
 
-      // значения в панели уже есть → жмём Submit, иначе SQL не уходит
       function clickSubmit() {
         try {
           var panel =
@@ -167,7 +224,7 @@
           }
         } catch (e) {}
         try {
-          var nodes = document.querySelectorAll("input, button, a, div, span");
+          var nodes = document.querySelectorAll("input,button,a,div,span");
           for (var i = 0; i < nodes.length; i++) {
             var t = (nodes[i].innerText || nodes[i].value || "").trim();
             if (t === "Submit" || t === "Применить") {
@@ -188,37 +245,24 @@
       }
 
       var n = 0;
-      var t = setInterval(function () {
-        var ok = clickSubmit();
+      var timer = setInterval(function () {
+        clickSubmit();
         n += 1;
-        info(
-          "pages=" +
-            pages +
-            " comps=" +
-            comps +
-            " submit=" +
-            ok +
-            " try=" +
-            n
-        );
-        if (ok || n >= 12) clearInterval(t);
-      }, 400);
-
-      setTimeout(function () {
-        if (dataHits === 0) {
-          info(
-            "WARNING: нет запросов /data — SQL не вызывался. Нажми Submit вручную."
-          );
-          if (status) status.style.background = "#840";
+        if (n >= 15) {
+          clearInterval(timer);
+          if (dataHits === 0) {
+            info(
+              "нет /data после Submit — смотри Console. comps=" + comps,
+              true
+            );
+          }
         }
-      }, 5000);
+      }, 500);
     })().catch(function (err) {
       console.error(err);
       var status = document.getElementById("stiStatus");
-      if (status) {
-        status.style.background = "#800";
-        status.textContent = String(err && err.message ? err.message : err);
-      }
+      status.className = "err";
+      status.textContent = String(err && err.message ? err.message : err);
     });
   </script>
 </body>
