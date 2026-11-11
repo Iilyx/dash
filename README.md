@@ -29,3 +29,14 @@ curl -s http://127.0.0.1:8090/ask \
 Ответ: `answer`, `view` (markdown-сцена), `dashboard.layout`, `sql_results`, …
 
 `ask_trace.txt`: … → SQL (MCP) → DASHBOARD → RESULT
+
+## Stimulsoft viewer (Python)
+
+```bash
+cp .env.example .env   # MRT_PATH, POSTGRES_*, license
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python view_dashboard.py
+```
+
+Viewer: http://127.0.0.1:8040/viewer · Designer: `/designer`
+
