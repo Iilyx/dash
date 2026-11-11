@@ -11,16 +11,11 @@
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #c8c8c8; }
     #stiStatus {
-      position: fixed; z-index: 99999; left: 0; right: 0; bottom: 0; height: 40px;
-      background: #111; color: #0f0; font: 12px/40px monospace;
+      position: fixed; z-index: 99999; left: 0; right: 0; bottom: 0; height: 36px;
+      background: #111; color: #0f0; font: 12px/36px monospace;
       padding: 0 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     #stiStatus.err { color: #f66; }
-    /* если Stimulsoft схлопнул область дашборда */
-    .stiJsViewerPage, .stiJsViewerDashboardPanel, .stiJsViewerReportPanel,
-    .stiJsViewerMainPanel, [class*="Dashboard"] {
-      min-height: 480px !important;
-    }
   </style>
 </head>
 <body>
@@ -28,43 +23,11 @@
   <script type="text/javascript">
     (async function () {
       var status = document.getElementById("stiStatus");
-      var dataHits = 0, dataOk = 0;
       function info(msg, err) {
         console.log("[viewer]", msg);
         status.textContent = msg;
         status.className = err ? "err" : "";
       }
-
-      (function () {
-        var oOpen = XMLHttpRequest.prototype.open;
-        var oSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (m, u) {
-          this.__u = u;
-          return oOpen.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function () {
-          var x = this;
-          if (String(x.__u || "").indexOf("/data") >= 0) {
-            x.addEventListener("load", function () {
-              dataHits++;
-              var t = "";
-              try {
-                t = x.responseText || "";
-              } catch (e) {}
-              if (x.status < 400 && !/"success"\s*:\s*false/i.test(t)) dataOk++;
-              info(
-                "SQL hits=" +
-                  dataHits +
-                  " ok=" +
-                  dataOk +
-                  " | " +
-                  t.slice(0, 60)
-              );
-            });
-          }
-          return oSend.apply(this, arguments);
-        };
-      })();
 
       var cfg = window.__STI__ || {};
       StiOptions.WebServer.url =
@@ -79,7 +42,6 @@
       }
 
       var options = new Stimulsoft.Viewer.StiViewerOptions();
-      // официальный dashboard sample — full screen
       options.appearance.fullScreenMode = true;
       try {
         options.appearance.theme =
@@ -95,7 +57,7 @@
         }
       } catch (e) {}
       try {
-        options.appearance.parametersPanelMaxHeight = 120;
+        options.appearance.parametersPanelMaxHeight = 140;
       } catch (e) {}
       try {
         options.appearance.parametersPanelColumnsCount = 3;
@@ -113,6 +75,67 @@
       }
       viewer.onBeginProcessData = bindConn;
 
+      // Форум Stimulsoft: после parameters panel для Dashboard нужен GetPages,
+      // иначе холст белый при живых фильтрах (JS 2024.x).
+      function hookDashboardGetPages(js) {
+        if (!js || js.__stiDashHook) return;
+        js.__stiDashHook = true;
+
+        function forceDashboardPages(tag) {
+          try {
+            var type =
+              (js.reportParams && js.reportParams.type) ||
+              (js.options && js.options.reportType) ||
+              "";
+            info("GetPages (" + tag + ") type=" + type);
+            if (js.postAction) {
+              js.postAction("GetPages");
+              js.postAction("ZoomPageWidth");
+            }
+          } catch (e) {
+            console.warn(e);
+          }
+        }
+
+        if (typeof js.showParametersPanel === "function") {
+          var origShow = js.showParametersPanel.bind(js);
+          js.showParametersPanel = function (data, jsObject) {
+            var ret = origShow(data, jsObject);
+            try {
+              js.options.isParametersReceived = true;
+            } catch (e) {}
+            forceDashboardPages("showParametersPanel");
+            return ret;
+          };
+        }
+
+        if (typeof js.InitializeParametersPanel === "function") {
+          var origInit = js.InitializeParametersPanel.bind(js);
+          js.InitializeParametersPanel = function () {
+            var ret = origInit.apply(js, arguments);
+            forceDashboardPages("InitializeParametersPanel");
+            return ret;
+          };
+        }
+
+        // после Submit тоже
+        if (js.controls && js.controls.parametersPanel && js.controls.parametersPanel.mainButtons) {
+          try {
+            var btn = js.controls.parametersPanel.mainButtons.submit;
+            if (btn && !btn.__stiWrapped) {
+              btn.__stiWrapped = true;
+              var prev = btn.action;
+              btn.action = function () {
+                if (typeof prev === "function") prev.apply(this, arguments);
+                setTimeout(function () {
+                  forceDashboardPages("Submit");
+                }, 50);
+              };
+            }
+          } catch (e) {}
+        }
+      }
+
       var fromPreview = /(?:\?|&)from=preview(?:&|$)/.test(location.search || "");
       var mrtUrl = fromPreview ? "/dashboard-preview" : "/dashboard";
       var text = await (await fetch(mrtUrl, { cache: "no-store" })).text();
@@ -120,6 +143,7 @@
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
       report.load(text);
       report.onBeginProcessData = bindConn;
+      // не блокируем первую отрисовку страницы дашборда
       report.requestParameters = false;
 
       try {
@@ -149,45 +173,30 @@
         }
       } catch (e) {}
 
-      // выбрать страницу с максимумом компонентов (не пустую)
-      var best = 0,
-        bestComps = -1,
-        pageInfo = [];
+      var comps = 0;
       try {
         for (var p = 0; p < (report.pages.count || 0); p++) {
           var page = report.pages.getByIndex(p);
-          var c = (page && page.components && page.components.count) || 0;
-          var nm = (page && (page.name || page.Name)) || ("p" + p);
-          pageInfo.push(nm + ":" + c);
-          if (c > bestComps) {
-            bestComps = c;
-            best = p;
-          }
-        }
-        if (best > 0 && report.pages.getByIndex) {
-          // сделать «толстую» страницу первой
-          try {
-            var rich = report.pages.getByIndex(best);
-            report.currentPage = best;
-          } catch (e) {}
+          comps += (page && page.components && page.components.count) || 0;
         }
       } catch (e) {}
+      info("comps=" + comps + " → render");
+      if (!comps) throw new Error("MRT without components");
 
-      info(
-        "pages=[" +
-          pageInfo.join(", ") +
-          "] best=" +
-          best +
-          " comps=" +
-          bestComps
-      );
-      if (bestComps <= 0) throw new Error("no dashboard components in MRT");
-
-      // официальный порядок full-screen sample
       viewer.renderHtml();
       viewer.report = report;
 
-      function clickSubmit() {
+      var n = 0;
+      var timer = setInterval(function () {
+        n++;
+        try {
+          if (viewer.jsObject) hookDashboardGetPages(viewer.jsObject);
+        } catch (e) {}
+        try {
+          if (viewer.jsObject && viewer.jsObject.postAction) {
+            viewer.jsObject.postAction("GetPages");
+          }
+        } catch (e) {}
         try {
           var panel =
             viewer.jsObject &&
@@ -196,68 +205,13 @@
           var btn = panel && panel.mainButtons && panel.mainButtons.submit;
           if (btn) {
             if (typeof btn.action === "function") btn.action();
-            else btn.click && btn.click();
-            return true;
+            else if (btn.click) btn.click();
           }
         } catch (e) {}
-        try {
-          var nodes = document.querySelectorAll("input,button,a,div,span");
-          for (var i = 0; i < nodes.length; i++) {
-            var t = (nodes[i].innerText || nodes[i].value || "").trim();
-            if (t === "Submit" || t === "Применить") {
-              nodes[i].click();
-              return true;
-            }
-          }
-        } catch (e) {}
-        try {
-          if (viewer.jsObject && viewer.jsObject.postAction) {
-            viewer.jsObject.postAction("Submit");
-            viewer.jsObject.postAction("GetPages");
-            return true;
-          }
-        } catch (e) {}
-        return false;
-      }
-
-      var n = 0;
-      var t = setInterval(function () {
-        clickSubmit();
-        try {
-          if (viewer.jsObject && viewer.jsObject.postAction) {
-            viewer.jsObject.postAction("GetPages");
-            viewer.jsObject.postAction("ZoomPageWidth");
-          }
-        } catch (e) {}
-        // диагностика видимости
-        try {
-          var el =
-            document.querySelector(".stiJsViewerPage") ||
-            document.querySelector(".stiJsViewerDashboardPanel") ||
-            document.querySelector("#StiViewer");
-          if (el) {
-            var r = el.getBoundingClientRect();
-            info(
-              "SQL ok=" +
-                dataOk +
-                "/" +
-                dataHits +
-                " | canvas " +
-                Math.round(r.width) +
-                "x" +
-                Math.round(r.height) +
-                " top=" +
-                Math.round(r.top) +
-                " | " +
-                pageInfo.join(",")
-            );
-          }
-        } catch (e) {}
-        if (++n >= 20) clearInterval(t);
-      }, 500);
+        if (n >= 10) clearInterval(timer);
+      }, 400);
     })().catch(function (err) {
       console.error(err);
-      var status = document.getElementById("stiStatus");
       status.className = "err";
       status.textContent = String(err && err.message ? err.message : err);
     });
