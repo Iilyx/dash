@@ -146,6 +146,30 @@ _PREVIEW_JS = (
     "}"
 )
 
+# RequestFromUser: без Submit холст пустой — рендерим сразу + жмём Submit
+_VIEWER_LOAD_PATCH = "report.requestParameters = false;\n"
+_VIEWER_AUTOSUBMIT_JS = """
+window.viewer = viewer;
+(function () {
+  function clickSubmit() {
+    try {
+      var panel = viewer.jsObject && viewer.jsObject.controls
+        && viewer.jsObject.controls.parametersPanel;
+      var btn = panel && panel.mainButtons && panel.mainButtons.submit;
+      if (!btn) return false;
+      if (typeof btn.action === 'function') btn.action();
+      else if (typeof btn.onclick === 'function') btn.onclick();
+      else btn.click();
+      return true;
+    } catch (e) { return false; }
+  }
+  var n = 0;
+  var t = setInterval(function () {
+    if (clickSubmit() || ++n > 40) clearInterval(t);
+  }, 250);
+})();
+""".replace("\n", "")
+
 
 def begin_process_data(args: StiDataEventArgs) -> None:
     if PG_CONN:
@@ -180,6 +204,37 @@ def _patch_preview_to_viewer(resp: Response) -> Response:
             1,
         )
     resp.set_data(patched)
+    return resp
+
+
+def _patch_viewer_render(resp: Response) -> Response:
+    """Сразу отрисовать дашборд: не ждать ручной Submit по RequestParameters."""
+    html = resp.get_data(as_text=True)
+    if "report.requestParameters" not in html:
+        html = html.replace(
+            "report.loadFile('/mrt');",
+            "report.loadFile('/mrt');\n" + _VIEWER_LOAD_PATCH,
+            1,
+        )
+        if "report.requestParameters" not in html:
+            html = html.replace(
+                'report.loadFile("/mrt");',
+                'report.loadFile("/mrt");\n' + _VIEWER_LOAD_PATCH,
+                1,
+            )
+    if "parametersPanel.mainButtons.submit" not in html:
+        html = html.replace(
+            "viewer.renderHtml('viewerContent');",
+            "viewer.renderHtml('viewerContent');\n" + _VIEWER_AUTOSUBMIT_JS,
+            1,
+        )
+        if "parametersPanel.mainButtons.submit" not in html:
+            html = html.replace(
+                'viewer.renderHtml("viewerContent");',
+                'viewer.renderHtml("viewerContent");\n' + _VIEWER_AUTOSUBMIT_JS,
+                1,
+            )
+    resp.set_data(html)
     return resp
 
 
@@ -251,7 +306,7 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     sti.report = report
-    return sti.getFrameworkResponse()
+    return _patch_viewer_render(sti.getFrameworkResponse())
 
 
 def main() -> None:
