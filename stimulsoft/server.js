@@ -111,23 +111,45 @@ app.get("/", (_req, res) => {
   res.redirect("/viewer");
 });
 
-app.get("/dashboard", (_req, res) => {
-  if (!fs.existsSync(MRT)) {
-    res.status(404).type("application/json").send(JSON.stringify({ error: "mrt missing", path: MRT }));
+/** JS 2024.3.3 не крутит CSharp — для preview/viewer подменяем на JavaScript. */
+function patchMrtForJs(raw) {
+  if (!raw) return raw;
+  let text = String(raw);
+  // JSON .mrt
+  if (/"ScriptLanguage"\s*:/.test(text)) {
+    text = text.replace(
+      /"ScriptLanguage"\s*:\s*"(CSharp|VB|C#)"/gi,
+      '"ScriptLanguage":"JavaScript"'
+    );
+  }
+  // XML .mrt
+  if (/<ScriptLanguage>/i.test(text)) {
+    text = text.replace(
+      /<ScriptLanguage>\s*(CSharp|VB|C#)\s*<\/ScriptLanguage>/gi,
+      "<ScriptLanguage>JavaScript</ScriptLanguage>"
+    );
+  }
+  return text;
+}
+
+function sendMrtFile(filePath, res) {
+  if (!fs.existsSync(filePath)) {
+    res.status(404).type("application/json").send(JSON.stringify({ error: "mrt missing", path: filePath }));
     return;
   }
+  const raw = fs.readFileSync(filePath, "utf8");
+  const body = patchMrtForJs(raw);
   res.set("Cache-Control", "no-store");
-  res.sendFile(MRT);
+  res.type("application/json; charset=utf-8").send(body);
+}
+
+app.get("/dashboard", (_req, res) => {
+  sendMrtFile(MRT, res);
 });
 
 // снимок из Designer Preview → /viewer?from=preview
 app.get("/dashboard-preview", (_req, res) => {
-  if (!fs.existsSync(PREVIEW_MRT)) {
-    res.status(404).type("application/json").send(JSON.stringify({ error: "no preview snapshot" }));
-    return;
-  }
-  res.set("Cache-Control", "no-store");
-  res.type("application/json").send(fs.readFileSync(PREVIEW_MRT, "utf8"));
+  sendMrtFile(PREVIEW_MRT, res);
 });
 
 function sendScript(dir, name) {
