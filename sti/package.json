@@ -1,0 +1,15 @@
+{
+  "name": "sti-designer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stimulsoft Dashboards.JS 2024.3.3 designer + SQL adapter",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "stimulsoft-dashboards-js": "2024.3.3",
+    "stimulsoft-data-adapter": "2024.3.3"
+  }
+}

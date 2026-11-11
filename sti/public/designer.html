@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stimulsoft Dashboards.JS Designer</title>
+  <script src="/stimulsoft.reports.js"></script>
+  <script src="/stimulsoft.dashboards.js"></script>
+  <script src="/stimulsoft.viewer.js"></script>
+  <script src="/stimulsoft.designer.js"></script>
+  <script src="/stimulsoft.blockly.editor.js"></script>
+  <script src="/config.js"></script>
+</head>
+<body>
+  <div id="designer"></div>
+  <script>
+    (function () {
+      var cfg = window.__STI__ || {};
+
+      if (cfg.licenseKey) {
+        Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+      }
+
+      // SQL → Express /data (stimulsoft-data-adapter)
+      Stimulsoft.Base.StiOptions.WebServer.url =
+        cfg.dataAdapterUrl && cfg.dataAdapterUrl.indexOf("http") === 0
+          ? cfg.dataAdapterUrl
+          : window.location.origin + (cfg.dataAdapterUrl || "/data");
+
+      var options = new Stimulsoft.Designer.StiDesignerOptions();
+      options.appearance.fullScreenMode = true;
+
+      var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
+
+      designer.onBeginProcessData = function (args) {
+        var db = String(args.database || "");
+        if (/postgres|npgsql/i.test(db) && cfg.pgConn) {
+          args.connectionString = cfg.pgConn;
+        }
+      };
+
+      designer.onSaveReport = function (args) {
+        args.preventDefault = true;
+        var json = args.report.saveToJsonString();
+        fetch("/mrt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: json,
+        }).then(function (r) {
+          if (!r.ok) throw new Error("save failed: " + r.status);
+        }).catch(function (err) {
+          alert(String(err && err.message ? err.message : err));
+        });
+      };
+
+      designer.onSaveAsReport = designer.onSaveReport;
+
+      designer.renderHtml("designer");
+
+      var report = Stimulsoft.Report.StiReport.createNewDashboard();
+      report.loadFile("/mrt");
+      designer.report = report;
+    })();
+  </script>
+</body>
+</html>
