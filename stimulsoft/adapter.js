@@ -16,17 +16,40 @@ function accept(request, response) {
     return;
   }
 
+  // GET / probe (браузер, healthcheck) — пустое тело, getCommand падает
+  if (request.method === "GET" || request.method === "HEAD") {
+    response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Stimulsoft Data Adapter OK");
+    return;
+  }
+
   var data = "";
   request.on("data", function (buffer) {
     data += buffer;
   });
 
   request.on("end", function () {
-    var command = adapter.getCommand(data);
-    adapter.process(command, function (result) {
-      var responseData = adapter.getResponse(result);
-      response.end(responseData);
-    });
+    if (!data || !String(data).trim()) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ success: false, notice: "Empty adapter command" }));
+      return;
+    }
+    try {
+      var command = adapter.getCommand(data);
+      adapter.process(command, function (result) {
+        var responseData = adapter.getResponse(result);
+        response.end(responseData);
+      });
+    } catch (err) {
+      console.error("[adapter]", err && err.message ? err.message : err);
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(
+        JSON.stringify({
+          success: false,
+          notice: String(err && err.message ? err.message : err),
+        })
+      );
+    }
   });
 }
 
