@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2024.3.3).
+"""Stimulsoft Dashboards.PYTHON 2024.3.3 — designer как в Samples-Dashboards.Python.
 
-2024.3.3 — последняя до смены Format(): короткое "N1" ещё авто-оборачивается в "{0:N1}".
-С 2024.3.4 / 2025+ — другая ветка со скобками { } (NPS-шаблоны ломаются).
-
-Встроенный Preview в designer иногда показывает только фильтры.
-Кнопка Preview: сохранить .mrt → открыть /viewer.
+Официальный паттерн:
+  StiDesigner + processRequest + StiReport.loadFile + getFrameworkResponse
+  onBeginProcessData (Postgres) + onSaveReport
 
 Запуск:
-  # в .env: MRT_PATH=.../dashboard.mrt
+  # .env: MRT_PATH=... STIMULSOFT_LICENSE_KEY=... POSTGRES_*
   .venv/bin/python view_dashboard.py
 """
 
@@ -16,15 +14,15 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
+# подтягивает stimulsoft.dashboards.js в HTML (без этого только Reports)
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request
-from stimulsoft_reports import StiResult
+from stimulsoft_reports import StiLicense, StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
@@ -33,13 +31,6 @@ from stimulsoft_reports.viewer.enums import (
     StiParametersPanelPosition,
     StiToolbarDisplayMode,
 )
-
-try:
-    from stimulsoft_reports import StiLicense
-except ImportError:  # older builds
-    from stimulsoft_reports.classes.StiLicenseStatic import (  # type: ignore
-        StiLicenseStatic as StiLicense,
-    )
 
 ROOT = Path(__file__).resolve().parent
 
@@ -91,7 +82,6 @@ def stimulsoft_pg_connection_string(url: str) -> str:
 
 
 def check_postgres(url: str) -> str:
-    """Быстрый ping — без этого viewer покажет только фильтры."""
     try:
         import psycopg
     except ImportError:
@@ -102,7 +92,7 @@ def check_postgres(url: str) -> str:
                 cur.execute("select 1")
                 cur.fetchone()
         return "ok"
-    except Exception as exc:  # noqa: BLE001 — диагностика старта
+    except Exception as exc:  # noqa: BLE001
         return f"FAIL: {exc}"
 
 
@@ -116,14 +106,11 @@ def resolve_mrt_path() -> Path:
 
 
 def apply_license() -> str:
-    """Ставит Stimulsoft.Base.StiLicense.Key (один на Reports+Dashboards).
+    """Как в How_to_Activate_the_Product: StiLicense.setKey / setFile.
 
-    Приоритет:
-      1) STIMULSOFT_LICENSE_KEY / _FILE — Ultimate / общий
-      2) STIMULSOFT_DASHBOARDS_LICENSE_KEY / _FILE — нужен для viewer дашбордов
-      3) STIMULSOFT_REPORTS_LICENSE_KEY / _FILE — Reports-only (дашборд может не открыться)
+    Приоритет: Ultimate → Dashboards → Reports (в JS один Base.StiLicense.Key).
     """
-    candidates: list[tuple[str, str, str]] = [
+    candidates = [
         ("ultimate", "STIMULSOFT_LICENSE_KEY", "STIMULSOFT_LICENSE_FILE"),
         (
             "dashboards",
@@ -189,62 +176,17 @@ PG_STATUS = check_postgres(_DB_URL)
 
 app = Flask(__name__)
 
-# встроенный Preview → сохранить и открыть /viewer
-_PREVIEW_JS = (
-    "designer.onPreviewReport = function (args, callback) { "
-    "args.preventDefault = true; "
-    "Stimulsoft.handler.process(args, function () { window.location = '/viewer'; }); "
-    "}"
-)
-
-# RequestFromUser: холст пустой, пока не уйдёт Variables/Submit.
-# requestParameters=false ломает первый рендер дашборда — только отложенный Submit.
-_VIEWER_AUTOSUBMIT_JS = """
-window.viewer = viewer;
-(function () {
-  var tries = 0;
-  var done = false;
-  function ready() {
-    try {
-      var jo = viewer.jsObject;
-      if (!jo || !jo.controls || !jo.controls.parametersPanel) return false;
-      var panel = jo.controls.parametersPanel;
-      if (!panel.mainButtons || !panel.mainButtons.submit) return false;
-      if (jo.service && jo.service.isRequestInProcess) return false;
-      // панель уже с переменными (иначе Submit уйдёт впустую)
-      if (panel.visible === false) return false;
-      return true;
-    } catch (e) { return false; }
-  }
-  function go() {
-    if (done) return;
-    tries += 1;
-    if (!ready()) {
-      if (tries < 80) setTimeout(go, 250);
-      return;
-    }
-    done = true;
-    try { viewer.jsObject.postAction('Submit'); }
-    catch (e) {}
-  }
-  setTimeout(go, 600);
-})();
-""".replace("\n", "")
-
 
 def begin_process_data(args: StiDataEventArgs) -> None:
+    """Как в Using_Parameters_in_SQL_Query — подмена connection string."""
     if PG_CONN:
         args.connectionString = PG_CONN
     db = getattr(args, "database", None)
     src = getattr(args, "dataSource", None) or "?"
-    conn_name = getattr(args, "connection", None) or "?"
     sql = (getattr(args, "queryString", None) or "").replace("\n", " ").strip()
     if len(sql) > 180:
         sql = sql[:180] + "…"
-    print(
-        f"[data] BEGIN db={db} source={src} conn={conn_name} sql={sql or '<empty>'}",
-        flush=True,
-    )
+    print(f"[data] BEGIN db={db} source={src} sql={sql or '<empty>'}", flush=True)
 
 
 def end_process_data(args: StiDataEventArgs) -> None:
@@ -258,13 +200,11 @@ def end_process_data(args: StiDataEventArgs) -> None:
     rows = getattr(result, "count", None)
     if rows is None and getattr(result, "rows", None) is not None:
         rows = len(result.rows)
-    print(
-        f"[data] END source={src} ok={ok} rows={rows} notice={notice!r}",
-        flush=True,
-    )
+    print(f"[data] END source={src} ok={ok} rows={rows} notice={notice!r}", flush=True)
 
 
 def save_report(args: StiReportEventArgs):
+    """Как в Saving_a_Dashboard_Template_on_the_Server_Side."""
     if args.report is None:
         return StiResult.getError("пустой report — нечего сохранять")
     try:
@@ -275,43 +215,11 @@ def save_report(args: StiReportEventArgs):
     return None
 
 
-def _patch_preview_to_viewer(resp: Response) -> Response:
-    """Подменить встроенный Preview на переход в /viewer после save."""
-    html = resp.get_data(as_text=True)
-    patched, n = re.subn(
-        r"designer\.onPreviewReport\s*=\s*function\s*\([^)]*\)\s*\{[^}]*\}",
-        _PREVIEW_JS,
-        html,
-        count=1,
-    )
-    if n == 0:
-        # handler не сгенерился — вставим перед renderHtml
-        patched = html.replace(
-            "designer.renderHtml(",
-            _PREVIEW_JS + ";\ndesigner.renderHtml(",
-            1,
-        )
-    resp.set_data(patched)
-    return resp
-
-
-def _patch_viewer_render(resp: Response) -> Response:
-    """После загрузки панели параметров нажать Submit (иначе пустой холст)."""
-    html = resp.get_data(as_text=True)
-    if "postAction('Submit')" not in html and 'postAction("Submit")' not in html:
-        html = html.replace(
-            "viewer.renderHtml('viewerContent');",
-            "viewer.renderHtml('viewerContent');\n" + _VIEWER_AUTOSUBMIT_JS,
-            1,
-        )
-        if "postAction('Submit')" not in html and 'postAction("Submit")' not in html:
-            html = html.replace(
-                'viewer.renderHtml("viewerContent");',
-                'viewer.renderHtml("viewerContent");\n' + _VIEWER_AUTOSUBMIT_JS,
-                1,
-            )
-    resp.set_data(html)
-    return resp
+def make_report() -> StiReport:
+    report = StiReport()
+    # абсолютный /mrt — иначе relative loadFile с /designer даёт 404
+    report.loadFile("/mrt")
+    return report
 
 
 @app.get("/favicon.ico")
@@ -340,51 +248,44 @@ def not_found(_err):
 @app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
-    sti = StiDesigner()
-    sti.options.appearance.fullScreenMode = True
-    sti.options.toolbar.showPreviewButton = True
-    sti.options.toolbar.showFileMenuExit = True
-    sti.onBeginProcessData += begin_process_data
-    sti.onEndProcessData += end_process_data
-    # PREVIEW_REPORT / Save — пишем актуальный .mrt
-    sti.onPreviewReport += save_report
-    sti.onSaveReport += save_report
-    sti.onSaveAsReport += save_report
-    sti.onExit += "window.location = '/viewer';"
+    """Editing_a_Dashboard_Template_in_the_Designer — дефолтный редактор."""
+    designer = StiDesigner()
+    designer.options.appearance.fullScreenMode = True
 
-    if sti.processRequest(request):
-        return sti.getFrameworkResponse()
+    designer.onBeginProcessData += begin_process_data
+    designer.onEndProcessData += end_process_data
+    designer.onSaveReport += save_report
+    designer.onSaveAsReport += save_report
 
-    report = StiReport()
-    report.loadFile("/mrt")
-    sti.report = report
-    return _patch_preview_to_viewer(sti.getFrameworkResponse())
+    if designer.processRequest(request):
+        return designer.getFrameworkResponse()
+
+    designer.report = make_report()
+    return designer.getFrameworkResponse()
 
 
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
-    """Preview дашборда — обход broken embedded Preview в designer."""
-    sti = StiViewer()
-    sti.id = "viewer"
-    sti.options.appearance.fullScreenMode = True
-    sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
-    sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
-    if hasattr(sti.options.appearance, "minParametersCountForMultiColumns"):
-        sti.options.appearance.minParametersCountForMultiColumns = 1
-    sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
-    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
-    sti.options.toolbar.showDesignButton = True
-    sti.onBeginProcessData += begin_process_data
-    sti.onEndProcessData += end_process_data
-    sti.onDesignReport += "window.location = '/designer';"
+    """Showing_a_Dashboard_in_the_Viewer + Design → /designer."""
+    viewer = StiViewer()
+    viewer.options.appearance.fullScreenMode = True
+    viewer.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    viewer.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
+    if hasattr(viewer.options.appearance, "minParametersCountForMultiColumns"):
+        viewer.options.appearance.minParametersCountForMultiColumns = 1
+    viewer.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
+    viewer.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
+    viewer.options.toolbar.showDesignButton = True
 
-    if sti.processRequest(request):
-        return sti.getFrameworkResponse()
+    viewer.onBeginProcessData += begin_process_data
+    viewer.onEndProcessData += end_process_data
+    viewer.onDesignReport += "window.location = '/designer';"
 
-    report = StiReport()
-    report.loadFile("/mrt")
-    sti.report = report
-    return _patch_viewer_render(sti.getFrameworkResponse())
+    if viewer.processRequest(request):
+        return viewer.getFrameworkResponse()
+
+    viewer.report = make_report()
+    return viewer.getFrameworkResponse()
 
 
 def main() -> None:
@@ -399,8 +300,8 @@ def main() -> None:
     )
     if PG_STATUS != "ok":
         print(
-            "WARNING: БД недоступна — в /viewer останутся только фильтры. "
-            "Подними Postgres: docker compose up -d postgres",
+            "WARNING: БД недоступна — данные не подтянутся. "
+            "docker compose up -d postgres",
             flush=True,
         )
     if LICENSE_STATUS.startswith("not set"):
@@ -409,7 +310,7 @@ def main() -> None:
             flush=True,
         )
     print(f"Designer: {url}", flush=True)
-    print(f"Preview:  {url}viewer", flush=True)
+    print(f"Viewer:   {url}viewer", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
