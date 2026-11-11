@@ -10,65 +10,68 @@
   <script src="/stimulsoft.designer.js" type="text/javascript"></script>
   <script src="/stimulsoft.blockly.editor.js" type="text/javascript"></script>
   <script src="/config.js" type="text/javascript"></script>
-
-  <script type="text/javascript">
-    var cfg = window.__STI__ || {};
-
-    StiOptions.WebServer.url = cfg.dataAdapterUrl || "http://localhost:9615";
-
-    if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
-      Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
-    }
-
-    console.log("Set full screen mode for the designer");
-    var options = new Stimulsoft.Designer.StiDesignerOptions();
-    options.appearance.fullScreenMode = true;
-    options.toolbar.showPreviewButton = true;
-
-    console.log("Create the dashboard designer with specified options");
-    var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
-
-    designer.onBeginProcessData = function (args) {
-      if (cfg.pgConn && args.database === "PostgreSQL") {
-        args.connectionString = cfg.pgConn;
-      }
-    };
-
-    // Встроенный Preview в Dashboards.JS часто белый / только фильтры.
-    // Уводим Preview на полноценный /viewer с актуальным шаблоном.
-    designer.onPreviewReport = function (args) {
-      args.preventDefault = true;
-      var json = args.report.saveToJsonString();
-      fetch("/preview-mrt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: json,
-      })
-        .then(function (r) {
-          if (!r.ok) throw new Error("preview save failed");
-          window.location = "/viewer?from=preview";
-        })
-        .catch(function (err) {
-          console.error(err);
-          window.location = "/viewer";
-        });
-    };
-
-    console.log("Create a new dashboard instance");
-    var report = Stimulsoft.Report.StiReport.createNewDashboard();
-
-    console.log("Load dashboard from url");
-    report.loadFile("/dashboard");
-
-    console.log("Edit dashboard template in the designer");
-    designer.report = report;
-  </script>
 </head>
 <body>
   <div id="designer"></div>
   <script type="text/javascript">
-    console.log("Render Designer");
-    designer.renderHtml("designer");
+    (async function () {
+      var cfg = window.__STI__ || {};
+
+      StiOptions.WebServer.url = cfg.dataAdapterUrl || "http://localhost:9615";
+      StiOptions.WebServer.encryptData = false;
+      try {
+        StiOptions.WebServer.checkDataAdaptersVersion = false;
+      } catch (e) {}
+
+      if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
+        Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+      }
+
+      var options = new Stimulsoft.Designer.StiDesignerOptions();
+      options.appearance.fullScreenMode = true;
+      options.toolbar.showPreviewButton = true;
+
+      var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
+
+      function bindConn(args) {
+        if (cfg.pgConn) args.connectionString = cfg.pgConn;
+      }
+      designer.onBeginProcessData = bindConn;
+
+      // Встроенный Preview часто белый → /viewer со снимком
+      designer.onPreviewReport = function (args) {
+        args.preventDefault = true;
+        var json = args.report.saveToJsonString();
+        fetch("/preview-mrt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: json,
+        })
+          .then(function (r) {
+            if (!r.ok) throw new Error("preview save failed");
+            window.location = "/viewer?from=preview";
+          })
+          .catch(function (err) {
+            console.error(err);
+            window.location = "/viewer";
+          });
+      };
+
+      console.log("Load dashboard /dashboard");
+      var text = await (await fetch("/dashboard", { cache: "no-store" })).text();
+      var report = Stimulsoft.Report.StiReport.createNewDashboard();
+      report.load(text);
+      report.onBeginProcessData = bindConn;
+      try {
+        report.requestParameters = false;
+      } catch (e) {}
+
+      designer.report = report;
+      designer.renderHtml("designer");
+    })().catch(function (err) {
+      console.error(err);
+      document.body.textContent = String(err && err.message ? err.message : err);
+    });
   </script>
 </body>
 </html>

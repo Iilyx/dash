@@ -176,6 +176,8 @@ app.listen(port, "0.0.0.0", () => {
   console.log("Navigate to http://localhost:" + port + "/viewer to show Viewer");
   console.log("Navigate to http://localhost:" + port + "/designer to show Designer");
   console.log("MRT: " + MRT);
+  console.log("PG conn: " + (pgConn() ? "ok" : "MISSING — set POSTGRES_* or DATABASE_URL"));
+  console.log("License: " + (LICENSE ? "set" : "empty (trial)"));
   console.log("stimulsoft-reports-js / stimulsoft-dashboards-js 2024.3.3");
   console.log("Data adapter must be running: npm run adapter  (port 9615)");
 });
