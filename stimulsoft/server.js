@@ -82,8 +82,9 @@ function envFlag(name, def) {
 const FORCE_REQUEST_PARAMETERS = envFlag("FORCE_REQUEST_PARAMETERS", "0");
 const FORCE_PARAMETERS_PANEL = envFlag("FORCE_PARAMETERS_PANEL", "1");
 const FORCE_SHOW_ON_PARAMETERS_PANEL = envFlag("FORCE_SHOW_ON_PARAMETERS_PANEL", "1");
-const FORCE_DASHBOARD_TOOLBAR = envFlag("FORCE_DASHBOARD_TOOLBAR", "1");
-const DASHBOARD_VIEWER_SETTINGS = 671; // toolbar + parameters panel
+// не перетираем DashboardViewerSettings из .mrt — 671 иногда даёт пустой холст
+const FORCE_DASHBOARD_TOOLBAR = envFlag("FORCE_DASHBOARD_TOOLBAR", "0");
+const DASHBOARD_VIEWER_SETTINGS = 671;
 
 const app = express();
 
