@@ -1,4 +1,3 @@
-// Общая подготовка отчёта: Postgres + Preview без фильтров
 window.StiApp = {
   applyLicense: function (cfg) {
     if (!cfg || !cfg.licenseKey) return;
@@ -26,31 +25,9 @@ window.StiApp = {
     }
   },
 
-  isFilterComponent: function (comp) {
-    if (!comp) return false;
-    var name = String(comp.name || "");
-    var typeName = "";
-    try {
-      if (comp.componentType != null) typeName = String(comp.componentType);
-    } catch (e) {}
-    try {
-      if (!typeName && comp.ident) typeName = String(comp.ident);
-    } catch (e) {}
-    try {
-      if (!typeName && comp.constructor && comp.constructor.name)
-        typeName = comp.constructor.name;
-    } catch (e) {}
-    var s = (typeName + " " + name).toLowerCase();
-    return /combobox|listbox|datepicker|treeview|filter|parameter/.test(s);
-  },
-
-  /** Убрать панель параметров и filter-элементы с холста дашборда */
-  stripFilters: function (report) {
+  /** Только отключить Request Parameters — холст НЕ трогаем */
+  disableParameterPrompt: function (report) {
     report.requestParameters = false;
-    try {
-      if (report.parametersDisplayMode != null) report.parametersDisplayMode = 0;
-    } catch (e) {}
-
     try {
       var vars = report.dictionary.variables;
       for (var i = 0; i < (vars.count || 0); i++) {
@@ -62,33 +39,10 @@ window.StiApp = {
         } catch (e2) {}
       }
     } catch (e) {}
-
-    try {
-      for (var p = 0; p < (report.pages.count || 0); p++) {
-        var page = report.pages.getByIndex(p);
-        if (!page || !page.components) continue;
-        var remove = [];
-        for (var c = 0; c < (page.components.count || 0); c++) {
-          var comp = page.components.getByIndex(c);
-          if (window.StiApp.isFilterComponent(comp)) remove.push(comp);
-        }
-        for (var r = 0; r < remove.length; r++) {
-          try {
-            page.components.remove(remove[r]);
-          } catch (e3) {
-            try {
-              page.components.removeAt(page.components.indexOf(remove[r]));
-            } catch (e4) {}
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("[sti] strip filter components", e);
-    }
   },
 
   patchPg: function (report, cfg) {
-    window.StiApp.stripFilters(report);
+    window.StiApp.disableParameterPrompt(report);
     try {
       var dbs = report.dictionary.databases;
       for (var i = 0; i < (dbs.count || 0); i++) {
@@ -97,38 +51,48 @@ window.StiApp = {
       }
     } catch (e) {}
     report.onBeginProcessData = function (args) {
-      console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
+      console.log("[sti]", args.command, args.database, args.dataSource || "");
       if (cfg && cfg.pgConn) args.connectionString = cfg.pgConn;
     };
   },
 
-  buildPgDemo: function (report, cfg) {
-    report.dictionary.databases.clear();
-    report.dictionary.dataSources.clear();
+  stats: function (report) {
+    var pages = 0;
+    var comps = 0;
+    var dbs = 0;
+    var dss = 0;
+    try {
+      pages = report.pages.count || 0;
+      for (var i = 0; i < pages; i++) {
+        var p = report.pages.getByIndex(i);
+        comps += (p && p.components && p.components.count) || 0;
+      }
+    } catch (e) {}
+    try {
+      dbs = report.dictionary.databases.count || 0;
+    } catch (e) {}
+    try {
+      dss = report.dictionary.dataSources.count || 0;
+    } catch (e) {}
+    return { pages: pages, comps: comps, dbs: dbs, dss: dss };
+  },
 
-    var db = new Stimulsoft.Report.Dictionary.StiPostgreSQLDatabase(
-      "Connection",
-      "Connection",
-      (cfg && cfg.pgConn) || ""
-    );
-    report.dictionary.databases.add(db);
+  /** Demo без Postgres: JSON → таблица (чтобы viewer точно не был пустым) */
+  buildJsonDemo: function (report) {
+    try {
+      report.dictionary.databases.clear();
+      report.dictionary.dataSources.clear();
+    } catch (e) {}
 
-    var ds = new Stimulsoft.Report.Dictionary.StiPostgreSQLSource(
-      "Connection",
-      "Demo",
-      "Demo",
-      "SELECT 1 AS n, current_database()::text AS db, now()::text AS ts"
-    );
-    ds.columns.add(
-      new Stimulsoft.Report.Dictionary.StiDataColumn("n", "n", "n", Stimulsoft.System.Int32)
-    );
-    ds.columns.add(
-      new Stimulsoft.Report.Dictionary.StiDataColumn("db", "db", "db", Stimulsoft.System.String)
-    );
-    ds.columns.add(
-      new Stimulsoft.Report.Dictionary.StiDataColumn("ts", "ts", "ts", Stimulsoft.System.String)
-    );
-    report.dictionary.dataSources.add(ds);
+    var dataSet = new Stimulsoft.System.Data.DataSet("Demo");
+    dataSet.readJson({
+      Demo: [
+        { n: 1, db: "json-demo", ts: new Date().toISOString() },
+        { n: 2, db: "json-demo", ts: new Date().toISOString() },
+      ],
+    });
+    report.regData("Demo", "Demo", dataSet);
+    report.dictionary.synchronize();
 
     var dashboard = report.pages.getByIndex(0);
     try {
@@ -152,16 +116,20 @@ window.StiApp = {
 
   loadReport: async function (cfg) {
     var resp = await fetch("/dashboard", { cache: "no-store" });
-    var json = resp.ok ? await resp.text() : "";
+    if (!resp.ok) throw new Error("/dashboard HTTP " + resp.status);
+    var json = await resp.text();
     var report = Stimulsoft.Report.StiReport.createNewDashboard();
-    var demo = true;
+    var mode = "demo-json";
+
     if (json && !window.StiApp.isScrubbed(json)) {
       report.load(json);
-      demo = false;
+      mode = "mrt";
+      window.StiApp.patchPg(report, cfg);
     } else {
-      window.StiApp.buildPgDemo(report, cfg);
+      window.StiApp.buildJsonDemo(report);
+      window.StiApp.disableParameterPrompt(report);
     }
-    window.StiApp.patchPg(report, cfg);
-    return { report: report, demo: demo };
+
+    return { report: report, mode: mode, stats: window.StiApp.stats(report) };
   },
 };

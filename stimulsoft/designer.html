@@ -14,7 +14,7 @@
     #banner {
       position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
       padding: 8px 12px; background: #1a3a5c; color: #fff;
-      font: 14px/1.4 system-ui, sans-serif;
+      font: 13px/1.4 system-ui, sans-serif;
     }
     #banner a { color: #9cf; }
     #designer { padding-top: 36px; }
@@ -22,7 +22,7 @@
 </head>
 <body>
   <div id="banner">
-    Preview дашборда (без фильтров):
+    Смотреть дашборд:
     <a href="/viewer" target="_blank">/viewer</a>
   </div>
   <div id="designer"></div>
@@ -35,26 +35,18 @@
       var options = new Stimulsoft.Designer.StiDesignerOptions();
       options.appearance.fullScreenMode = true;
       try {
-        if (options.viewerOptions && options.viewerOptions.toolbar) {
+        if (options.viewerOptions && options.viewerOptions.toolbar)
           options.viewerOptions.toolbar.showParametersButton = false;
-        }
       } catch (e) {}
 
       var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
-
       designer.onBeginProcessData = function (args) {
         if (cfg.pgConn) args.connectionString = cfg.pgConn;
       };
-
-      // Встроенный Preview в дизайнере часто даёт серый холст —
-      // открываем отдельный Viewer без фильтров.
       designer.onPreviewReport = function (args) {
-        try {
-          args.preventDefault = true;
-        } catch (e) {}
+        try { args.preventDefault = true; } catch (e) {}
         window.open("/viewer", "_blank");
       };
-
       designer.onSaveReport = function (args) {
         args.preventDefault = true;
         fetch("/dashboard", {
@@ -67,26 +59,14 @@
       designer.renderHtml("designer");
 
       var loaded = await window.StiApp.loadReport(cfg);
-      // в редакторе фильтры оставляем (для правки), strip только в viewer
-      // здесь только PG + requestParameters off чтобы не блокировать
-      loaded.report.requestParameters = false;
-      try {
-        var dbs = loaded.report.dictionary.databases;
-        for (var i = 0; i < (dbs.count || 0); i++) {
-          var db = dbs.getByIndex(i);
-          if (db && cfg.pgConn) db.connectionString = cfg.pgConn;
-        }
-      } catch (e) {}
-      loaded.report.onBeginProcessData = function (args) {
-        if (cfg.pgConn) args.connectionString = cfg.pgConn;
-      };
       designer.report = loaded.report;
-
-      if (loaded.demo) {
-        document.getElementById("banner").innerHTML +=
-          " · сейчас DEMO (scrubbed .mrt), положи полный файл в MRT_PATH";
-      }
-    })();
+      document.getElementById("banner").innerHTML +=
+        " · " + loaded.mode +
+        " pages=" + loaded.stats.pages +
+        " comps=" + loaded.stats.comps;
+    })().catch(function (e) {
+      document.getElementById("banner").textContent = String(e && e.message ? e.message : e);
+    });
   </script>
 </body>
 </html>

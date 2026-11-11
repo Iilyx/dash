@@ -9,53 +9,76 @@
   <script src="/config.js"></script>
   <script src="/sti-common.js"></script>
   <style>
-    html, body { margin: 0; height: 100%; background: #1e1e1e; }
+    html, body { margin: 0; height: 100%; background: #111; color: #eee; }
     #banner {
-      display: none;
       position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
       padding: 8px 12px; background: #245b2e; color: #fff;
-      font: 14px/1.4 system-ui, sans-serif;
+      font: 13px/1.4 system-ui, sans-serif;
     }
     #banner a { color: #cfc; }
+    #banner.err { background: #7a1f1f; }
+    #viewer { position: absolute; inset: 36px 0 0 0; }
   </style>
 </head>
 <body>
-  <div id="banner"></div>
+  <div id="banner">loading…</div>
   <div id="viewer"></div>
   <script>
     (async function () {
-      var cfg = window.__STI__ || {};
-      window.StiApp.applyLicense(cfg);
-      window.StiApp.setupAdapter();
-
-      var options = new Stimulsoft.Viewer.StiViewerOptions();
-      options.appearance.fullScreenMode = true;
-      options.toolbar.showParametersButton = false;
-      options.appearance.scrollbarsMode = true;
-
-      var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
-      viewer.onBeginProcessData = function (args) {
-        if (cfg.pgConn) args.connectionString = cfg.pgConn;
-      };
-      viewer.renderHtml("viewer");
-
-      var loaded = await window.StiApp.loadReport(cfg);
-      viewer.report = loaded.report;
-
       var banner = document.getElementById("banner");
-      banner.style.display = "block";
-      banner.innerHTML = loaded.demo
-        ? "DEMO (scrubbed .mrt). Редактор: <a href='/designer'>/designer</a>"
-        : "Дашборд без панели фильтров. Редактор: <a href='/designer'>/designer</a>";
+      function info(html, isErr) {
+        banner.className = isErr ? "err" : "";
+        banner.innerHTML = html;
+      }
 
-      // если viewer всё же ждёт параметры — дожать отрисовку
-      setTimeout(function () {
-        try {
-          if (viewer.jsObject && viewer.jsObject.postAction) {
-            viewer.jsObject.postAction("GetPages");
-          }
-        } catch (e) {}
-      }, 400);
+      try {
+        if (typeof Stimulsoft === "undefined") throw new Error("Stimulsoft scripts not loaded");
+        if (typeof StiOptions === "undefined") throw new Error("StiOptions missing");
+        if (!window.StiApp) throw new Error("sti-common.js not loaded");
+
+        var cfg = window.__STI__ || {};
+        window.StiApp.applyLicense(cfg);
+        window.StiApp.setupAdapter();
+
+        var options = new Stimulsoft.Viewer.StiViewerOptions();
+        options.appearance.fullScreenMode = false;
+        options.toolbar.showParametersButton = false;
+        options.appearance.scrollbarsMode = true;
+
+        var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
+        viewer.onBeginProcessData = function (args) {
+          if (cfg.pgConn) args.connectionString = cfg.pgConn;
+        };
+        viewer.renderHtml("viewer");
+
+        var loaded = await window.StiApp.loadReport(cfg);
+        viewer.report = loaded.report;
+
+        var s = loaded.stats;
+        info(
+          (loaded.mode === "mrt" ? "MRT" : "JSON-DEMO") +
+            " · pages=" + s.pages +
+            " comps=" + s.comps +
+            " db=" + s.dbs +
+            " ds=" + s.dss +
+            " · <a href='/designer'>designer</a>" +
+            (loaded.mode !== "mrt"
+              ? " · scrubbed .mrt → demo table (положи полный MRT_PATH)"
+              : " · без Request Parameters"),
+          s.pages === 0 || s.comps === 0
+        );
+
+        setTimeout(function () {
+          try {
+            if (viewer.jsObject && viewer.jsObject.postAction) {
+              viewer.jsObject.postAction("GetPages");
+            }
+          } catch (e) {}
+        }, 500);
+      } catch (e) {
+        console.error(e);
+        info("Viewer error: " + (e && e.message ? e.message : e), true);
+      }
     })();
   </script>
 </body>
