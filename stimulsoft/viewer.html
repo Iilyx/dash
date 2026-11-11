@@ -55,8 +55,32 @@
       report.load(text);
       report.onBeginProcessData = bindConn;
 
-      // Фильтры оставляем (RequestFromUser / parameters panel).
-      // requestParameters=true → холст пустой до Submit — жмём Submit ниже, флаги не трогаем.
+      // Дожать панель фильтров на стороне JS (как старый view_dashboard _OPENED_REPORT_JS)
+      try {
+        report.requestParameters = true;
+      } catch (e) {}
+      try {
+        if (Stimulsoft.Report && Stimulsoft.Report.StiParametersDisplayMode) {
+          report.parametersDisplayMode =
+            Stimulsoft.Report.StiParametersDisplayMode.Panel;
+        } else {
+          report.parametersDisplayMode = 1;
+        }
+      } catch (e) {}
+      try {
+        report.dashboardViewerSettings = 671;
+      } catch (e) {}
+      try {
+        var vars = report.dictionary && report.dictionary.variables;
+        for (var i = 0; i < (vars && vars.count ? vars.count : 0); i++) {
+          var v = vars.getByIndex ? vars.getByIndex(i) : null;
+          if (!v) continue;
+          if (v.requestFromUser || v.showOnParametersPanel) {
+            v.requestFromUser = true;
+            v.showOnParametersPanel = true;
+          }
+        }
+      } catch (e) {}
 
       viewer.report = report;
       viewer.renderHtml();

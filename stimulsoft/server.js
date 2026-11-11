@@ -67,6 +67,18 @@ const LICENSE =
   (process.env.STIMULSOFT_REPORTS_LICENSE_KEY || "").trim();
 const ADAPTER_URL = (process.env.DATA_ADAPTER_URL || "http://localhost:9615").trim();
 
+function envFlag(name, def) {
+  const v = (process.env[name] != null ? process.env[name] : def);
+  return String(v).toLowerCase() in { "1": 1, true: 1, yes: 1 };
+}
+
+// как в старом view_dashboard.py / Windows mrt_patch
+const FORCE_REQUEST_PARAMETERS = envFlag("FORCE_REQUEST_PARAMETERS", "1");
+const FORCE_PARAMETERS_PANEL = envFlag("FORCE_PARAMETERS_PANEL", "1");
+const FORCE_SHOW_ON_PARAMETERS_PANEL = envFlag("FORCE_SHOW_ON_PARAMETERS_PANEL", "1");
+const FORCE_DASHBOARD_TOOLBAR = envFlag("FORCE_DASHBOARD_TOOLBAR", "1");
+const DASHBOARD_VIEWER_SETTINGS = 671; // toolbar + parameters panel
+
 const app = express();
 
 // raw body for preview snapshot (не express.json — большие .mrt)
@@ -111,25 +123,155 @@ app.get("/", (_req, res) => {
   res.redirect("/viewer");
 });
 
-/** JS 2024.3.3 не крутит CSharp — для preview/viewer подменяем на JavaScript. */
-function patchMrtForJs(raw) {
-  if (!raw) return raw;
-  let text = String(raw);
-  // JSON .mrt
-  if (/"ScriptLanguage"\s*:/.test(text)) {
-    text = text.replace(
-      /"ScriptLanguage"\s*:\s*"(CSharp|VB|C#)"/gi,
-      '"ScriptLanguage":"JavaScript"'
-    );
+function flagTrue(v) {
+  return v === true || v === "true" || v === "True" || v === 1 || v === "1";
+}
+function flagFalse(v) {
+  return v === false || v === "false" || v === "False" || v === 0 || v === "0";
+}
+
+function numbered(obj) {
+  if (!obj) return [];
+  if (Array.isArray(obj)) return obj;
+  if (typeof obj !== "object") return [];
+  return Object.keys(obj)
+    .filter((k) => /^\d+$/.test(k))
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => obj[k]);
+}
+
+function repairMrtJson(raw) {
+  return String(raw).replace(/(:\s*)""\.([0-9]+)/g, "$1$2");
+}
+
+function isPanelCandidate(variable) {
+  if (!variable || typeof variable !== "object") return false;
+  if (flagFalse(variable.RequestFromUser) && flagFalse(variable.ShowOnParametersPanel)) {
+    return false;
   }
-  // XML .mrt
-  if (/<ScriptLanguage>/i.test(text)) {
+  if (flagTrue(variable.RequestFromUser) || flagTrue(variable.ShowOnParametersPanel)) {
+    return true;
+  }
+  // обезличка: true→"" но ключ остаётся
+  if ("RequestFromUser" in variable && !flagFalse(variable.RequestFromUser)) return true;
+  if ("ShowOnParametersPanel" in variable && !flagFalse(variable.ShowOnParametersPanel)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Как Windows /debug mrt_patch:
+ * RequestParameters + Panel + RFU/ShowOnParametersPanel + ScriptLanguage=JavaScript
+ */
+function patchMrt(raw) {
+  const meta = {
+    patched: false,
+    script_language: null,
+    request_parameters: false,
+    parameters_display_mode: null,
+    panel_candidates: 0,
+    rfu_forced: 0,
+    show_on_panel_forced: 0,
+    dashboard_viewer_settings: null,
+  };
+  if (!raw) return { body: raw, meta };
+
+  let text = String(raw).replace(/^\uFEFF/, "");
+
+  // XML sample — только ScriptLanguage
+  if (text.trimStart().startsWith("<")) {
     text = text.replace(
       /<ScriptLanguage>\s*(CSharp|VB|C#)\s*<\/ScriptLanguage>/gi,
       "<ScriptLanguage>JavaScript</ScriptLanguage>"
     );
+    meta.script_language = "JavaScript";
+    meta.patched = true;
+    return { body: text, meta };
   }
-  return text;
+
+  let report;
+  try {
+    report = JSON.parse(text);
+  } catch (_) {
+    try {
+      text = repairMrtJson(text);
+      report = JSON.parse(text);
+      meta.json_repaired = true;
+    } catch (exc) {
+      meta.error = String(exc && exc.message ? exc.message : exc);
+      return { body: text, meta };
+    }
+  }
+  if (!report || typeof report !== "object") {
+    return { body: text, meta };
+  }
+
+  let changed = false;
+
+  const sl = report.ScriptLanguage;
+  if (sl === "CSharp" || sl === "VB" || sl === "C#") {
+    report.ScriptLanguage = "JavaScript";
+    changed = true;
+  }
+  meta.script_language = report.ScriptLanguage || null;
+
+  if (FORCE_REQUEST_PARAMETERS && !flagTrue(report.RequestParameters)) {
+    report.RequestParameters = true;
+    changed = true;
+  }
+  meta.request_parameters = flagTrue(report.RequestParameters);
+
+  if (FORCE_PARAMETERS_PANEL) {
+    const mode = report.ParametersDisplayMode;
+    if (mode !== "Panel" && mode !== 1 && mode !== "1") {
+      report.ParametersDisplayMode = "Panel";
+      changed = true;
+    }
+  }
+  meta.parameters_display_mode = report.ParametersDisplayMode || null;
+
+  if (FORCE_DASHBOARD_TOOLBAR) {
+    const prev = report.DashboardViewerSettings;
+    let prevI = 0;
+    try {
+      prevI = prev != null && prev !== "" ? Number(prev) : 0;
+    } catch (_) {
+      prevI = 0;
+    }
+    if (prevI !== DASHBOARD_VIEWER_SETTINGS) {
+      report.DashboardViewerSettings = DASHBOARD_VIEWER_SETTINGS;
+      changed = true;
+    }
+  }
+  meta.dashboard_viewer_settings = report.DashboardViewerSettings;
+
+  const dictionary =
+    report.Dictionary && typeof report.Dictionary === "object" ? report.Dictionary : {};
+  let rfuForced = 0;
+  let showForced = 0;
+  let candidates = 0;
+  for (const variable of numbered(dictionary.Variables)) {
+    if (!isPanelCandidate(variable)) continue;
+    candidates += 1;
+    if (!flagTrue(variable.RequestFromUser)) {
+      variable.RequestFromUser = true;
+      rfuForced += 1;
+      changed = true;
+    }
+    if (FORCE_SHOW_ON_PARAMETERS_PANEL && !flagTrue(variable.ShowOnParametersPanel)) {
+      variable.ShowOnParametersPanel = true;
+      showForced += 1;
+      changed = true;
+    }
+  }
+  meta.panel_candidates = candidates;
+  meta.rfu_forced = rfuForced;
+  meta.show_on_panel_forced = showForced;
+  meta.patched = changed;
+
+  if (!changed) return { body: text, meta };
+  return { body: JSON.stringify(report, null, 2) + "\n", meta };
 }
 
 function sendMrtFile(filePath, res) {
@@ -138,7 +280,8 @@ function sendMrtFile(filePath, res) {
     return;
   }
   const raw = fs.readFileSync(filePath, "utf8");
-  const body = patchMrtForJs(raw);
+  const { body, meta } = patchMrt(raw);
+  console.log("[mrt]", path.basename(filePath), meta);
   res.set("Cache-Control", "no-store");
   res.type("application/json; charset=utf-8").send(body);
 }
@@ -150,6 +293,53 @@ app.get("/dashboard", (_req, res) => {
 // снимок из Designer Preview → /viewer?from=preview
 app.get("/dashboard-preview", (_req, res) => {
   sendMrtFile(PREVIEW_MRT, res);
+});
+
+app.get("/debug", (_req, res) => {
+  if (!fs.existsSync(MRT)) {
+    res.status(404).json({ ok: false, error: "mrt missing", path: MRT });
+    return;
+  }
+  const raw = fs.readFileSync(MRT, "utf8");
+  const { meta } = patchMrt(raw);
+  let report = null;
+  try {
+    report = JSON.parse(raw.replace(/^\uFEFF/, ""));
+  } catch (_) {
+    try {
+      report = JSON.parse(repairMrtJson(raw.replace(/^\uFEFF/, "")));
+    } catch (e) {
+      res.json({ ok: false, path: MRT, error: String(e.message || e), mrt_patch: meta });
+      return;
+    }
+  }
+  const vars = numbered(
+    report && report.Dictionary && report.Dictionary.Variables
+  ).filter((v) => v && typeof v === "object");
+  const panel = vars.filter(isPanelCandidate).map((v) => ({
+    name: v.Name || "",
+    requestFromUser: v.RequestFromUser,
+    showOnParametersPanel: v.ShowOnParametersPanel,
+  }));
+  res.json({
+    ok: true,
+    path: MRT,
+    reportVersion: report.ReportVersion || "",
+    scriptLanguage: report.ScriptLanguage || "",
+    requestParameters: report.RequestParameters,
+    parametersDisplayMode: report.ParametersDisplayMode,
+    all_variables_count: vars.length,
+    panel_candidates: panel,
+    panel_count: panel.length,
+    force_request_parameters: FORCE_REQUEST_PARAMETERS,
+    force_parameters_panel: FORCE_PARAMETERS_PANEL,
+    force_show_on_parameters_panel: FORCE_SHOW_ON_PARAMETERS_PANEL,
+    mrt_patch: meta,
+    note:
+      panel.length === 0
+        ? "Нет RFU/ShowOnParametersPanel кандидатов — в .mrt нет панели фильтров (или файл обезличен)."
+        : "Ожидай Parameters panel + Submit. Canvas ComboBox — отдельно.",
+  });
 });
 
 function sendScript(dir, name) {
