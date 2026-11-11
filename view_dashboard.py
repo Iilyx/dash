@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2024.2.6).
+"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2025.4.3).
 
-Встроенный Preview в designer 2024.2.6 часто показывает только фильтры.
+Встроенный Preview в designer иногда показывает только фильтры.
 Кнопка Preview: сохранить .mrt → открыть /viewer.
 
 Запуск:
@@ -33,7 +33,7 @@ from stimulsoft_reports.viewer.enums import (
 
 try:
     from stimulsoft_reports import StiLicense
-except ImportError:  # 2024.2.x
+except ImportError:  # older builds
     from stimulsoft_reports.classes.StiLicenseStatic import (  # type: ignore
         StiLicenseStatic as StiLicense,
     )
@@ -228,7 +228,7 @@ def designer():
 
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
-    """Preview дашборда — обход broken embedded Preview в designer 2024.2.6."""
+    """Preview дашборда — обход broken embedded Preview в designer."""
     sti = StiViewer()
     sti.id = "viewer"
     sti.options.appearance.fullScreenMode = True
