@@ -29,7 +29,7 @@ services:
       - "${DESIGNER_PORT:-8040}:8040"
       - "9615:9615"
     volumes:
-      - ${MRT_FILE:-../test.mrt}:/data/dashboard.mrt
+      - ${MRT_FILE:-./SampleDashboard.mrt}:/data/dashboard.mrt
     depends_on:
       postgres:
         condition: service_healthy

@@ -25,7 +25,7 @@ function loadEnv() {
 loadEnv();
 
 function mrtPath() {
-  const raw = (process.env.MRT_PATH || path.join(ROOT, "..", "test.mrt")).trim();
+  const raw = (process.env.MRT_PATH || path.join(ROOT, "SampleDashboard.mrt")).trim();
   return path.isAbsolute(raw) ? raw : path.resolve(ROOT, raw);
 }
 
