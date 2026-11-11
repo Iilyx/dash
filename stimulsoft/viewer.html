@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Stimulsoft Dashboards.js Viewer 2024.3.3</title>
+
+  <!-- stimulsoft-reports-js + stimulsoft-dashboards-js -->
+  <script src="/stimulsoft.reports.js" type="text/javascript"></script>
+  <script src="/stimulsoft.dashboards.js" type="text/javascript"></script>
+  <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
+  <script src="/config.js" type="text/javascript"></script>
+
+  <script type="text/javascript">
+    var cfg = window.__STI__ || {};
+
+    // Connecting SQL Databases — до создания report/viewer
+    // https://www.stimulsoft.com/en/documentation/online/programming-manual/reports_js_engine_connecting_sql_data_bases.htm
+    StiOptions.WebServer.url = cfg.dataAdapterUrl || "http://localhost:9615";
+
+    if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
+      Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+    }
+
+    console.log("Set full screen mode for the viewer");
+    var options = new Stimulsoft.Viewer.StiViewerOptions();
+    options.appearance.fullScreenMode = true;
+
+    console.log("Create the dashboard viewer with specified options");
+    var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
+
+    // Postgres connection string на сервере data-adapter
+    viewer.onBeginProcessData = function (args) {
+      if (cfg.pgConn && args.database === "PostgreSQL") {
+        args.connectionString = cfg.pgConn;
+      }
+    };
+
+    console.log("Create a new dashboard instance");
+    var report = Stimulsoft.Report.StiReport.createNewDashboard();
+
+    console.log("Load dashboard from url");
+    report.loadFile("/dashboard");
+
+    console.log("Show dashboard template in the viewer");
+    viewer.report = report;
+  </script>
+</head>
+<body>
+  <script type="text/javascript">
+    console.log("Render Viewer");
+    viewer.renderHtml();
+  </script>
+</body>
+</html>

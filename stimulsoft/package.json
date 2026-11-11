@@ -1,0 +1,16 @@
+{
+  "name": "stimulsoft-js-2024.3.3",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "adapter": "node adapter.js",
+    "server": "node server.js",
+    "start": "node start.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "stimulsoft-dashboards-js": "2024.3.3",
+    "stimulsoft-data-adapter": "2024.3.3",
+    "stimulsoft-reports-js": "2024.3.3"
+  }
+}
