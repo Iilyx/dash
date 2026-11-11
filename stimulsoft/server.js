@@ -77,10 +77,9 @@ app.post("/dashboard", (req, res) => {
 // https://www.stimulsoft.com/en/samples/dashboards-js/nodejs/starting-sql-adapters-from-the-http-server
 function forcePg(command) {
   if (!command || typeof command !== "object") return command;
-  const db = String(command.database || "").toLowerCase();
-  if (db.includes("postgres") || db.includes("npgsql")) {
-    command.connectionString = PG;
-  }
+  // всегда подставляем Postgres из .env (в scrubbed .mrt строка пустая)
+  command.connectionString = PG;
+  if (!command.database) command.database = "PostgreSQL";
   return command;
 }
 
@@ -101,8 +100,23 @@ app.post("/data", (req, res) => {
     "Cache-Control": "no-cache",
   });
   const raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
-  const command = forcePg(adapter.getCommand(raw));
+  let command;
+  try {
+    command = forcePg(adapter.getCommand(raw));
+  } catch (err) {
+    console.error("[/data] getCommand", err);
+    return res.json({ success: false, notice: String(err.message || err) });
+  }
+  console.log(
+    "[/data]",
+    command && command.command,
+    command && command.database,
+    (command && command.queryString && String(command.queryString).slice(0, 120)) || ""
+  );
   adapter.process(command, (result) => {
+    if (result && result.success === false) {
+      console.error("[/data] fail", result.notice || result);
+    }
     res.type("application/json").send(adapter.getResponse(result));
   });
 });
