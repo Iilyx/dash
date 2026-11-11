@@ -13,87 +13,91 @@
 <body>
   <div id="designer"></div>
   <script>
-    var cfg = window.__STI__ || {};
-    var dataUrl = window.location.origin + "/data";
+    (async function () {
+      var cfg = window.__STI__ || {};
+      var dataUrl = window.location.origin + "/data";
 
-    // Лицензия (разные пути в разных сборках)
-    if (cfg.licenseKey) {
-      try {
-        if (Stimulsoft.Base && Stimulsoft.Base.StiLicense)
-          Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
-      } catch (e) {}
-      try {
-        if (Stimulsoft.StiLicense) Stimulsoft.StiLicense.key = cfg.licenseKey;
-      } catch (e) {}
-    }
-
-    // ВАЖНО: в 2024.3.3 движок читает именно StiOptions.WebServer.url
-    // (не Stimulsoft.Base.StiOptions — такого пути нет)
-    StiOptions.WebServer.url = dataUrl;
-    StiOptions.WebServer.encryptData = false;
-    StiOptions.WebServer.checkDataAdaptersVersion = false;
-    if (Stimulsoft.StiOptions && Stimulsoft.StiOptions.WebServer) {
-      Stimulsoft.StiOptions.WebServer.url = dataUrl;
-      Stimulsoft.StiOptions.WebServer.encryptData = false;
-      Stimulsoft.StiOptions.WebServer.checkDataAdaptersVersion = false;
-    }
-    console.log("[sti] WebServer.url =", StiOptions.WebServer.url);
-
-    // Проверка адаптера: должен появиться POST /data в Network
-    fetch(dataUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        command: "TestConnection",
-        database: "PostgreSQL",
-        connectionString: cfg.pgConn || "",
-      }),
-    })
-      .then(function (r) { return r.json(); })
-      .then(function (j) { console.log("[sti] TestConnection", j); })
-      .catch(function (e) { console.error("[sti] TestConnection failed", e); });
-
-    var options = new Stimulsoft.Designer.StiDesignerOptions();
-    options.appearance.fullScreenMode = true;
-    var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
-
-    designer.onBeginProcessData = function (args) {
-      console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
-      if (cfg.pgConn) args.connectionString = cfg.pgConn;
-    };
-
-    designer.onSaveReport = function (args) {
-      args.preventDefault = true;
-      fetch("/dashboard", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: args.report.saveToJsonString(),
-      });
-    };
-    designer.onSaveAsReport = designer.onSaveReport;
-
-    designer.renderHtml("designer");
-
-    var report = Stimulsoft.Report.StiReport.createNewDashboard();
-    report.loadFile("/dashboard");
-
-    // Диагностика scrubbed .mrt
-    try {
-      var dbs = report.dictionary.databases;
-      var n = dbs ? dbs.count || dbs.length || 0 : 0;
-      console.log("[sti] databases count =", n);
-      for (var i = 0; i < n; i++) {
-        var db = dbs.getByIndex ? dbs.getByIndex(i) : dbs.list[i];
-        console.log("[sti] db[", i, "]", db && db.name, db && (db.ident || db.Ident), db);
+      if (cfg.licenseKey) {
+        try {
+          if (Stimulsoft.Base && Stimulsoft.Base.StiLicense)
+            Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+        } catch (e) {}
       }
-      if (!n) {
-        console.warn("[sti] В .mrt нет Databases — SQL-запросов к /data не будет. Нужен полный .mrt");
-      }
-    } catch (e) {
-      console.warn("[sti] dictionary check", e);
-    }
 
-    designer.report = report;
+      // движок 2024.3.3 читает global StiOptions.WebServer
+      StiOptions.WebServer.url = dataUrl;
+      StiOptions.WebServer.encryptData = false;
+      StiOptions.WebServer.checkDataAdaptersVersion = false;
+      console.log("[sti] WebServer.url =", StiOptions.WebServer.url);
+
+      function patchReport(report) {
+        // иначе Preview ждёт Submit по RequestFromUser и холст пустой
+        report.requestParameters = false;
+
+        try {
+          var dbs = report.dictionary.databases;
+          var n = dbs.count || 0;
+          console.log("[sti] databases =", n);
+          for (var i = 0; i < n; i++) {
+            var db = dbs.getByIndex(i);
+            if (!db) continue;
+            console.log("[sti] db", i, db.name, db.serviceName || db.ident || "");
+            if (cfg.pgConn) db.connectionString = cfg.pgConn;
+          }
+          if (!n) {
+            console.error(
+              "[sti] В .mrt нет живых Databases (scrubbed). Подставь полный .mrt в MRT_PATH / dashboard.mrt"
+            );
+          }
+        } catch (e) {
+          console.warn("[sti] patchReport", e);
+        }
+
+        report.onBeginProcessData = function (args) {
+          console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
+          if (cfg.pgConn) args.connectionString = cfg.pgConn;
+        };
+      }
+
+      var options = new Stimulsoft.Designer.StiDesignerOptions();
+      options.appearance.fullScreenMode = true;
+      var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
+
+      designer.onBeginProcessData = function (args) {
+        console.log("[sti] designer BeginProcessData", args.command, args.database);
+        if (cfg.pgConn) args.connectionString = cfg.pgConn;
+      };
+
+      // перед Preview в дизайнере
+      designer.onPreviewReport = function (args) {
+        patchReport(args.report);
+      };
+
+      designer.onSaveReport = function (args) {
+        args.preventDefault = true;
+        fetch("/dashboard", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: args.report.saveToJsonString(),
+        });
+      };
+      designer.onSaveAsReport = designer.onSaveReport;
+
+      designer.renderHtml("designer");
+
+      // явная загрузка JSON — без гонки loadFile
+      var resp = await fetch("/dashboard", { cache: "no-store" });
+      if (!resp.ok) {
+        console.error("[sti] /dashboard", resp.status);
+        return;
+      }
+      var json = await resp.text();
+
+      var report = Stimulsoft.Report.StiReport.createNewDashboard();
+      report.load(json);
+      patchReport(report);
+      designer.report = report;
+    })();
   </script>
 </body>
 </html>

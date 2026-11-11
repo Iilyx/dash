@@ -24,7 +24,10 @@ loadEnv();
 
 const SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Scripts");
 const PORT = Number(process.env.PORT || process.env.DESIGNER_PORT || 8040);
-const MRT = process.env.MRT_PATH || path.join(ROOT, "dashboard.mrt");
+const MRT = (() => {
+  const raw = (process.env.MRT_PATH || path.join(ROOT, "dashboard.mrt")).trim();
+  return path.isAbsolute(raw) ? raw : path.resolve(ROOT, raw);
+})();
 
 function pgConn() {
   const user = process.env.POSTGRES_USER || "";
@@ -57,11 +60,28 @@ app.get("/config.js", (_req, res) => {
     );
 });
 
+function mrtLooksScrubbed(raw) {
+  try {
+    const d = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    const db0 = d && d.Dictionary && d.Dictionary.Databases && d.Dictionary.Databases["0"];
+    if (!db0) return true;
+    return !String(db0.Ident || "").trim() || !String(db0.Name || "").trim();
+  } catch {
+    return false;
+  }
+}
+
 app.get("/dashboard", (_req, res) => {
   if (!fs.existsSync(MRT)) {
     return res.status(404).send("MRT not found: " + MRT);
   }
-  res.type("application/json").set("Cache-Control", "no-store").send(fs.readFileSync(MRT));
+  const raw = fs.readFileSync(MRT, "utf8");
+  if (mrtLooksScrubbed(raw)) {
+    console.warn(
+      "[mrt] scrubbed template (empty Database Ident/Name) — Preview/SQL не заработают. Укажи полный .mrt в MRT_PATH"
+    );
+  }
+  res.type("application/json").set("Cache-Control", "no-store").send(raw);
 });
 
 app.post("/dashboard", (req, res) => {
