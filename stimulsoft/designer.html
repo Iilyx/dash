@@ -9,8 +9,17 @@
   <script src="/stimulsoft.designer.js"></script>
   <script src="/stimulsoft.blockly.editor.js"></script>
   <script src="/config.js"></script>
+  <style>
+    #banner {
+      display: none;
+      position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
+      padding: 8px 12px; background: #7a1f1f; color: #fff;
+      font: 14px/1.4 system-ui, sans-serif;
+    }
+  </style>
 </head>
 <body>
+  <div id="banner"></div>
   <div id="designer"></div>
   <script>
     (async function () {
@@ -24,39 +33,89 @@
         } catch (e) {}
       }
 
-      // движок 2024.3.3 читает global StiOptions.WebServer
       StiOptions.WebServer.url = dataUrl;
       StiOptions.WebServer.encryptData = false;
       StiOptions.WebServer.checkDataAdaptersVersion = false;
       console.log("[sti] WebServer.url =", StiOptions.WebServer.url);
 
-      function patchReport(report) {
-        // иначе Preview ждёт Submit по RequestFromUser и холст пустой
-        report.requestParameters = false;
+      function showBanner(text) {
+        var el = document.getElementById("banner");
+        el.style.display = "block";
+        el.textContent = text;
+      }
 
+      function isScrubbed(jsonText) {
+        try {
+          var d = JSON.parse(jsonText);
+          var db0 = d.Dictionary && d.Dictionary.Databases && d.Dictionary.Databases["0"];
+          return !db0 || !String(db0.Ident || "").trim() || !String(db0.Name || "").trim();
+        } catch (e) {
+          return true;
+        }
+      }
+
+      function patchPg(report) {
+        report.requestParameters = false;
         try {
           var dbs = report.dictionary.databases;
-          var n = dbs.count || 0;
-          console.log("[sti] databases =", n);
-          for (var i = 0; i < n; i++) {
+          for (var i = 0; i < (dbs.count || 0); i++) {
             var db = dbs.getByIndex(i);
-            if (!db) continue;
-            console.log("[sti] db", i, db.name, db.serviceName || db.ident || "");
-            if (cfg.pgConn) db.connectionString = cfg.pgConn;
+            if (db && cfg.pgConn) db.connectionString = cfg.pgConn;
           }
-          if (!n) {
-            console.error(
-              "[sti] В .mrt нет живых Databases (scrubbed). Подставь полный .mrt в MRT_PATH / dashboard.mrt"
-            );
-          }
-        } catch (e) {
-          console.warn("[sti] patchReport", e);
-        }
-
+        } catch (e) {}
         report.onBeginProcessData = function (args) {
           console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
           if (cfg.pgConn) args.connectionString = cfg.pgConn;
         };
+      }
+
+      // Живой demo с Postgres, если .mrt scrubbed
+      function buildPgDemo(report) {
+        report.dictionary.databases.clear();
+        report.dictionary.dataSources.clear();
+
+        var db = new Stimulsoft.Report.Dictionary.StiPostgreSQLDatabase(
+          "Connection",
+          "Connection",
+          cfg.pgConn || ""
+        );
+        report.dictionary.databases.add(db);
+
+        var ds = new Stimulsoft.Report.Dictionary.StiPostgreSQLSource(
+          "Connection",
+          "Demo",
+          "Demo",
+          "SELECT 1 AS n, current_database()::text AS db, now()::text AS ts"
+        );
+        ds.columns.add(
+          new Stimulsoft.Report.Dictionary.StiDataColumn("n", "n", "n", Stimulsoft.System.Int32)
+        );
+        ds.columns.add(
+          new Stimulsoft.Report.Dictionary.StiDataColumn("db", "db", "db", Stimulsoft.System.String)
+        );
+        ds.columns.add(
+          new Stimulsoft.Report.Dictionary.StiDataColumn("ts", "ts", "ts", Stimulsoft.System.String)
+        );
+        report.dictionary.dataSources.add(ds);
+
+        var dashboard = report.pages.getByIndex(0);
+        try {
+          dashboard.components.clear();
+        } catch (e) {}
+
+        var tableElement = new Stimulsoft.Dashboard.Components.Table.StiTableElement();
+        tableElement.left = 20;
+        tableElement.top = 40;
+        tableElement.width = 720;
+        tableElement.height = 360;
+        tableElement.name = "DemoTable";
+        dashboard.components.add(tableElement);
+
+        ["Demo.n", "Demo.db", "Demo.ts"].forEach(function (expr) {
+          var col = new Stimulsoft.Dashboard.Components.Table.StiDimensionColumn();
+          col.expression = expr;
+          tableElement.columns.add(col);
+        });
       }
 
       var options = new Stimulsoft.Designer.StiDesignerOptions();
@@ -64,15 +123,11 @@
       var designer = new Stimulsoft.Designer.StiDesigner(options, "StiDesigner", false);
 
       designer.onBeginProcessData = function (args) {
-        console.log("[sti] designer BeginProcessData", args.command, args.database);
         if (cfg.pgConn) args.connectionString = cfg.pgConn;
       };
-
-      // перед Preview в дизайнере
       designer.onPreviewReport = function (args) {
-        patchReport(args.report);
+        patchPg(args.report);
       };
-
       designer.onSaveReport = function (args) {
         args.preventDefault = true;
         fetch("/dashboard", {
@@ -82,20 +137,25 @@
         });
       };
       designer.onSaveAsReport = designer.onSaveReport;
-
       designer.renderHtml("designer");
 
-      // явная загрузка JSON — без гонки loadFile
       var resp = await fetch("/dashboard", { cache: "no-store" });
-      if (!resp.ok) {
-        console.error("[sti] /dashboard", resp.status);
-        return;
-      }
-      var json = await resp.text();
-
+      var json = resp.ok ? await resp.text() : "";
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
-      report.load(json);
-      patchReport(report);
+
+      if (json && !isScrubbed(json)) {
+        report.load(json);
+        patchPg(report);
+        console.log("[sti] loaded full .mrt");
+      } else {
+        buildPgDemo(report);
+        patchPg(report);
+        showBanner(
+          "dashboard.mrt scrubbed/пустой — открыт DEMO с Postgres (SELECT 1). Положи полный .mrt и задай MRT_PATH."
+        );
+        console.warn("[sti] scrubbed mrt → PG demo dashboard");
+      }
+
       designer.report = report;
     })();
   </script>
