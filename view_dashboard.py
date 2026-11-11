@@ -21,7 +21,7 @@ from urllib.parse import quote_plus, urlparse
 
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
-from flask import Flask, Response, request, url_for
+from flask import Flask, Response, request
 from stimulsoft_reports import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
@@ -144,12 +144,29 @@ def save_report(args: StiReportEventArgs):
     return f"Сохранено в {MRT_PATH.name}"
 
 
-@app.get("/mrt")
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
+@app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
+    """Всегда с корня /mrt — иначе relative loadFile с /designer даёт 404."""
+    if not MRT_PATH.is_file():
+        return Response('{"error":"mrt missing"}', status=404, mimetype="application/json")
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.errorhandler(404)
+def not_found(_err):
+    # Stimulsoft иногда дергает лишние GetResource — в Network: null + 404
+    print(f"[404] {request.method} {request.path} args={dict(request.args)}", flush=True)
+    if request.args.get("sti_event") or request.path.startswith("/mrt"):
+        return Response("null", status=404, mimetype="application/json")
+    return Response("not found", status=404)
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -166,7 +183,8 @@ def designer():
         return sti.getFrameworkResponse()
 
     report = StiReport()
-    report.loadFile(url_for("serve_mrt"))
+    # абсолютный путь от origin — не url_for relative к /designer
+    report.loadFile("/mrt")
     sti.report = report
     return sti.getFrameworkResponse()
 
