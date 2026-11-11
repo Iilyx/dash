@@ -73,7 +73,8 @@ function envFlag(name, def) {
 }
 
 // как в старом view_dashboard.py / Windows mrt_patch
-const FORCE_REQUEST_PARAMETERS = envFlag("FORCE_REQUEST_PARAMETERS", "1");
+// RequestParameters=true → белый холст до Submit. Для UX «дашборд + фильтры сверху» — false.
+const FORCE_REQUEST_PARAMETERS = envFlag("FORCE_REQUEST_PARAMETERS", "0");
 const FORCE_PARAMETERS_PANEL = envFlag("FORCE_PARAMETERS_PANEL", "1");
 const FORCE_SHOW_ON_PARAMETERS_PANEL = envFlag("FORCE_SHOW_ON_PARAMETERS_PANEL", "1");
 const FORCE_DASHBOARD_TOOLBAR = envFlag("FORCE_DASHBOARD_TOOLBAR", "1");
@@ -216,8 +217,14 @@ function patchMrt(raw) {
   }
   meta.script_language = report.ScriptLanguage || null;
 
-  if (FORCE_REQUEST_PARAMETERS && !flagTrue(report.RequestParameters)) {
-    report.RequestParameters = true;
+  if (FORCE_REQUEST_PARAMETERS) {
+    if (!flagTrue(report.RequestParameters)) {
+      report.RequestParameters = true;
+      changed = true;
+    }
+  } else if (flagTrue(report.RequestParameters) || report.RequestParameters === "") {
+    // сразу рисуем дашборд с default-значениями переменных; Submit потом подставит новые
+    report.RequestParameters = false;
     changed = true;
   }
   meta.request_parameters = flagTrue(report.RequestParameters);
