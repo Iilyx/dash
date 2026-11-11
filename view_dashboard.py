@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Минимальный viewer: .mrt + Postgres connection.
+"""Viewer + designer: .mrt + Postgres (Stimulsoft Dashboards.PYTHON 2024.2.6).
 
-Stimulsoft Dashboards.PYTHON 2026.x
-  StiViewer + loadFile(.mrt) + onBeginProcessData(connectionString).
+  /         — viewer
+  /designer — HTML5 designer, Save → MRT_PATH
 
 Запуск:
   # в .env: MRT_PATH=.../dashboard.mrt
@@ -11,6 +11,7 @@ Stimulsoft Dashboards.PYTHON 2026.x
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import webbrowser
@@ -20,14 +21,19 @@ from urllib.parse import quote_plus, urlparse
 # Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request, url_for
-from stimulsoft_reports.events import StiDataEventArgs
+from stimulsoft_reports import StiResult
+from stimulsoft_reports.designer import StiDesigner
+from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
-from stimulsoft_reports.viewer.enums import StiParametersPanelPosition
+from stimulsoft_reports.viewer.enums import (
+    StiParametersPanelPosition,
+    StiToolbarDisplayMode,
+)
 
 try:
     from stimulsoft_reports import StiLicense
-except ImportError:  # старые 2024.x
+except ImportError:  # 2024.2.x
     from stimulsoft_reports.classes.StiLicenseStatic import (  # type: ignore
         StiLicenseStatic as StiLicense,
     )
@@ -138,12 +144,45 @@ def begin_process_data(args: StiDataEventArgs) -> None:
         args.connectionString = PG_CONN
 
 
+def save_report(args: StiReportEventArgs):
+    """Save / Save As из designer → MRT_PATH."""
+    if args.report is None:
+        return StiResult.getError("пустой report — нечего сохранять")
+    try:
+        text = json.dumps(args.report, ensure_ascii=False, indent=2)
+        MRT_PATH.write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        return StiResult.getError(str(exc))
+    return f"Сохранено в {MRT_PATH.name}"
+
+
 @app.get("/mrt")
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.route("/designer", methods=["GET", "POST"])
+def designer():
+    sti = StiDesigner()
+    sti.id = "designer"
+    sti.options.appearance.fullScreenMode = True
+    sti.options.toolbar.showFileMenuExit = True
+    sti.onBeginProcessData += begin_process_data
+    sti.onSaveReport += save_report
+    sti.onSaveAsReport += save_report
+    # 2024.2.x: нет javascript.appendHead — raw JS в callback
+    sti.onExit += "window.location = '/';"
+
+    if sti.processRequest(request):
+        return sti.getFrameworkResponse()
+
+    report = StiReport()
+    report.loadFile(url_for("serve_mrt"))
+    sti.report = report
+    return sti.getFrameworkResponse()
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -157,7 +196,10 @@ def viewer():
     if hasattr(sti.options.appearance, "minParametersCountForMultiColumns"):
         sti.options.appearance.minParametersCountForMultiColumns = 1
     sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
+    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
+    sti.options.toolbar.showDesignButton = True
     sti.onBeginProcessData += begin_process_data
+    sti.onDesignReport += "window.location = '/designer';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -170,12 +212,13 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
-    print(f"MRT:     {MRT_PATH.resolve()}", flush=True)
-    print(f"License: {LICENSE_STATUS}", flush=True)
-    print(f"Open:    {url}", flush=True)
+    print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
+    print(f"License:  {LICENSE_STATUS}", flush=True)
+    print(f"Open:     {url}", flush=True)
+    print(f"Designer: {url}designer", flush=True)
     if OPEN_BROWSER:
         try:
-            webbrowser.open(url)
+            webbrowser.open(url + "designer")
         except Exception:
             pass
     app.run(host=VIEWER_HOST, port=VIEWER_PORT, debug=False)
