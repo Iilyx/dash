@@ -31,6 +31,31 @@ from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 
+# RequestParameters / RequestFromUser: без Submit холст белый.
+# После loadFile отключаем ожидание и жмём Submit на parameters panel.
+_VIEWER_LOAD_PATCH = "report.requestParameters = false;\n"
+_VIEWER_AUTOSUBMIT_JS = """
+window.viewer = viewer;
+(function () {
+  function clickSubmit() {
+    try {
+      var panel = viewer.jsObject && viewer.jsObject.controls
+        && viewer.jsObject.controls.parametersPanel;
+      var btn = panel && panel.mainButtons && panel.mainButtons.submit;
+      if (!btn) return false;
+      if (typeof btn.action === 'function') btn.action();
+      else if (typeof btn.onclick === 'function') btn.onclick();
+      else btn.click();
+      return true;
+    } catch (e) { return false; }
+  }
+  var n = 0;
+  var t = setInterval(function () {
+    if (clickSubmit() || ++n > 40) clearInterval(t);
+  }, 250);
+})();
+""".replace("\n", "")
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -122,6 +147,37 @@ def save_report(args: StiReportEventArgs):
     return None
 
 
+def _patch_viewer_render(resp: Response) -> Response:
+    """Сразу отрисовать дашборд: не ждать ручной Submit по RequestParameters."""
+    html = resp.get_data(as_text=True)
+    if "report.requestParameters" not in html:
+        html = html.replace(
+            "report.loadFile('/mrt');",
+            "report.loadFile('/mrt');\n" + _VIEWER_LOAD_PATCH,
+            1,
+        )
+        if "report.requestParameters" not in html:
+            html = html.replace(
+                'report.loadFile("/mrt");',
+                'report.loadFile("/mrt");\n' + _VIEWER_LOAD_PATCH,
+                1,
+            )
+    if "parametersPanel.mainButtons.submit" not in html:
+        html = html.replace(
+            "viewer.renderHtml('viewerContent');",
+            "viewer.renderHtml('viewerContent');\n" + _VIEWER_AUTOSUBMIT_JS,
+            1,
+        )
+        if "parametersPanel.mainButtons.submit" not in html:
+            html = html.replace(
+                'viewer.renderHtml("viewerContent");',
+                'viewer.renderHtml("viewerContent");\n' + _VIEWER_AUTOSUBMIT_JS,
+                1,
+            )
+    resp.set_data(html)
+    return resp
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -157,6 +213,7 @@ def designer():
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     # Official: Showing a Dashboard in the Viewer
+    # + patch: RequestParameters иначе белый холст до Submit
     viewer = StiViewer()
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
@@ -167,7 +224,7 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return viewer.getFrameworkResponse()
+    return _patch_viewer_render(viewer.getFrameworkResponse())
 
 
 def main() -> None:
