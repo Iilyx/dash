@@ -90,6 +90,22 @@ def stimulsoft_pg_connection_string(url: str) -> str:
     )
 
 
+def check_postgres(url: str) -> str:
+    """Быстрый ping — без этого viewer покажет только фильтры."""
+    try:
+        import psycopg
+    except ImportError:
+        return "psycopg not installed"
+    try:
+        with psycopg.connect(url, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select 1")
+                cur.fetchone()
+        return "ok"
+    except Exception as exc:  # noqa: BLE001 — диагностика старта
+        return f"FAIL: {exc}"
+
+
 def resolve_mrt_path() -> Path:
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         return path_of(sys.argv[1])
@@ -100,18 +116,51 @@ def resolve_mrt_path() -> Path:
 
 
 def apply_license() -> str:
-    key = os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
-    key_file = os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
-    if key:
-        StiLicense.setKey(key)
-        return f"key ({len(key)} chars)"
-    if key_file:
-        path = path_of(key_file)
-        if path.is_file():
-            StiLicense.setFile(str(path.resolve()))
-            return f"file ({path.name})"
-        return f"file missing: {path}"
-    return "not set (trial)"
+    """Ставит Stimulsoft.Base.StiLicense.Key (один на Reports+Dashboards).
+
+    Приоритет:
+      1) STIMULSOFT_LICENSE_KEY / _FILE — Ultimate / общий
+      2) STIMULSOFT_DASHBOARDS_LICENSE_KEY / _FILE — нужен для viewer дашбордов
+      3) STIMULSOFT_REPORTS_LICENSE_KEY / _FILE — Reports-only (дашборд может не открыться)
+    """
+    candidates: list[tuple[str, str, str]] = [
+        ("ultimate", "STIMULSOFT_LICENSE_KEY", "STIMULSOFT_LICENSE_FILE"),
+        (
+            "dashboards",
+            "STIMULSOFT_DASHBOARDS_LICENSE_KEY",
+            "STIMULSOFT_DASHBOARDS_LICENSE_FILE",
+        ),
+        (
+            "reports",
+            "STIMULSOFT_REPORTS_LICENSE_KEY",
+            "STIMULSOFT_REPORTS_LICENSE_FILE",
+        ),
+    ]
+    found: list[str] = []
+    applied: str | None = None
+    for kind, key_env, file_env in candidates:
+        key = os.environ.get(key_env, "").strip()
+        key_file = os.environ.get(file_env, "").strip()
+        if key:
+            found.append(f"{kind}:key({len(key)})")
+            if applied is None:
+                StiLicense.setKey(key)
+                applied = f"{kind} key ({len(key)} chars)"
+            continue
+        if key_file:
+            path = path_of(key_file)
+            if path.is_file():
+                found.append(f"{kind}:file({path.name})")
+                if applied is None:
+                    StiLicense.setFile(str(path.resolve()))
+                    applied = f"{kind} file ({path.name})"
+            else:
+                found.append(f"{kind}:file missing ({path})")
+    if applied is None:
+        return "not set (trial)"
+    if len(found) > 1:
+        return f"{applied}; also {', '.join(found[1:])}"
+    return applied
 
 
 load_env()
@@ -129,12 +178,14 @@ PARAMETERS_PANEL_MAX_HEIGHT = int(
     os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
 )
 
-PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
+_DB_URL = database_url()
+PG_CONN = stimulsoft_pg_connection_string(_DB_URL) if _DB_URL else ""
 if not PG_CONN:
     raise SystemExit(
         "Нет DATABASE_URL / POSTGRES_USER+PASSWORD+DB в .env — "
         "не подставится connection string."
     )
+PG_STATUS = check_postgres(_DB_URL)
 
 app = Flask(__name__)
 
@@ -146,27 +197,37 @@ _PREVIEW_JS = (
     "}"
 )
 
-# RequestFromUser: без Submit холст пустой — рендерим сразу + жмём Submit
-_VIEWER_LOAD_PATCH = "report.requestParameters = false;\n"
+# RequestFromUser: холст пустой, пока не уйдёт Variables/Submit.
+# requestParameters=false ломает первый рендер дашборда — только отложенный Submit.
 _VIEWER_AUTOSUBMIT_JS = """
 window.viewer = viewer;
 (function () {
-  function clickSubmit() {
+  var tries = 0;
+  var done = false;
+  function ready() {
     try {
-      var panel = viewer.jsObject && viewer.jsObject.controls
-        && viewer.jsObject.controls.parametersPanel;
-      var btn = panel && panel.mainButtons && panel.mainButtons.submit;
-      if (!btn) return false;
-      if (typeof btn.action === 'function') btn.action();
-      else if (typeof btn.onclick === 'function') btn.onclick();
-      else btn.click();
+      var jo = viewer.jsObject;
+      if (!jo || !jo.controls || !jo.controls.parametersPanel) return false;
+      var panel = jo.controls.parametersPanel;
+      if (!panel.mainButtons || !panel.mainButtons.submit) return false;
+      if (jo.service && jo.service.isRequestInProcess) return false;
+      // панель уже с переменными (иначе Submit уйдёт впустую)
+      if (panel.visible === false) return false;
       return true;
     } catch (e) { return false; }
   }
-  var n = 0;
-  var t = setInterval(function () {
-    if (clickSubmit() || ++n > 40) clearInterval(t);
-  }, 250);
+  function go() {
+    if (done) return;
+    tries += 1;
+    if (!ready()) {
+      if (tries < 80) setTimeout(go, 250);
+      return;
+    }
+    done = true;
+    try { viewer.jsObject.postAction('Submit'); }
+    catch (e) {}
+  }
+  setTimeout(go, 600);
 })();
 """.replace("\n", "")
 
@@ -174,6 +235,33 @@ window.viewer = viewer;
 def begin_process_data(args: StiDataEventArgs) -> None:
     if PG_CONN:
         args.connectionString = PG_CONN
+    db = getattr(args, "database", None)
+    src = getattr(args, "dataSource", None) or "?"
+    conn_name = getattr(args, "connection", None) or "?"
+    sql = (getattr(args, "queryString", None) or "").replace("\n", " ").strip()
+    if len(sql) > 180:
+        sql = sql[:180] + "…"
+    print(
+        f"[data] BEGIN db={db} source={src} conn={conn_name} sql={sql or '<empty>'}",
+        flush=True,
+    )
+
+
+def end_process_data(args: StiDataEventArgs) -> None:
+    result = getattr(args, "result", None)
+    src = getattr(args, "dataSource", None) or "?"
+    if result is None:
+        print(f"[data] END source={src} result=<none>", flush=True)
+        return
+    ok = getattr(result, "success", None)
+    notice = getattr(result, "notice", None) or ""
+    rows = getattr(result, "count", None)
+    if rows is None and getattr(result, "rows", None) is not None:
+        rows = len(result.rows)
+    print(
+        f"[data] END source={src} ok={ok} rows={rows} notice={notice!r}",
+        flush=True,
+    )
 
 
 def save_report(args: StiReportEventArgs):
@@ -208,27 +296,15 @@ def _patch_preview_to_viewer(resp: Response) -> Response:
 
 
 def _patch_viewer_render(resp: Response) -> Response:
-    """Сразу отрисовать дашборд: не ждать ручной Submit по RequestParameters."""
+    """После загрузки панели параметров нажать Submit (иначе пустой холст)."""
     html = resp.get_data(as_text=True)
-    if "report.requestParameters" not in html:
-        html = html.replace(
-            "report.loadFile('/mrt');",
-            "report.loadFile('/mrt');\n" + _VIEWER_LOAD_PATCH,
-            1,
-        )
-        if "report.requestParameters" not in html:
-            html = html.replace(
-                'report.loadFile("/mrt");',
-                'report.loadFile("/mrt");\n' + _VIEWER_LOAD_PATCH,
-                1,
-            )
-    if "parametersPanel.mainButtons.submit" not in html:
+    if "postAction('Submit')" not in html and 'postAction("Submit")' not in html:
         html = html.replace(
             "viewer.renderHtml('viewerContent');",
             "viewer.renderHtml('viewerContent');\n" + _VIEWER_AUTOSUBMIT_JS,
             1,
         )
-        if "parametersPanel.mainButtons.submit" not in html:
+        if "postAction('Submit')" not in html and 'postAction("Submit")' not in html:
             html = html.replace(
                 'viewer.renderHtml("viewerContent");',
                 'viewer.renderHtml("viewerContent");\n' + _VIEWER_AUTOSUBMIT_JS,
@@ -269,6 +345,7 @@ def designer():
     sti.options.toolbar.showPreviewButton = True
     sti.options.toolbar.showFileMenuExit = True
     sti.onBeginProcessData += begin_process_data
+    sti.onEndProcessData += end_process_data
     # PREVIEW_REPORT / Save — пишем актуальный .mrt
     sti.onPreviewReport += save_report
     sti.onSaveReport += save_report
@@ -298,6 +375,7 @@ def viewer():
     sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
     sti.options.toolbar.showDesignButton = True
     sti.onBeginProcessData += begin_process_data
+    sti.onEndProcessData += end_process_data
     sti.onDesignReport += "window.location = '/designer';"
 
     if sti.processRequest(request):
@@ -311,8 +389,25 @@ def viewer():
 
 def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
+    parsed = urlparse(_DB_URL)
     print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
     print(f"License:  {LICENSE_STATUS}", flush=True)
+    print(
+        f"Postgres: {parsed.hostname}:{parsed.port or 5432}/"
+        f"{(parsed.path or '/').lstrip('/')} → {PG_STATUS}",
+        flush=True,
+    )
+    if PG_STATUS != "ok":
+        print(
+            "WARNING: БД недоступна — в /viewer останутся только фильтры. "
+            "Подними Postgres: docker compose up -d postgres",
+            flush=True,
+        )
+    if LICENSE_STATUS.startswith("not set"):
+        print(
+            "WARNING: нет STIMULSOFT_LICENSE_KEY — trial может резать дашборд.",
+            flush=True,
+        )
     print(f"Designer: {url}", flush=True)
     print(f"Preview:  {url}viewer", flush=True)
     if OPEN_BROWSER:

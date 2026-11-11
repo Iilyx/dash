@@ -5,6 +5,8 @@ pydantic>=2
 mcp==2.3.0
 
 # Stimulsoft Dashboards.PYTHON viewer (view_dashboard.py)
+# reports тянется явно (и как dependency dashboards) — одна линейка 2024.3.3
 flask>=3.0
+stimulsoft-reports==2024.3.3
 stimulsoft-dashboards==2024.3.3
 psycopg[binary]>=3.1
