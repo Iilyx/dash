@@ -145,8 +145,15 @@ function repairMrtJson(raw) {
   return String(raw).replace(/(:\s*)""\.([0-9]+)/g, "$1$2");
 }
 
+function varName(variable) {
+  const n = variable && variable.Name != null ? String(variable.Name).trim() : "";
+  return n;
+}
+
 function isPanelCandidate(variable) {
   if (!variable || typeof variable !== "object") return false;
+  // безымянная переменная ломает Parameters panel
+  if (!varName(variable)) return false;
   if (flagFalse(variable.RequestFromUser) && flagFalse(variable.ShowOnParametersPanel)) {
     return false;
   }
@@ -258,7 +265,19 @@ function patchMrt(raw) {
   let rfuForced = 0;
   let showForced = 0;
   let candidates = 0;
+  let skippedEmptyName = 0;
   for (const variable of numbered(dictionary.Variables)) {
+    if (!variable || typeof variable !== "object") continue;
+    // RFU без Name — убрать с панели, иначе Stimulsoft рисует пусто
+    if (!varName(variable) && (flagTrue(variable.RequestFromUser) || "RequestFromUser" in variable)) {
+      if (!flagFalse(variable.RequestFromUser) || !flagFalse(variable.ShowOnParametersPanel)) {
+        variable.RequestFromUser = false;
+        variable.ShowOnParametersPanel = false;
+        skippedEmptyName += 1;
+        changed = true;
+      }
+      continue;
+    }
     if (!isPanelCandidate(variable)) continue;
     candidates += 1;
     if (!flagTrue(variable.RequestFromUser)) {
@@ -275,6 +294,7 @@ function patchMrt(raw) {
   meta.panel_candidates = candidates;
   meta.rfu_forced = rfuForced;
   meta.show_on_panel_forced = showForced;
+  meta.skipped_empty_name = skippedEmptyName;
   meta.patched = changed;
 
   if (!changed) return { body: text, meta };
@@ -308,8 +328,9 @@ app.get("/debug", (_req, res) => {
     return;
   }
   const raw = fs.readFileSync(MRT, "utf8");
-  const { meta } = patchMrt(raw);
+  const { body, meta } = patchMrt(raw);
   let report = null;
+  let patchedReport = null;
   try {
     report = JSON.parse(raw.replace(/^\uFEFF/, ""));
   } catch (_) {
@@ -320,32 +341,51 @@ app.get("/debug", (_req, res) => {
       return;
     }
   }
+  try {
+    patchedReport = JSON.parse(body);
+  } catch (_) {
+    patchedReport = report;
+  }
   const vars = numbered(
     report && report.Dictionary && report.Dictionary.Variables
   ).filter((v) => v && typeof v === "object");
-  const panel = vars.filter(isPanelCandidate).map((v) => ({
-    name: v.Name || "",
+  const patchedVars = numbered(
+    patchedReport && patchedReport.Dictionary && patchedReport.Dictionary.Variables
+  ).filter((v) => v && typeof v === "object");
+  const panel = patchedVars.filter(isPanelCandidate).map((v) => ({
+    name: varName(v),
     requestFromUser: v.RequestFromUser,
     showOnParametersPanel: v.ShowOnParametersPanel,
   }));
+  const emptyNamedRfu = vars.filter(
+    (v) =>
+      !varName(v) &&
+      (flagTrue(v.RequestFromUser) || ("RequestFromUser" in v && !flagFalse(v.RequestFromUser)))
+  ).length;
   res.json({
     ok: true,
     path: MRT,
     reportVersion: report.ReportVersion || "",
-    scriptLanguage: report.ScriptLanguage || "",
-    requestParameters: report.RequestParameters,
-    parametersDisplayMode: report.ParametersDisplayMode,
+    scriptLanguage_file: report.ScriptLanguage || "",
+    scriptLanguage_served: patchedReport.ScriptLanguage || meta.script_language,
+    requestParameters_served: patchedReport.RequestParameters,
+    parametersDisplayMode_served: patchedReport.ParametersDisplayMode,
     all_variables_count: vars.length,
     panel_candidates: panel,
     panel_count: panel.length,
+    empty_named_rfu_in_file: emptyNamedRfu,
     force_request_parameters: FORCE_REQUEST_PARAMETERS,
     force_parameters_panel: FORCE_PARAMETERS_PANEL,
     force_show_on_parameters_panel: FORCE_SHOW_ON_PARAMETERS_PANEL,
     mrt_patch: meta,
     note:
       panel.length === 0
-        ? "Нет RFU/ShowOnParametersPanel кандидатов — в .mrt нет панели фильтров (или файл обезличен)."
-        : "Ожидай Parameters panel + Submit. Canvas ComboBox — отдельно.",
+        ? "Нет именованных RFU на панели — проверь .mrt."
+        : "Сервер отдаёт Panel + " +
+          panel.length +
+          " фильтров (" +
+          panel.map((p) => p.name).join(", ") +
+          "). Открой /viewer — сверху параметры, ниже дашборд; Submit подставит значения в SQL.",
   });
 });
 
