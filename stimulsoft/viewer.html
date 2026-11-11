@@ -9,10 +9,11 @@
   <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
   <script src="/config.js" type="text/javascript"></script>
   <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #e8e8e8; }
     #stiStatus {
       position: fixed; z-index: 99999; left: 8px; bottom: 8px;
-      background: rgba(0,0,0,.75); color: #fff; font: 12px/1.4 monospace;
-      padding: 8px 10px; border-radius: 6px; max-width: 60vw;
+      background: rgba(0,0,0,.8); color: #fff; font: 12px/1.4 monospace;
+      padding: 8px 10px; border-radius: 6px; max-width: 70vw;
     }
   </style>
 </head>
@@ -21,9 +22,10 @@
   <script type="text/javascript">
     (async function () {
       var status = document.getElementById("stiStatus");
+      var dataHits = 0;
       function info(msg) {
         console.log("[viewer]", msg);
-        if (status) status.textContent = msg;
+        if (status) status.textContent = msg + " | /data hits=" + dataHits;
       }
 
       var cfg = window.__STI__ || {};
@@ -41,37 +43,49 @@
       var options = new Stimulsoft.Viewer.StiViewerOptions();
       options.appearance.fullScreenMode = true;
       try {
+        options.appearance.scrollbarsMode = true;
+      } catch (e) {}
+      try {
         options.toolbar.showParametersButton = true;
       } catch (e) {}
+      // панель фильтров сверху, но НЕ на весь экран
       try {
         if (Stimulsoft.Viewer && Stimulsoft.Viewer.StiParametersPanelPosition) {
           options.appearance.parametersPanelPosition =
             Stimulsoft.Viewer.StiParametersPanelPosition.Top;
         }
       } catch (e) {}
+      try {
+        options.appearance.parametersPanelMaxHeight = 160;
+      } catch (e) {}
+      try {
+        options.appearance.parametersPanelColumnsCount = 3;
+      } catch (e) {}
+      try {
+        options.appearance.minParametersCountForMultiColumns = 1;
+      } catch (e) {}
 
       var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
 
       function bindConn(args) {
+        dataHits += 1;
         if (cfg.pgConn) {
           args.connectionString = cfg.pgConn;
           try {
             args.database = "PostgreSQL";
           } catch (e) {}
         }
-        console.log(
-          "[sti data]",
-          args.command || "",
-          args.database || "",
-          args.dataSource || "",
-          (args.queryString || "").slice(0, 120)
+        info(
+          "SQL " +
+            (args.dataSource || args.command || "") +
+            " " +
+            String(args.queryString || "").slice(0, 80)
         );
       }
       viewer.onBeginProcessData = bindConn;
 
       var fromPreview = /(?:\?|&)from=preview(?:&|$)/.test(location.search || "");
       var mrtUrl = fromPreview ? "/dashboard-preview" : "/dashboard";
-      info("fetch " + mrtUrl);
 
       var resp = await fetch(mrtUrl, { cache: "no-store" });
       if (!resp.ok) throw new Error(mrtUrl + " HTTP " + resp.status);
@@ -82,8 +96,11 @@
       report.load(text);
       report.onBeginProcessData = bindConn;
 
-      // дашборд сразу; фильтры на панели остаются как в .mrt
+      // критично: иначе холст ждёт Submit и остаётся белым
       report.requestParameters = false;
+      try {
+        report.reportPass = "First";
+      } catch (e) {}
 
       try {
         if (Stimulsoft.Report && Stimulsoft.Report.StiParametersDisplayMode) {
@@ -92,7 +109,6 @@
         }
       } catch (e) {}
 
-      // PG connection на словарях
       try {
         var dbs = report.dictionary.databases;
         for (var i = 0; i < (dbs.count || 0); i++) {
@@ -101,13 +117,12 @@
         }
       } catch (e) {}
 
-      // именованные RFU → на панели (безымянные не трогаем)
       try {
         var vars = report.dictionary.variables;
         for (var i = 0; i < (vars.count || 0); i++) {
           var v = vars.getByIndex(i);
           if (!v) continue;
-          var name = (v.name || v.Name || "").toString().trim();
+          var name = String(v.name || "").trim();
           if (!name) continue;
           if (v.requestFromUser || v.showOnParametersPanel) {
             v.requestFromUser = true;
@@ -117,8 +132,7 @@
       } catch (e) {}
 
       var pages = 0,
-        comps = 0,
-        dbsN = 0;
+        comps = 0;
       try {
         pages = report.pages.count || 0;
         for (var p = 0; p < pages; p++) {
@@ -126,53 +140,78 @@
           comps += (page && page.components && page.components.count) || 0;
         }
       } catch (e) {}
-      try {
-        dbsN = report.dictionary.databases.count || 0;
-      } catch (e) {}
 
-      info(
-        "pages=" +
-          pages +
-          " comps=" +
-          comps +
-          " dbs=" +
-          dbsN +
-          " pg=" +
-          (cfg.pgConn ? "ok" : "no") +
-          " adapter=" +
-          StiOptions.WebServer.url
-      );
+      info("loaded pages=" + pages + " comps=" + comps);
 
       if (!pages || !comps) {
-        throw new Error(
-          "MRT loaded but empty dashboard (pages=" +
-            pages +
-            ", comps=" +
-            comps +
-            "). Проверь testted.mrt"
-        );
+        throw new Error("MRT empty: pages=" + pages + " comps=" + comps);
       }
 
-      // как в офиц. Express sample: сначала renderHtml, потом report
-      viewer.renderHtml();
+      // как в рабочем коммите: сначала report, потом renderHtml
       viewer.report = report;
+      viewer.renderHtml();
 
-      function kick() {
+      // значения в панели уже есть → жмём Submit, иначе SQL не уходит
+      function clickSubmit() {
         try {
-          var js = viewer.jsObject;
-          if (!js) return;
-          if (js.postAction) {
-            js.postAction("Submit");
-            js.postAction("GetPages");
-            js.postAction("Refresh");
+          var panel =
+            viewer.jsObject &&
+            viewer.jsObject.controls &&
+            viewer.jsObject.controls.parametersPanel;
+          var btn = panel && panel.mainButtons && panel.mainButtons.submit;
+          if (btn) {
+            if (typeof btn.action === "function") btn.action();
+            else if (typeof btn.onclick === "function") btn.onclick();
+            else btn.click();
+            return true;
           }
         } catch (e) {}
+        try {
+          var nodes = document.querySelectorAll("input, button, a, div, span");
+          for (var i = 0; i < nodes.length; i++) {
+            var t = (nodes[i].innerText || nodes[i].value || "").trim();
+            if (t === "Submit" || t === "Применить") {
+              nodes[i].click();
+              return true;
+            }
+          }
+        } catch (e) {}
+        try {
+          if (viewer.jsObject && viewer.jsObject.postAction) {
+            viewer.jsObject.postAction("Submit");
+            viewer.jsObject.postAction("GetPages");
+            viewer.jsObject.postAction("Refresh");
+            return true;
+          }
+        } catch (e) {}
+        return false;
       }
-      setTimeout(kick, 500);
-      setTimeout(kick, 1500);
+
+      var n = 0;
+      var t = setInterval(function () {
+        var ok = clickSubmit();
+        n += 1;
+        info(
+          "pages=" +
+            pages +
+            " comps=" +
+            comps +
+            " submit=" +
+            ok +
+            " try=" +
+            n
+        );
+        if (ok || n >= 12) clearInterval(t);
+      }, 400);
+
       setTimeout(function () {
-        if (status) status.style.opacity = "0.35";
-      }, 4000);
+        if (dataHits === 0) {
+          info(
+            "WARNING: нет запросов /data — SQL не вызывался. Нажми Submit вручную."
+          );
+          if (status) status.style.background = "#840";
+        }
+      }, 5000);
     })().catch(function (err) {
       console.error(err);
       var status = document.getElementById("stiStatus");
