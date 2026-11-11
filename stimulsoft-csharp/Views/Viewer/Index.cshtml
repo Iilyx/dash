@@ -1,0 +1,16 @@
+@{
+    ViewData["Title"] = "Viewer";
+}
+
+@Html.StiNetCoreViewer(new StiNetCoreViewerOptions()
+{
+    Actions =
+    {
+        GetReport = "GetReport",
+        ViewerEvent = "ViewerEvent"
+    },
+    Appearance =
+    {
+        ScrollbarsMode = true
+    }
+})

@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .env
 node_modules/
+stimulsoft-csharp/bin/
+stimulsoft-csharp/obj/
+stimulsoft-csharp/.vs/
 
 # generated / local
 catalog.json
