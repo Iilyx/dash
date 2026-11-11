@@ -7,15 +7,30 @@ const express = require("express");
 const adapter = require("stimulsoft-data-adapter");
 
 const ROOT = __dirname;
+
+function loadEnv() {
+  const p = path.join(ROOT, ".env");
+  if (!fs.existsSync(p)) return;
+  for (const line of fs.readFileSync(p, "utf8").split("\n")) {
+    const s = line.trim();
+    if (!s || s.startsWith("#") || !s.includes("=")) continue;
+    const i = s.indexOf("=");
+    const k = s.slice(0, i).trim();
+    const v = s.slice(i + 1).trim().replace(/^['"]|['"]$/g, "");
+    if (!(k in process.env)) process.env[k] = v;
+  }
+}
+loadEnv();
+
 const SCRIPTS = path.join(ROOT, "node_modules", "stimulsoft-dashboards-js", "Scripts");
-const PORT = Number(process.env.PORT || 8040);
+const PORT = Number(process.env.PORT || process.env.DESIGNER_PORT || 8040);
 const MRT = process.env.MRT_PATH || path.join(ROOT, "dashboard.mrt");
 
 function pgConn() {
   const user = process.env.POSTGRES_USER || "";
   const password = process.env.POSTGRES_PASSWORD || "";
   const db = process.env.POSTGRES_DB || "";
-  const host = process.env.POSTGRES_HOST || "postgres";
+  const host = process.env.POSTGRES_HOST || "127.0.0.1";
   const port = process.env.POSTGRES_PORT || "5432";
   if (!user || !password || !db) {
     throw new Error("Need POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB");
