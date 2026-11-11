@@ -151,13 +151,23 @@ for (const name of [
   app.get("/" + name, (_req, res) => res.sendFile(path.join(SCRIPTS, name)));
 }
 
+app.get("/sti-common.js", (_req, res) => {
+  res.sendFile(path.join(ROOT, "public", "sti-common.js"));
+});
+
+app.get("/viewer", (_req, res) => {
+  res.sendFile(path.join(ROOT, "viewer.html"));
+});
+
 app.get(["/", "/designer"], (_req, res) => {
+  // / → сразу viewer с дашбордом без фильтров
+  if (_req.path === "/") return res.redirect("/viewer");
   res.sendFile(path.join(ROOT, "designer.html"));
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Dashboards.JS 2024.3.3 designer + Postgres adapter");
+  console.log("Dashboards.JS 2024.3.3 + Postgres adapter");
   console.log("MRT:", MRT);
-  console.log("http://0.0.0.0:" + PORT + "/designer");
-  console.log('StiOptions.WebServer.url = "' + "http://localhost:" + PORT + '/data"');
+  console.log("Viewer:   http://0.0.0.0:" + PORT + "/viewer");
+  console.log("Designer: http://0.0.0.0:" + PORT + "/designer");
 });

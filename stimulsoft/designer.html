@@ -9,142 +9,31 @@
   <script src="/stimulsoft.designer.js"></script>
   <script src="/stimulsoft.blockly.editor.js"></script>
   <script src="/config.js"></script>
+  <script src="/sti-common.js"></script>
   <style>
     #banner {
-      display: none;
       position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
-      padding: 8px 12px; background: #7a1f1f; color: #fff;
+      padding: 8px 12px; background: #1a3a5c; color: #fff;
       font: 14px/1.4 system-ui, sans-serif;
     }
+    #banner a { color: #9cf; }
+    #designer { padding-top: 36px; }
   </style>
 </head>
 <body>
-  <div id="banner"></div>
+  <div id="banner">
+    Preview дашборда (без фильтров):
+    <a href="/viewer" target="_blank">/viewer</a>
+  </div>
   <div id="designer"></div>
   <script>
     (async function () {
       var cfg = window.__STI__ || {};
-      var dataUrl = window.location.origin + "/data";
-
-      if (cfg.licenseKey) {
-        try {
-          if (Stimulsoft.Base && Stimulsoft.Base.StiLicense)
-            Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
-        } catch (e) {}
-      }
-
-      StiOptions.WebServer.url = dataUrl;
-      StiOptions.WebServer.encryptData = false;
-      StiOptions.WebServer.checkDataAdaptersVersion = false;
-      console.log("[sti] WebServer.url =", StiOptions.WebServer.url);
-
-      function showBanner(text) {
-        var el = document.getElementById("banner");
-        el.style.display = "block";
-        el.textContent = text;
-      }
-
-      function isScrubbed(jsonText) {
-        try {
-          var d = JSON.parse(jsonText);
-          var db0 = d.Dictionary && d.Dictionary.Databases && d.Dictionary.Databases["0"];
-          return !db0 || !String(db0.Ident || "").trim() || !String(db0.Name || "").trim();
-        } catch (e) {
-          return true;
-        }
-      }
-
-      // Preview без панели фильтров / без ожидания Submit
-      function patchForPreview(report) {
-        report.requestParameters = false;
-        try {
-          if (report.parametersDisplayMode != null) report.parametersDisplayMode = 0;
-        } catch (e) {}
-
-        try {
-          var vars = report.dictionary.variables;
-          for (var i = 0; i < (vars.count || 0); i++) {
-            var v = vars.getByIndex(i);
-            if (!v) continue;
-            v.requestFromUser = false;
-            try {
-              if ("showOnParametersPanel" in v) v.showOnParametersPanel = false;
-            } catch (e2) {}
-          }
-        } catch (e) {
-          console.warn("[sti] variables patch", e);
-        }
-
-        try {
-          var dbs = report.dictionary.databases;
-          for (var i = 0; i < (dbs.count || 0); i++) {
-            var db = dbs.getByIndex(i);
-            if (db && cfg.pgConn) db.connectionString = cfg.pgConn;
-          }
-        } catch (e) {}
-
-        report.onBeginProcessData = function (args) {
-          console.log("[sti] BeginProcessData", args.command, args.database, args.dataSource);
-          if (cfg.pgConn) args.connectionString = cfg.pgConn;
-        };
-      }
-
-      function patchPg(report) {
-        patchForPreview(report);
-      }
-
-      // Живой demo с Postgres, если .mrt scrubbed
-      function buildPgDemo(report) {
-        report.dictionary.databases.clear();
-        report.dictionary.dataSources.clear();
-
-        var db = new Stimulsoft.Report.Dictionary.StiPostgreSQLDatabase(
-          "Connection",
-          "Connection",
-          cfg.pgConn || ""
-        );
-        report.dictionary.databases.add(db);
-
-        var ds = new Stimulsoft.Report.Dictionary.StiPostgreSQLSource(
-          "Connection",
-          "Demo",
-          "Demo",
-          "SELECT 1 AS n, current_database()::text AS db, now()::text AS ts"
-        );
-        ds.columns.add(
-          new Stimulsoft.Report.Dictionary.StiDataColumn("n", "n", "n", Stimulsoft.System.Int32)
-        );
-        ds.columns.add(
-          new Stimulsoft.Report.Dictionary.StiDataColumn("db", "db", "db", Stimulsoft.System.String)
-        );
-        ds.columns.add(
-          new Stimulsoft.Report.Dictionary.StiDataColumn("ts", "ts", "ts", Stimulsoft.System.String)
-        );
-        report.dictionary.dataSources.add(ds);
-
-        var dashboard = report.pages.getByIndex(0);
-        try {
-          dashboard.components.clear();
-        } catch (e) {}
-
-        var tableElement = new Stimulsoft.Dashboard.Components.Table.StiTableElement();
-        tableElement.left = 20;
-        tableElement.top = 40;
-        tableElement.width = 720;
-        tableElement.height = 360;
-        tableElement.name = "DemoTable";
-        dashboard.components.add(tableElement);
-
-        ["Demo.n", "Demo.db", "Demo.ts"].forEach(function (expr) {
-          var col = new Stimulsoft.Dashboard.Components.Table.StiDimensionColumn();
-          col.expression = expr;
-          tableElement.columns.add(col);
-        });
-      }
+      window.StiApp.applyLicense(cfg);
+      window.StiApp.setupAdapter();
 
       var options = new Stimulsoft.Designer.StiDesignerOptions();
       options.appearance.fullScreenMode = true;
-      // preview-viewer внутри дизайнера — без кнопки Parameters
       try {
         if (options.viewerOptions && options.viewerOptions.toolbar) {
           options.viewerOptions.toolbar.showParametersButton = false;
@@ -156,27 +45,16 @@
       designer.onBeginProcessData = function (args) {
         if (cfg.pgConn) args.connectionString = cfg.pgConn;
       };
+
+      // Встроенный Preview в дизайнере часто даёт серый холст —
+      // открываем отдельный Viewer без фильтров.
       designer.onPreviewReport = function (args) {
-        patchForPreview(args.report);
-        // дашборд: форсируем отрисовку страниц без Submit по фильтрам
-        setTimeout(function () {
-          try {
-            var js =
-              (designer.jsObject &&
-                designer.jsObject.options &&
-                designer.jsObject.options.viewer &&
-                designer.jsObject.options.viewer.jsObject) ||
-              (designer.viewer && designer.viewer.jsObject) ||
-              null;
-            if (js && js.postAction) {
-              js.postAction("GetPages");
-              console.log("[sti] preview GetPages");
-            }
-          } catch (e) {
-            console.warn("[sti] GetPages", e);
-          }
-        }, 300);
+        try {
+          args.preventDefault = true;
+        } catch (e) {}
+        window.open("/viewer", "_blank");
       };
+
       designer.onSaveReport = function (args) {
         args.preventDefault = true;
         fetch("/dashboard", {
@@ -188,24 +66,26 @@
       designer.onSaveAsReport = designer.onSaveReport;
       designer.renderHtml("designer");
 
-      var resp = await fetch("/dashboard", { cache: "no-store" });
-      var json = resp.ok ? await resp.text() : "";
-      var report = Stimulsoft.Report.StiReport.createNewDashboard();
+      var loaded = await window.StiApp.loadReport(cfg);
+      // в редакторе фильтры оставляем (для правки), strip только в viewer
+      // здесь только PG + requestParameters off чтобы не блокировать
+      loaded.report.requestParameters = false;
+      try {
+        var dbs = loaded.report.dictionary.databases;
+        for (var i = 0; i < (dbs.count || 0); i++) {
+          var db = dbs.getByIndex(i);
+          if (db && cfg.pgConn) db.connectionString = cfg.pgConn;
+        }
+      } catch (e) {}
+      loaded.report.onBeginProcessData = function (args) {
+        if (cfg.pgConn) args.connectionString = cfg.pgConn;
+      };
+      designer.report = loaded.report;
 
-      if (json && !isScrubbed(json)) {
-        report.load(json);
-        patchPg(report);
-        console.log("[sti] loaded full .mrt");
-      } else {
-        buildPgDemo(report);
-        patchPg(report);
-        showBanner(
-          "dashboard.mrt scrubbed/пустой — открыт DEMO с Postgres (SELECT 1). Положи полный .mrt и задай MRT_PATH."
-        );
-        console.warn("[sti] scrubbed mrt → PG demo dashboard");
+      if (loaded.demo) {
+        document.getElementById("banner").innerHTML +=
+          " · сейчас DEMO (scrubbed .mrt), положи полный файл в MRT_PATH";
       }
-
-      designer.report = report;
     })();
   </script>
 </body>

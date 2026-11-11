@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Stimulsoft Dashboards.JS Viewer</title>
+  <script src="/stimulsoft.reports.js"></script>
+  <script src="/stimulsoft.dashboards.js"></script>
+  <script src="/stimulsoft.viewer.js"></script>
+  <script src="/config.js"></script>
+  <script src="/sti-common.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #1e1e1e; }
+    #banner {
+      display: none;
+      position: fixed; z-index: 99999; left: 0; right: 0; top: 0;
+      padding: 8px 12px; background: #245b2e; color: #fff;
+      font: 14px/1.4 system-ui, sans-serif;
+    }
+    #banner a { color: #cfc; }
+  </style>
+</head>
+<body>
+  <div id="banner"></div>
+  <div id="viewer"></div>
+  <script>
+    (async function () {
+      var cfg = window.__STI__ || {};
+      window.StiApp.applyLicense(cfg);
+      window.StiApp.setupAdapter();
+
+      var options = new Stimulsoft.Viewer.StiViewerOptions();
+      options.appearance.fullScreenMode = true;
+      options.toolbar.showParametersButton = false;
+      options.appearance.scrollbarsMode = true;
+
+      var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
+      viewer.onBeginProcessData = function (args) {
+        if (cfg.pgConn) args.connectionString = cfg.pgConn;
+      };
+      viewer.renderHtml("viewer");
+
+      var loaded = await window.StiApp.loadReport(cfg);
+      viewer.report = loaded.report;
+
+      var banner = document.getElementById("banner");
+      banner.style.display = "block";
+      banner.innerHTML = loaded.demo
+        ? "DEMO (scrubbed .mrt). Редактор: <a href='/designer'>/designer</a>"
+        : "Дашборд без панели фильтров. Редактор: <a href='/designer'>/designer</a>";
+
+      // если viewer всё же ждёт параметры — дожать отрисовку
+      setTimeout(function () {
+        try {
+          if (viewer.jsObject && viewer.jsObject.postAction) {
+            viewer.jsObject.postAction("GetPages");
+          }
+        } catch (e) {}
+      }, 400);
+    })();
+  </script>
+</body>
+</html>
