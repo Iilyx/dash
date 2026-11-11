@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
-"""Designer дашборда: .mrt + Postgres (Stimulsoft Dashboards.PYTHON 2024.2.6).
+"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2024.2.6).
 
-Как в Samples-Dashboards.Python / docs:
-  StiDesigner + loadFile(.mrt) + onBeginProcessData + onSaveReport.
+Встроенный Preview в designer 2024.2.6 часто показывает только фильтры.
+Кнопка Preview: сохранить .mrt → открыть /viewer.
 
 Запуск:
   # в .env: MRT_PATH=.../dashboard.mrt
   .venv/bin/python view_dashboard.py
-  Открой /designer
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import webbrowser
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
-# Нужен пакет dashboards — иначе в HTML не подтянется stimulsoft.dashboards.js
 import stimulsoft_dashboards  # noqa: F401
 from flask import Flask, Response, request
 from stimulsoft_reports import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
+from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums import (
+    StiParametersPanelPosition,
+    StiToolbarDisplayMode,
+)
 
 try:
     from stimulsoft_reports import StiLicense
@@ -117,15 +121,27 @@ if not MRT_PATH.is_file():
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
+PARAMETERS_PANEL_COLUMNS = int(os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") or "3")
+PARAMETERS_PANEL_MAX_HEIGHT = int(
+    os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
+)
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
     raise SystemExit(
         "Нет DATABASE_URL / POSTGRES_USER+PASSWORD+DB в .env — "
-        "designer не подставит connection string."
+        "не подставится connection string."
     )
 
 app = Flask(__name__)
+
+# встроенный Preview → сохранить и открыть /viewer
+_PREVIEW_JS = (
+    "designer.onPreviewReport = function (args, callback) { "
+    "args.preventDefault = true; "
+    "Stimulsoft.handler.process(args, function () { window.location = '/viewer'; }); "
+    "}"
+)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
@@ -141,7 +157,27 @@ def save_report(args: StiReportEventArgs):
         MRT_PATH.write_text(text + "\n", encoding="utf-8")
     except OSError as exc:
         return StiResult.getError(str(exc))
-    return f"Сохранено в {MRT_PATH.name}"
+    return None
+
+
+def _patch_preview_to_viewer(resp: Response) -> Response:
+    """Подменить встроенный Preview на переход в /viewer после save."""
+    html = resp.get_data(as_text=True)
+    patched, n = re.subn(
+        r"designer\.onPreviewReport\s*=\s*function\s*\([^)]*\)\s*\{[^}]*\}",
+        _PREVIEW_JS,
+        html,
+        count=1,
+    )
+    if n == 0:
+        # handler не сгенерился — вставим перед renderHtml
+        patched = html.replace(
+            "designer.renderHtml(",
+            _PREVIEW_JS + ";\ndesigner.renderHtml(",
+            1,
+        )
+    resp.set_data(patched)
+    return resp
 
 
 @app.get("/favicon.ico")
@@ -151,7 +187,6 @@ def favicon():
 
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
-    """Всегда с корня /mrt — иначе relative loadFile с /designer даёт 404."""
     if not MRT_PATH.is_file():
         return Response('{"error":"mrt missing"}', status=404, mimetype="application/json")
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
@@ -162,7 +197,6 @@ def serve_mrt():
 
 @app.errorhandler(404)
 def not_found(_err):
-    # Stimulsoft иногда дергает лишние GetResource — в Network: null + 404
     print(f"[404] {request.method} {request.path} args={dict(request.args)}", flush=True)
     if request.args.get("sti_event") or request.path.startswith("/mrt"):
         return Response("null", status=404, mimetype="application/json")
@@ -172,18 +206,46 @@ def not_found(_err):
 @app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
-    """HTML5 designer — как в документации Stimulsoft."""
     sti = StiDesigner()
     sti.options.appearance.fullScreenMode = True
+    sti.options.toolbar.showPreviewButton = True
+    sti.options.toolbar.showFileMenuExit = True
     sti.onBeginProcessData += begin_process_data
+    # PREVIEW_REPORT / Save — пишем актуальный .mrt
+    sti.onPreviewReport += save_report
     sti.onSaveReport += save_report
     sti.onSaveAsReport += save_report
+    sti.onExit += "window.location = '/viewer';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
 
     report = StiReport()
-    # абсолютный путь от origin — не url_for relative к /designer
+    report.loadFile("/mrt")
+    sti.report = report
+    return _patch_preview_to_viewer(sti.getFrameworkResponse())
+
+
+@app.route("/viewer", methods=["GET", "POST"])
+def viewer():
+    """Preview дашборда — обход broken embedded Preview в designer 2024.2.6."""
+    sti = StiViewer()
+    sti.id = "viewer"
+    sti.options.appearance.fullScreenMode = True
+    sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
+    if hasattr(sti.options.appearance, "minParametersCountForMultiColumns"):
+        sti.options.appearance.minParametersCountForMultiColumns = 1
+    sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
+    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
+    sti.options.toolbar.showDesignButton = True
+    sti.onBeginProcessData += begin_process_data
+    sti.onDesignReport += "window.location = '/designer';"
+
+    if sti.processRequest(request):
+        return sti.getFrameworkResponse()
+
+    report = StiReport()
     report.loadFile("/mrt")
     sti.report = report
     return sti.getFrameworkResponse()
@@ -194,6 +256,7 @@ def main() -> None:
     print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
     print(f"License:  {LICENSE_STATUS}", flush=True)
     print(f"Designer: {url}", flush=True)
+    print(f"Preview:  {url}viewer", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(url)
