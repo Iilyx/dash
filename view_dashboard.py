@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Viewer + designer: .mrt + Postgres (Stimulsoft Dashboards.PYTHON 2024.2.6).
+"""Designer дашборда: .mrt + Postgres (Stimulsoft Dashboards.PYTHON 2024.2.6).
 
-  /         — viewer
-  /designer — HTML5 designer, Save → MRT_PATH
+Как в Samples-Dashboards.Python / docs:
+  StiDesigner + loadFile(.mrt) + onBeginProcessData + onSaveReport.
 
 Запуск:
   # в .env: MRT_PATH=.../dashboard.mrt
   .venv/bin/python view_dashboard.py
+  Открой /designer
 """
 
 from __future__ import annotations
@@ -25,11 +26,6 @@ from stimulsoft_reports import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
-from stimulsoft_reports.viewer import StiViewer
-from stimulsoft_reports.viewer.enums import (
-    StiParametersPanelPosition,
-    StiToolbarDisplayMode,
-)
 
 try:
     from stimulsoft_reports import StiLicense
@@ -42,7 +38,6 @@ ROOT = Path(__file__).resolve().parent
 
 
 def load_env() -> None:
-    """Читает .env; значения из файла перекрывают уже заданные в окружении."""
     path = ROOT / ".env"
     if not path.is_file():
         return
@@ -89,7 +84,6 @@ def stimulsoft_pg_connection_string(url: str) -> str:
 
 
 def resolve_mrt_path() -> Path:
-    """Путь к .mrt из MRT_PATH в .env (опционально: argv перекрывает)."""
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         return path_of(sys.argv[1])
     env_path = os.environ.get("MRT_PATH", "").strip()
@@ -99,7 +93,6 @@ def resolve_mrt_path() -> Path:
 
 
 def apply_license() -> str:
-    """Ключ из .env → Stimulsoft.Base.StiLicense. Пусто = trial."""
     key = os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
     key_file = os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
     if key:
@@ -124,16 +117,12 @@ if not MRT_PATH.is_file():
 VIEWER_HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
-PARAMETERS_PANEL_COLUMNS = int(os.environ.get("PARAMETERS_PANEL_COLUMNS", "3") or "3")
-PARAMETERS_PANEL_MAX_HEIGHT = int(
-    os.environ.get("PARAMETERS_PANEL_MAX_HEIGHT", "220") or "220"
-)
 
 PG_CONN = stimulsoft_pg_connection_string(database_url()) if database_url() else ""
 if not PG_CONN:
     raise SystemExit(
         "Нет DATABASE_URL / POSTGRES_USER+PASSWORD+DB в .env — "
-        "viewer не подставит connection string."
+        "designer не подставит connection string."
     )
 
 app = Flask(__name__)
@@ -145,7 +134,6 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 
 def save_report(args: StiReportEventArgs):
-    """Save / Save As из designer → MRT_PATH."""
     if args.report is None:
         return StiResult.getError("пустой report — нечего сохранять")
     try:
@@ -164,51 +152,15 @@ def serve_mrt():
     return resp
 
 
-def preview_report(args: StiReportEventArgs):
-    """Preview в designer: данные уже идут через onBeginProcessData."""
-    return None
-
-
+@app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
+    """HTML5 designer — как в документации Stimulsoft."""
     sti = StiDesigner()
-    sti.id = "designer"
     sti.options.appearance.fullScreenMode = True
-    sti.options.toolbar.showFileMenuExit = True
-    sti.options.toolbar.showPreviewButton = True
-    # НЕ трогать viewerOptions.appearance в 2024.2.6:
-    # getHtml пишет в designerOptions.appearance и ломает Preview.
     sti.onBeginProcessData += begin_process_data
-    sti.onPreviewReport += preview_report
     sti.onSaveReport += save_report
     sti.onSaveAsReport += save_report
-    # 2024.2.x: нет javascript.appendHead — raw JS в callback
-    sti.onExit += "window.location = '/';"
-
-    if sti.processRequest(request):
-        return sti.getFrameworkResponse()
-
-    report = StiReport()
-    report.loadFile(url_for("serve_mrt"))
-    sti.report = report
-    return sti.getFrameworkResponse()
-
-
-@app.route("/", methods=["GET", "POST"])
-@app.route("/viewer", methods=["GET", "POST"])
-def viewer():
-    sti = StiViewer()
-    sti.id = "viewer"
-    sti.options.appearance.fullScreenMode = True
-    sti.options.appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
-    sti.options.appearance.parametersPanelColumnsCount = PARAMETERS_PANEL_COLUMNS
-    if hasattr(sti.options.appearance, "minParametersCountForMultiColumns"):
-        sti.options.appearance.minParametersCountForMultiColumns = 1
-    sti.options.appearance.parametersPanelMaxHeight = PARAMETERS_PANEL_MAX_HEIGHT
-    sti.options.toolbar.displayMode = StiToolbarDisplayMode.SEPARATED
-    sti.options.toolbar.showDesignButton = True
-    sti.onBeginProcessData += begin_process_data
-    sti.onDesignReport += "window.location = '/designer';"
 
     if sti.processRequest(request):
         return sti.getFrameworkResponse()
@@ -223,11 +175,10 @@ def main() -> None:
     url = f"http://{VIEWER_HOST}:{VIEWER_PORT}/"
     print(f"MRT:      {MRT_PATH.resolve()}", flush=True)
     print(f"License:  {LICENSE_STATUS}", flush=True)
-    print(f"Open:     {url}", flush=True)
-    print(f"Designer: {url}designer", flush=True)
+    print(f"Designer: {url}", flush=True)
     if OPEN_BROWSER:
         try:
-            webbrowser.open(url + "designer")
+            webbrowser.open(url)
         except Exception:
             pass
     app.run(host=VIEWER_HOST, port=VIEWER_PORT, debug=False)
