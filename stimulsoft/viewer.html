@@ -9,87 +9,60 @@
   <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
   <script src="/config.js" type="text/javascript"></script>
   <style>
-    html, body { margin: 0; height: 100%; background: #d0d0d0; }
-    #viewerHost {
-      position: absolute; left: 0; right: 0; top: 0; bottom: 48px;
-    }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #c8c8c8; }
     #stiStatus {
-      position: absolute; left: 0; right: 0; bottom: 0; height: 48px;
-      background: #111; color: #0f0; font: 12px/48px monospace;
+      position: fixed; z-index: 99999; left: 0; right: 0; bottom: 0; height: 40px;
+      background: #111; color: #0f0; font: 12px/40px monospace;
       padding: 0 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      z-index: 99999;
     }
     #stiStatus.err { color: #f66; }
+    /* если Stimulsoft схлопнул область дашборда */
+    .stiJsViewerPage, .stiJsViewerDashboardPanel, .stiJsViewerReportPanel,
+    .stiJsViewerMainPanel, [class*="Dashboard"] {
+      min-height: 480px !important;
+    }
   </style>
 </head>
 <body>
-  <div id="viewerHost"></div>
   <div id="stiStatus">loading…</div>
   <script type="text/javascript">
     (async function () {
       var status = document.getElementById("stiStatus");
-      var dataHits = 0;
-      var dataOk = 0;
-      var dataFail = 0;
-      var lastData = "";
-
-      function info(msg, isErr) {
+      var dataHits = 0, dataOk = 0;
+      function info(msg, err) {
         console.log("[viewer]", msg);
         status.textContent = msg;
-        status.className = isErr ? "err" : "";
+        status.className = err ? "err" : "";
       }
 
-      // перехват /data — видно, уходит ли SQL и что ответил adapter
       (function () {
-        var origOpen = XMLHttpRequest.prototype.open;
-        var origSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (method, url) {
-          this.__stiUrl = url;
-          return origOpen.apply(this, arguments);
+        var oOpen = XMLHttpRequest.prototype.open;
+        var oSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u) {
+          this.__u = u;
+          return oOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function () {
-          var xhr = this;
-          if (String(xhr.__stiUrl || "").indexOf("/data") >= 0) {
-            xhr.addEventListener("load", function () {
-              dataHits += 1;
-              var body = "";
+          var x = this;
+          if (String(x.__u || "").indexOf("/data") >= 0) {
+            x.addEventListener("load", function () {
+              dataHits++;
+              var t = "";
               try {
-                body = xhr.responseText || "";
+                t = x.responseText || "";
               } catch (e) {}
-              var fail =
-                /"success"\s*:\s*false/i.test(body) ||
-                /notice/i.test(body) && /error|fail|exception/i.test(body);
-              if (xhr.status >= 400 || fail) {
-                dataFail += 1;
-                lastData = "FAIL " + body.slice(0, 120);
-                info(
-                  "hits=" +
-                    dataHits +
-                    " ok=" +
-                    dataOk +
-                    " fail=" +
-                    dataFail +
-                    " | " +
-                    lastData,
-                  true
-                );
-              } else {
-                dataOk += 1;
-                lastData = "OK " + body.slice(0, 80);
-                info(
-                  "hits=" +
-                    dataHits +
-                    " ok=" +
-                    dataOk +
-                    " fail=" +
-                    dataFail +
-                    " | " +
-                    lastData
-                );
-              }
+              if (x.status < 400 && !/"success"\s*:\s*false/i.test(t)) dataOk++;
+              info(
+                "SQL hits=" +
+                  dataHits +
+                  " ok=" +
+                  dataOk +
+                  " | " +
+                  t.slice(0, 60)
+              );
             });
           }
-          return origSend.apply(this, arguments);
+          return oSend.apply(this, arguments);
         };
       })();
 
@@ -106,31 +79,26 @@
       }
 
       var options = new Stimulsoft.Viewer.StiViewerOptions();
-      // без fullScreen — явный контейнер, иначе холст часто 0px под панелью
-      options.appearance.fullScreenMode = false;
+      // официальный dashboard sample — full screen
+      options.appearance.fullScreenMode = true;
       try {
-        options.appearance.scrollbarsMode = true;
+        options.appearance.theme =
+          Stimulsoft.Viewer.StiViewerTheme.Office2013WhiteBlue;
       } catch (e) {}
       try {
         options.toolbar.showParametersButton = true;
       } catch (e) {}
       try {
-        if (Stimulsoft.Viewer && Stimulsoft.Viewer.StiParametersPanelPosition) {
+        if (Stimulsoft.Viewer.StiParametersPanelPosition) {
           options.appearance.parametersPanelPosition =
             Stimulsoft.Viewer.StiParametersPanelPosition.Top;
         }
       } catch (e) {}
       try {
-        options.appearance.parametersPanelMaxHeight = 140;
+        options.appearance.parametersPanelMaxHeight = 120;
       } catch (e) {}
       try {
         options.appearance.parametersPanelColumnsCount = 3;
-      } catch (e) {}
-      try {
-        options.appearance.minParametersCountForMultiColumns = 1;
-      } catch (e) {}
-      try {
-        options.height = "100%";
       } catch (e) {}
 
       var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
@@ -147,10 +115,7 @@
 
       var fromPreview = /(?:\?|&)from=preview(?:&|$)/.test(location.search || "");
       var mrtUrl = fromPreview ? "/dashboard-preview" : "/dashboard";
-
-      var resp = await fetch(mrtUrl, { cache: "no-store" });
-      if (!resp.ok) throw new Error(mrtUrl + " HTTP " + resp.status);
-      var text = await resp.text();
+      var text = await (await fetch(mrtUrl, { cache: "no-store" })).text();
 
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
       report.load(text);
@@ -158,7 +123,7 @@
       report.requestParameters = false;
 
       try {
-        if (Stimulsoft.Report && Stimulsoft.Report.StiParametersDisplayMode) {
+        if (Stimulsoft.Report.StiParametersDisplayMode) {
           report.parametersDisplayMode =
             Stimulsoft.Report.StiParametersDisplayMode.Panel;
         }
@@ -184,30 +149,43 @@
         }
       } catch (e) {}
 
-      var pages = 0,
-        comps = 0;
+      // выбрать страницу с максимумом компонентов (не пустую)
+      var best = 0,
+        bestComps = -1,
+        pageInfo = [];
       try {
-        pages = report.pages.count || 0;
-        for (var p = 0; p < pages; p++) {
+        for (var p = 0; p < (report.pages.count || 0); p++) {
           var page = report.pages.getByIndex(p);
-          comps += (page && page.components && page.components.count) || 0;
+          var c = (page && page.components && page.components.count) || 0;
+          var nm = (page && (page.name || page.Name)) || ("p" + p);
+          pageInfo.push(nm + ":" + c);
+          if (c > bestComps) {
+            bestComps = c;
+            best = p;
+          }
+        }
+        if (best > 0 && report.pages.getByIndex) {
+          // сделать «толстую» страницу первой
+          try {
+            var rich = report.pages.getByIndex(best);
+            report.currentPage = best;
+          } catch (e) {}
         }
       } catch (e) {}
 
       info(
-        "pages=" +
-          pages +
+        "pages=[" +
+          pageInfo.join(", ") +
+          "] best=" +
+          best +
           " comps=" +
-          comps +
-          " pg=" +
-          (cfg.pgConn ? "yes" : "NO") +
-          " → " +
-          StiOptions.WebServer.url
+          bestComps
       );
-      if (!comps) throw new Error("MRT without components");
+      if (bestComps <= 0) throw new Error("no dashboard components in MRT");
 
+      // официальный порядок full-screen sample
+      viewer.renderHtml();
       viewer.report = report;
-      viewer.renderHtml("viewerHost");
 
       function clickSubmit() {
         try {
@@ -218,8 +196,7 @@
           var btn = panel && panel.mainButtons && panel.mainButtons.submit;
           if (btn) {
             if (typeof btn.action === "function") btn.action();
-            else if (typeof btn.onclick === "function") btn.onclick();
-            else btn.click();
+            else btn.click && btn.click();
             return true;
           }
         } catch (e) {}
@@ -237,7 +214,6 @@
           if (viewer.jsObject && viewer.jsObject.postAction) {
             viewer.jsObject.postAction("Submit");
             viewer.jsObject.postAction("GetPages");
-            viewer.jsObject.postAction("Refresh");
             return true;
           }
         } catch (e) {}
@@ -245,18 +221,39 @@
       }
 
       var n = 0;
-      var timer = setInterval(function () {
+      var t = setInterval(function () {
         clickSubmit();
-        n += 1;
-        if (n >= 15) {
-          clearInterval(timer);
-          if (dataHits === 0) {
+        try {
+          if (viewer.jsObject && viewer.jsObject.postAction) {
+            viewer.jsObject.postAction("GetPages");
+            viewer.jsObject.postAction("ZoomPageWidth");
+          }
+        } catch (e) {}
+        // диагностика видимости
+        try {
+          var el =
+            document.querySelector(".stiJsViewerPage") ||
+            document.querySelector(".stiJsViewerDashboardPanel") ||
+            document.querySelector("#StiViewer");
+          if (el) {
+            var r = el.getBoundingClientRect();
             info(
-              "нет /data после Submit — смотри Console. comps=" + comps,
-              true
+              "SQL ok=" +
+                dataOk +
+                "/" +
+                dataHits +
+                " | canvas " +
+                Math.round(r.width) +
+                "x" +
+                Math.round(r.height) +
+                " top=" +
+                Math.round(r.top) +
+                " | " +
+                pageInfo.join(",")
             );
           }
-        }
+        } catch (e) {}
+        if (++n >= 20) clearInterval(t);
       }, 500);
     })().catch(function (err) {
       console.error(err);
