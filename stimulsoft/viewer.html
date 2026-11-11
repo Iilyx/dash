@@ -12,11 +12,11 @@
   <script type="text/javascript">
     (async function () {
       var cfg = window.__STI__ || {};
-      if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
-        Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
-      }
+      try {
+        if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense)
+          Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
+      } catch (e) {}
 
-      // до создания report — Connecting SQL Databases
       StiOptions.WebServer.url = window.location.origin + "/data";
       StiOptions.WebServer.encryptData = false;
       StiOptions.WebServer.checkDataAdaptersVersion = false;
@@ -27,27 +27,57 @@
 
       var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
 
-      // loadFile асинхронный: флаг requestParameters из .mrt затирает то, что ставим сразу после вызова.
-      // грузим JSON до конца, потом выключаем панель Submit.
       var text = await (await fetch("/dashboard", { cache: "no-store" })).text();
       var report = Stimulsoft.Report.StiReport.createNewDashboard();
       report.load(text);
-      report.requestParameters = false;
 
+      // выключить ожидание Submit (из .mrt часто RequestParameters=true)
+      report.requestParameters = false;
       try {
         var vars = report.dictionary.variables;
         for (var i = 0; i < (vars.count || 0); i++) {
           var v = vars.getByIndex(i);
-          if (v) v.requestFromUser = false;
+          if (!v) continue;
+          v.requestFromUser = false;
         }
       } catch (e) {}
 
       report.onBeginProcessData = function (args) {
         if (cfg.pgConn) args.connectionString = cfg.pgConn;
       };
+      viewer.onBeginProcessData = function (args) {
+        if (cfg.pgConn) args.connectionString = cfg.pgConn;
+      };
 
       viewer.report = report;
       viewer.renderHtml();
+
+      // На скрине всё ещё панель Submit + пустой холст.
+      // Даже если requestParameters не сбросилcя — жмём Submit сами.
+      function kick() {
+        try {
+          var js = viewer.jsObject;
+          if (!js) return;
+          if (js.postAction) {
+            js.postAction("Submit");
+            js.postAction("GetPages");
+            js.postAction("Refresh");
+          }
+        } catch (e) {}
+        try {
+          var nodes = document.querySelectorAll("a, button, input, div, span");
+          for (var i = 0; i < nodes.length; i++) {
+            var t = (nodes[i].innerText || nodes[i].value || "").trim();
+            if (t === "Submit" || t === "Применить") {
+              nodes[i].click();
+              break;
+            }
+          }
+        } catch (e) {}
+      }
+      setTimeout(kick, 300);
+      setTimeout(kick, 1000);
+      setTimeout(kick, 2500);
     })();
   </script>
 </body>

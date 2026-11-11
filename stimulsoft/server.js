@@ -48,7 +48,8 @@ const LICENSE =
   (process.env.STIMULSOFT_REPORTS_LICENSE_KEY || "").trim();
 
 const app = express();
-app.use(express.text({ type: "*/*", limit: "50mb" }));
+// ВАЖНО: не ставить глобальный body-parser до /data —
+// иначе req.on('data') в адаптере получает пустое тело.
 
 app.get("/config.js", (_req, res) => {
   res
@@ -85,7 +86,7 @@ app.get("/dashboard", (_req, res) => {
   res.type("application/json").set("Cache-Control", "no-store").send(raw);
 });
 
-app.post("/dashboard", (req, res) => {
+app.post("/dashboard", express.text({ type: "*/*", limit: "50mb" }), (req, res) => {
   try {
     const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
     fs.writeFileSync(MRT, JSON.stringify(JSON.parse(body), null, 2) + "\n");
@@ -96,49 +97,63 @@ app.post("/dashboard", (req, res) => {
 });
 
 // https://www.stimulsoft.com/en/samples/dashboards-js/nodejs/starting-sql-adapters-from-the-http-server
+// stimulsoft-data-adapter сравнивает database строго с "PostgreSQL"
 function forcePg(command) {
   if (!command || typeof command !== "object") return command;
-  // всегда подставляем Postgres из .env (в scrubbed .mrt строка пустая)
   command.connectionString = PG;
-  if (!command.database) command.database = "PostgreSQL";
+  command.database = "PostgreSQL";
   return command;
 }
 
-app.options("/data", (_req, res) => {
-  res.set({
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Origin, X-Requested-With, Content-Type, Accept",
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-  });
-  res.sendStatus(204);
-});
-
-app.post("/data", (req, res) => {
+function dataCors(res) {
   res.set({
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Origin, X-Requested-With, Content-Type, Accept",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
     "Cache-Control": "no-cache",
   });
-  const raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
-  let command;
-  try {
-    command = forcePg(adapter.getCommand(raw));
-  } catch (err) {
-    console.error("[/data] getCommand", err);
-    return res.json({ success: false, notice: String(err.message || err) });
-  }
-  console.log(
-    "[/data]",
-    command && command.command,
-    command && command.database,
-    (command && command.queryString && String(command.queryString).slice(0, 120)) || ""
-  );
-  adapter.process(command, (result) => {
-    if (result && result.success === false) {
-      console.error("[/data] fail", result.notice || result);
+}
+
+app.options("/data", (_req, res) => {
+  dataCors(res);
+  res.sendStatus(204);
+});
+
+// raw body как в официальном sample (express.json/text ломают encrypted payload)
+app.post("/data", (req, res) => {
+  dataCors(res);
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    const raw = Buffer.concat(chunks).toString("utf8");
+    let command;
+    try {
+      command = forcePg(adapter.getCommand(raw || "{}"));
+    } catch (err) {
+      console.error("[/data] getCommand", err, "raw=", raw.slice(0, 200));
+      return res.end(
+        adapter.getResponse({
+          success: false,
+          notice: String(err.message || err),
+          encryptData: false,
+        })
+      );
     }
-    res.type("application/json").send(adapter.getResponse(result));
+    console.log(
+      "[/data]",
+      command.command,
+      command.database,
+      (command.queryString && String(command.queryString).slice(0, 160)) || ""
+    );
+    adapter.process(command, (result) => {
+      if (result && result.success === false) {
+        console.error("[/data] fail", result.notice || result);
+      } else {
+        const rows = (result && result.rows && result.rows.length) || 0;
+        console.log("[/data] ok rows=", rows);
+      }
+      res.type("text/plain").end(adapter.getResponse(result));
+    });
   });
 });
 
