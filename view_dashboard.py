@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2025.4.3).
+"""Designer + Preview через /viewer (Stimulsoft Dashboards.PYTHON 2024.3.3).
+
+2024.3.3 — последняя до смены Format(): короткое "N1" ещё авто-оборачивается в "{0:N1}".
+С 2024.3.4 / 2025+ — другая ветка со скобками { } (NPS-шаблоны ломаются).
 
 Встроенный Preview в designer иногда показывает только фильтры.
 Кнопка Preview: сохранить .mrt → открыть /viewer.
