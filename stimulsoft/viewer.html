@@ -1,98 +1,46 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8" />
-  <title>Stimulsoft Dashboards.JS Viewer</title>
-  <link rel="stylesheet" type="text/css" href="/Css/stimulsoft.viewer.office2013.whiteblue.css" />
-  <script src="/stimulsoft.reports.js"></script>
-  <script src="/stimulsoft.dashboards.js"></script>
-  <script src="/stimulsoft.viewer.js"></script>
-  <script src="/config.js"></script>
-  <script src="/sti-common.js"></script>
-  <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; }
-    #banner {
-      position: fixed; z-index: 99999; left: 8px; top: 8px; max-width: 80%;
-      padding: 6px 10px; background: rgba(36,91,46,.9); color: #fff;
-      font: 12px/1.4 system-ui, sans-serif; border-radius: 4px;
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <title>Using the Full-Screen Mode in the Viewer</title>
+
+  <!-- как в Samples-Dashboards.JS-for-HTML / Using the Full-Screen Mode in the Viewer -->
+  <script src="/stimulsoft.reports.js" type="text/javascript"></script>
+  <script src="/stimulsoft.dashboards.js" type="text/javascript"></script>
+  <script src="/stimulsoft.viewer.js" type="text/javascript"></script>
+  <script src="/config.js" type="text/javascript"></script>
+
+  <script type="text/javascript">
+    // Адрес data adapter — ДО создания report (Connecting SQL Databases)
+    var cfg = window.__STI__ || {};
+    if (cfg.licenseKey && Stimulsoft.Base && Stimulsoft.Base.StiLicense) {
+      Stimulsoft.Base.StiLicense.key = cfg.licenseKey;
     }
-    #banner a { color: #cfc; }
-    #banner.err { background: rgba(122,31,31,.95); }
-  </style>
+    StiOptions.WebServer.url = window.location.origin + "/data";
+    StiOptions.WebServer.encryptData = false;
+    StiOptions.WebServer.checkDataAdaptersVersion = false;
+
+    var options = new Stimulsoft.Viewer.StiViewerOptions();
+    options.appearance.fullScreenMode = true;
+
+    var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
+    var report = Stimulsoft.Report.StiReport.createNewDashboard();
+    report.loadFile("/dashboard");
+
+    // не ждать Submit по фильтрам
+    report.requestParameters = false;
+
+    // подмена строки Postgres (дока: onBeginProcessData / connectionString)
+    report.onBeginProcessData = function (args) {
+      if (cfg.pgConn) args.connectionString = cfg.pgConn;
+    };
+
+    viewer.report = report;
+  </script>
 </head>
 <body>
-  <div id="banner">loading…</div>
-  <div id="viewerContent"></div>
-  <script>
-    (async function () {
-      var banner = document.getElementById("banner");
-      function info(t, err) {
-        banner.className = err ? "err" : "";
-        banner.innerHTML = t;
-      }
-
-      try {
-        if (!window.Stimulsoft) throw new Error("Stimulsoft scripts missing");
-        if (!window.StiApp) throw new Error("sti-common.js missing");
-
-        var cfg = window.__STI__ || {};
-        window.StiApp.applyLicense(cfg);
-        window.StiApp.setupAdapter();
-
-        // 1) готовим report (как в sample: createNewDashboard + loadFile)
-        var report = Stimulsoft.Report.StiReport.createNewDashboard();
-        report.loadFile("/dashboard");
-
-        var mode = "mrt";
-        var firstDb = null;
-        try {
-          firstDb = report.dictionary.databases.getByIndex(0);
-        } catch (e) {}
-
-        if (!firstDb || !String(firstDb.name || "").trim()) {
-          mode = "demo-json";
-          window.StiApp.buildJsonDemo(report);
-          window.StiApp.disableParameterPrompt(report);
-        } else {
-          window.StiApp.patchPg(report, cfg);
-        }
-
-        var s = window.StiApp.stats(report);
-
-        // 2) viewer: report → renderHtml (дока Stimulsoft)
-        var options = new Stimulsoft.Viewer.StiViewerOptions();
-        options.appearance.fullScreenMode = true;
-        options.toolbar.showParametersButton = false;
-
-        var viewer = new Stimulsoft.Viewer.StiViewer(options, "StiViewer", false);
-        viewer.onBeginProcessData = function (args) {
-          if (cfg.pgConn) args.connectionString = cfg.pgConn;
-        };
-        viewer.report = report;
-        viewer.renderHtml("viewerContent");
-
-        info(
-          mode.toUpperCase() +
-            " · pages=" + s.pages +
-            " comps=" + s.comps +
-            " · <a href='/designer'>designer</a>" +
-            " · css=ok",
-          s.comps === 0
-        );
-
-        setTimeout(function () {
-          try {
-            if (viewer.jsObject && viewer.jsObject.postAction) {
-              viewer.jsObject.postAction("Submit");
-              viewer.jsObject.postAction("GetPages");
-            }
-          } catch (e) {}
-        }, 400);
-      } catch (e) {
-        console.error(e);
-        info("Error: " + (e && e.message ? e.message : e), true);
-      }
-    })();
+  <script type="text/javascript">
+    viewer.renderHtml();
   </script>
 </body>
 </html>
