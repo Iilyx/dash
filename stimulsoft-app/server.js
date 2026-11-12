@@ -86,7 +86,7 @@ app.get('/viewer', (req, res) => {
 });
 
 app.get('/designer', (req, res) => {
-  res.send(`${head(['stimulsoft.reports.pack.js', 'stimulsoft.dashboards.pack.js', 'stimulsoft.designer.pack.js'])}
+  res.send(`${head(['stimulsoft.reports.pack.js', 'stimulsoft.dashboards.pack.js', 'stimulsoft.viewer.pack.js', 'stimulsoft.designer.pack.js'])}
 <link href="/stimulsoft/css/stimulsoft.designer.office2013.whiteblue.css" rel="stylesheet">
 <link href="/stimulsoft/css/stimulsoft.viewer.office2013.whiteblue.css" rel="stylesheet">
 <div id="designer"></div>
