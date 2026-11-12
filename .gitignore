@@ -19,3 +19,4 @@ init/
 *.error.txt
 *.ipynb
 
+.DS_Store
