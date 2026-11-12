@@ -23,6 +23,7 @@ from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
 from flask import Flask, Response, request
+from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
@@ -125,6 +126,28 @@ def save_report(args: StiReportEventArgs):
     return None
 
 
+def sti_process(component) -> bool:
+    """2024.2.2: ImportError django в __processFrameworkRequest ломает Flask-детект.
+
+    Не передаём flask.request — кормим query/body вручную и форсим framework=Flask.
+    """
+    handled = component.processRequest(
+        query=request.args.to_dict(),
+        body=request.get_data(False),
+    )
+    component.handler.framework = StiFrameworkType.FLASK
+    component.handler.origin = request.origin or "*"
+    component.handler.error = None
+    return handled
+
+
+def sti_response(component):
+    component.handler.framework = StiFrameworkType.FLASK
+    if not component.handler.origin:
+        component.handler.origin = request.origin or "*"
+    return component.getFrameworkResponse()
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -148,13 +171,13 @@ def designer():
     designer.onSaveReport += save_report
     designer.onSaveAsReport += save_report
 
-    if designer.processRequest(request):
-        return designer.getFrameworkResponse()
+    if sti_process(designer):
+        return sti_response(designer)
 
     report = StiReport()
     report.loadFile("/mrt")
     designer.report = report
-    return designer.getFrameworkResponse()
+    return sti_response(designer)
 
 
 @app.route("/viewer", methods=["GET", "POST"])
@@ -164,13 +187,13 @@ def viewer():
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
 
-    if viewer.processRequest(request):
-        return viewer.getFrameworkResponse()
+    if sti_process(viewer):
+        return sti_response(viewer)
 
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return viewer.getFrameworkResponse()
+    return sti_response(viewer)
 
 
 def main() -> None:
