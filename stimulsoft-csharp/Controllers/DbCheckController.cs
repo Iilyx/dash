@@ -14,26 +14,26 @@ public sealed class DbCheckController : Controller
     [HttpGet]
     public async Task<IActionResult> Get(CancellationToken ct)
     {
-        var url = _options.BuildNpgsqlUrl();
         var info = new Dictionary<string, object?>
         {
             ["ok"] = false,
-            ["npgsql"] = MaskUrl(url),
             ["stimulsoft"] = _options.MaskedConnectionString(),
         };
 
         try
         {
-            await using var conn = new NpgsqlConnection(url);
+            // только Host=...; формат — URI даёт "initialization string ... index 0"
+            var cs = _options.BuildConnectionString();
+            await using var conn = new NpgsqlConnection(cs);
             await conn.OpenAsync(ct);
-            await using var cmd = new NpgsqlCommand("select current_database() as db, current_user as u, inet_server_addr()::text as addr", conn);
+            await using var cmd = new NpgsqlCommand(
+                "select current_database() as db, current_user as u", conn);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             if (await r.ReadAsync(ct))
             {
                 info["ok"] = true;
                 info["database"] = r.GetString(0);
                 info["user"] = r.GetString(1);
-                info["server"] = r.IsDBNull(2) ? null : r.GetString(2);
             }
         }
         catch (Exception ex)
@@ -42,19 +42,5 @@ public sealed class DbCheckController : Controller
         }
 
         return Json(info);
-    }
-
-    private static string MaskUrl(string url)
-    {
-        try
-        {
-            var u = new Uri(url.Replace("postgresql://", "postgres://", StringComparison.OrdinalIgnoreCase));
-            var user = u.UserInfo.Split(':')[0];
-            return $"postgres://{user}:***@{u.Host}:{u.Port}{u.AbsolutePath}";
-        }
-        catch
-        {
-            return "(unparseable)";
-        }
     }
 }
