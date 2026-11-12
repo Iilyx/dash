@@ -1,0 +1,12 @@
+@{
+    ViewData["Title"] = "Designer";
+}
+
+@Html.StiNetCoreDesigner(new StiNetCoreDesignerOptions()
+{
+    Actions =
+    {
+        GetReport = "GetReport",
+        DesignerEvent = "DesignerEvent"
+    }
+})

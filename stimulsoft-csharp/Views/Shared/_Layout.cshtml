@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@ViewData["Title"] — Stimulsoft .NET</title>
+    <style>
+        html, body { margin: 0; height: 100%; font-family: Segoe UI, sans-serif; }
+        header {
+            display: flex; gap: 1rem; align-items: center;
+            padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; background: #f7f7f7;
+        }
+        header a { color: #1a5fb4; text-decoration: none; }
+        header a:hover { text-decoration: underline; }
+        main { height: calc(100% - 42px); }
+    </style>
+</head>
+<body>
+    <header>
+        <strong>Stimulsoft 2024.3.3 (.NET / CSharp)</strong>
+        <a asp-controller="Viewer" asp-action="Index">Viewer</a>
+        <a asp-controller="Designer" asp-action="Index">Designer</a>
+    </header>
+    <main>
+        @RenderBody()
+    </main>
+</body>
+</html>

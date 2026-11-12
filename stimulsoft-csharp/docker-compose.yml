@@ -1,0 +1,52 @@
+# На другом ПК: Docker Desktop / Docker Engine + этот репозиторий (или только папка stimulsoft-csharp).
+#
+# 1) cp .env.example .env  →  MRT + Postgres + license
+# 2) положи .mrt рядом как reports/Report.mrt  (или поправь volume)
+# 3) docker compose up --build -d
+# 4) http://127.0.0.1:8050/
+
+services:
+  viewer:
+    build: .
+    container_name: stimulsoft_net_viewer
+    ports:
+      - "${VIEWER_PORT:-8050}:8050"
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_URLS: http://0.0.0.0:8050
+      # внутри контейнера файл смонтирован сюда
+      MRT_PATH: /data/Report.mrt
+      # если Postgres в docker compose родителя на этом же хосте:
+      # PG_CONNECTION_STRING=postgres://admin:admin123@host.docker.internal:54322/app
+      # если поднимаешь postgres из этого файла (profile db) — используй сервис postgres:
+      # PG_CONNECTION_STRING=postgres://admin:admin123@postgres:5432/app
+    volumes:
+      # свой .mrt: слева путь на хосте → /data/Report.mrt в контейнере
+      - ${MRT_HOST_PATH:-./reports/Report.mrt}:/data/Report.mrt:ro
+    extra_hosts:
+      # чтобы с Linux/Mac/Windows достучаться до Postgres на хосте
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # опционально: своя БД (docker compose --profile db up -d)
+  postgres:
+    profiles: ["db"]
+    image: postgres:16
+    container_name: stimulsoft_net_pg
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    ports:
+      - "${POSTGRES_PORT:-54322}:5432"
+    volumes:
+      - stimulsoft_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  stimulsoft_pgdata:

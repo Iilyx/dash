@@ -20,3 +20,6 @@ init/
 *.ipynb
 
 .DS_Store
+stimulsoft-csharp/bin/
+stimulsoft-csharp/obj/
+stimulsoft-csharp/.vs/
