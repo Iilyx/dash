@@ -155,6 +155,67 @@ app.get('/designer', (req, res) => {
 </script></body></html>`);
 });
 
+// Проверка всех выражений из mrt парсером установленной версии: http://127.0.0.1:8040/expr-check
+app.get('/expr-check', (req, res) => {
+  res.send(`${head(['stimulsoft.reports.pack.js', 'stimulsoft.dashboards.pack.js'])}
+<pre id="out" style="padding:12px;font:13px monospace;white-space:pre-wrap">Проверяю...</pre>
+<script>
+(async function () {
+  var out = document.getElementById('out');
+  try {
+    var text = await (await fetch('/mrt' + location.search)).text();
+    var json = JSON.parse(text);
+    var report = new Stimulsoft.Report.StiReport();
+    report.load(text);
+    var comp = report.pages.getByIndex(0);
+    var Parser = Stimulsoft.Report.Engine.StiParser.StiParser;
+
+    // собираем выражения: ключи Expression и блоки {...} в строках
+    var items = [];
+    (function walk(n, path) {
+      if (Array.isArray(n)) return n.forEach(function (v, i) { walk(v, path + '[' + i + ']'); });
+      if (n && typeof n === 'object') {
+        Object.keys(n).forEach(function (k) {
+          var v = n[k], p = path + '/' + k;
+          if (typeof v === 'string') {
+            if (k === 'Expression' && v.trim()) items.push({ path: p, expr: v });
+            else if (k !== 'Image' && v.length < 5000) {
+              var re = /\\{([^{}]+)\\}/g, m;
+              while ((m = re.exec(v))) items.push({ path: p, expr: m[1] });
+            }
+          } else walk(v, p);
+        });
+      }
+    })(json, '');
+
+    var bad = [], seen = {};
+    items.forEach(function (it) {
+      var key = it.expr;
+      if (seen[key] !== undefined) { if (seen[key]) bad.push(Object.assign({ err: seen[key] }, it)); return; }
+      var err = null;
+      try { Parser.parseTextValue('{' + it.expr + '}', comp); }
+      catch (e) { err = String(e && e.message || e); }
+      seen[key] = err;
+      if (err) bad.push(Object.assign({ err: err }, it));
+    });
+
+    var isName = function (b) { return /does not exist in the current context/i.test(b.err); };
+    var syntax = bad.filter(function (b) { return !isName(b); });
+    var names = bad.filter(isName);
+    out.textContent = 'Проверено выражений: ' + items.length + ' (уникальных ' + Object.keys(seen).length + ')\\n' +
+      'Синтаксических/прочих ошибок парсера: ' + syntax.length + '\\n' +
+      'Ошибок вида "имя не найдено" (могут быть просто колонки данных, не загруженные в проверке): ' + names.length + '\\n\\n' +
+      (syntax.length ? '=== ОШИБКИ ПАРСЕРА ===\\n' + syntax.map(function (b) {
+        return b.err + '\\n  ' + b.path + '\\n  {' + b.expr + '}\\n';
+      }).join('\\n') : 'Ошибок парсера не найдено.') +
+      (names.length ? '\\n=== ИМЯ НЕ НАЙДЕНО (первые 15) ===\\n' + names.slice(0, 15).map(function (b) {
+        return b.err + '  <- {' + b.expr + '}';
+      }).join('\\n') : '');
+  } catch (e) { out.textContent = 'Сбой проверки: ' + (e && e.stack || e); }
+})();
+</script></body></html>`);
+});
+
 app.get('/', (req, res) => res.redirect('/viewer'));
 
 app.listen(PORT, () => {
