@@ -129,25 +129,11 @@ app = Flask(__name__)
 _params_lock = threading.Lock()
 _PARAMS: dict[str, Any] = {}
 _LAST_INTERACTION: dict[str, Any] | None = None
+_INTERACTIONS: list[dict[str, Any]] = []
+_INTERACTIONS_MAX = 50
 
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
-
-# Клиентский onInteraction → POST /api/params (в 2024.2.2 нет appendHead).
-_INTERACTION_JS = (
-    "try{"
-    "var params={};"
-    "var src=args.variables;"
-    "if(src){"
-    "if(Array.isArray(src)){src.forEach(function(v){if(v&&v.name!=null)params[v.name]=v.value;});}"
-    "else{Object.keys(src).forEach(function(k){"
-    "var v=src[k];params[k]=(v&&typeof v==='object'&&'value' in v)?v.value:v;"
-    "});}"
-    "}"
-    "fetch('/api/params',{method:'POST',headers:{'Content-Type':'application/json'},"
-    "body:JSON.stringify({params:params,interaction:{action:args.action||null,"
-    "variables:args.variables||null,data:args.data||null}})});"
-    "}catch(e){}"
-)
+_DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
 
 
 def _public_query_params() -> dict[str, str]:
@@ -302,12 +288,37 @@ def sti_process(component) -> bool:
     return handled
 
 
-def sti_response(component):
+def sti_response(component, inject_debug: bool = False):
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.passQueryParametersToReport = True
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
-    return component.getFrameworkResponse()
+    resp = component.getFrameworkResponse()
+    if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
+        html = resp.get_data(as_text=True)
+        tag = '<script src="/dash-debug.js"></script>\n'
+        if "dash-debug.js" not in html:
+            if "</head>" in html:
+                html = html.replace("</head>", tag + "</head>", 1)
+            else:
+                html = tag + html
+            resp.set_data(html)
+    return resp
+
+
+def remember_interaction(dump: Any) -> None:
+    global _LAST_INTERACTION
+    if not isinstance(dump, dict):
+        dump = {"raw": dump}
+    with _params_lock:
+        _LAST_INTERACTION = dump
+        _INTERACTIONS.append(dump)
+        overflow = len(_INTERACTIONS) - _INTERACTIONS_MAX
+        if overflow > 0:
+            del _INTERACTIONS[:overflow]
+    action = dump.get("action")
+    keys = dump.get("__keys")
+    print(f"[interaction] action={action!r} keys={keys}", flush=True)
 
 
 def wire_viewer(viewer: StiViewer) -> None:
@@ -316,7 +327,8 @@ def wire_viewer(viewer: StiViewer) -> None:
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
-    viewer.onInteraction += _INTERACTION_JS
+    # alnum → вызов window.dashCaptureInteraction(args) из dash_debug.js
+    viewer.onInteraction += "dashCaptureInteraction"
 
 
 def wire_designer(designer: StiDesigner) -> None:
@@ -334,6 +346,13 @@ def favicon():
     return Response(status=204)
 
 
+@app.get("/dash-debug.js")
+def dash_debug_js():
+    resp = Response(_DEBUG_JS, mimetype="application/javascript; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/api/params")
 def get_params():
     with _params_lock:
@@ -341,19 +360,24 @@ def get_params():
             {
                 "params": dict(_PARAMS),
                 "interaction": _LAST_INTERACTION,
+                "interactions_count": len(_INTERACTIONS),
             }
         )
 
 
+@app.get("/api/interactions")
+def get_interactions():
+    with _params_lock:
+        return jsonify({"interactions": list(_INTERACTIONS)})
+
+
 @app.post("/api/params")
 def post_params():
-    global _LAST_INTERACTION
     incoming = _body_params()
     incoming.update(_public_query_params())
     body = request.get_json(silent=True) if request.is_json else None
     if isinstance(body, dict) and body.get("interaction") is not None:
-        with _params_lock:
-            _LAST_INTERACTION = body.get("interaction")
+        remember_interaction(body.get("interaction"))
     updated = params_update(incoming)
     return jsonify({"ok": True, "params": updated})
 
@@ -364,6 +388,7 @@ def clear_params():
     with _params_lock:
         _PARAMS.clear()
         _LAST_INTERACTION = None
+        _INTERACTIONS.clear()
     return jsonify({"ok": True, "params": {}})
 
 
@@ -401,6 +426,7 @@ def viewer():
     wire_viewer(viewer)
 
     if sti_process(viewer):
+        # handler/ajax — без debug overlay
         return sti_response(viewer)
 
     q = _public_query_params()
@@ -410,7 +436,7 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer)
+    return sti_response(viewer, inject_debug=True)
 
 
 def main() -> None:
@@ -419,6 +445,7 @@ def main() -> None:
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
+    print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
