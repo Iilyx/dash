@@ -28,7 +28,11 @@ public sealed class ViewerController : Controller
         catch (Exception ex)
         {
             _log.LogError(ex, "GetReport failed");
-            throw;
+            // чтобы в UI было видно причину, а не пустой экран
+            return Content(
+                "GetReport failed: " + ex.Message +
+                "\n\nПроверь MRT_HOST_PATH / reports/Report.mrt и /dbcheck\n\n" + ex,
+                "text/plain; charset=utf-8");
         }
     }
 

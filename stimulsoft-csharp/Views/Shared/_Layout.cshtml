@@ -5,24 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>@ViewData["Title"] — Stimulsoft .NET</title>
     <style>
-        html, body { margin: 0; height: 100%; font-family: Segoe UI, sans-serif; }
-        header {
-            display: flex; gap: 1rem; align-items: center;
-            padding: 0.5rem 1rem; border-bottom: 1px solid #ddd; background: #f7f7f7;
+        html, body { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; }
+        #nav {
+            position: fixed; z-index: 10000; top: 0; right: 0;
+            padding: 6px 10px; background: rgba(255,255,255,.9);
+            font: 13px Segoe UI, sans-serif; border-bottom-left-radius: 6px;
         }
-        header a { color: #1a5fb4; text-decoration: none; }
-        header a:hover { text-decoration: underline; }
-        main { height: calc(100% - 42px); }
+        #nav a { margin-left: 10px; color: #1a5fb4; text-decoration: none; }
+        #host { position: absolute; inset: 0; }
     </style>
 </head>
 <body>
-    <header>
-        <strong>Stimulsoft 2024.3.3 (.NET / CSharp)</strong>
+    <div id="nav">
+        .NET 2024.3.3
         <a asp-controller="Viewer" asp-action="Index">Viewer</a>
         <a asp-controller="Designer" asp-action="Index">Designer</a>
-    </header>
-    <main>
+        <a href="/dbcheck">dbcheck</a>
+    </div>
+    <div id="host">
         @RenderBody()
-    </main>
+    </div>
 </body>
 </html>

@@ -26,12 +26,29 @@ public sealed class ReportLoader
         if (!File.Exists(path))
             throw new FileNotFoundException($"MRT not found: {path}");
 
-        _log.LogInformation("Loading dashboard: {Path}", path);
+        var len = new FileInfo(path).Length;
+        if (len < 64)
+            throw new InvalidOperationException(
+                $"MRT пустой или слишком маленький ({len} bytes): {path}. " +
+                "Положи файл в reports/Report.mrt или поправь MRT_HOST_PATH.");
+
+        _log.LogInformation("Loading dashboard: {Path} ({Len} bytes)", path, len);
         _log.LogInformation("DB connection: {Cs}", _options.MaskedConnectionString());
 
         var report = StiReport.CreateNewDashboard();
         report.Load(path);
+
+        // иначе холст белый, пока не нажмут Submit на панели параметров
+        report.RequestParameters = false;
+
         ApplyPostgresConnection(report);
+
+        _log.LogInformation(
+            "Loaded: pages={Pages} databases={Db} requestParameters={RP}",
+            report.Pages?.Count ?? 0,
+            report.Dictionary?.Databases?.Count ?? 0,
+            report.RequestParameters);
+
         return report;
     }
 
@@ -50,7 +67,6 @@ public sealed class ReportLoader
                 continue;
             }
 
-            // на всякий случай — любая БД со свойством ConnectionString
             var prop = db.GetType().GetProperty("ConnectionString");
             if (prop?.CanWrite == true && prop.PropertyType == typeof(string))
             {

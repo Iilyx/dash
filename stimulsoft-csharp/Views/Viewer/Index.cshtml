@@ -1,9 +1,12 @@
+@using System.Web.UI.WebControls
 @{
     ViewData["Title"] = "Viewer";
 }
 
 @Html.StiNetCoreViewer(new StiNetCoreViewerOptions()
 {
+    Width = Unit.Percentage(100),
+    Height = Unit.Percentage(100),
     Actions =
     {
         GetReport = "GetReport",
@@ -11,6 +14,7 @@
     },
     Appearance =
     {
+        FullScreenMode = true,
         ScrollbarsMode = true
     }
 })
