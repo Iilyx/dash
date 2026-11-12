@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stimulsoft Dashboards.PYTHON — по официальным sample Flask.
+"""Stimulsoft Dashboards.PYTHON 2024.2.2 — по официальным sample Flask.
 
 Docs / samples:
   Editing a Dashboard Template in the Designer
@@ -23,7 +23,7 @@ from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
 from flask import Flask, Response, request
-from stimulsoft_reports import StiLicense, StiResult
+from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
@@ -49,19 +49,25 @@ def path_of(raw: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-load_env()
+def apply_license(component) -> None:
+    """В 2024.2.x лицензия вешается на instance: component.license.setKey/setFile."""
+    key = (
+        os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
+        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
+        or os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
+    )
+    file_raw = (
+        os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip()
+        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip()
+        or os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
+    )
+    if key:
+        component.license.setKey(key)
+    elif file_raw:
+        component.license.setFile(str(path_of(file_raw).resolve()))
 
-# How to Activate the Product
-_dash = os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
-_reports = os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
-if _dash:
-    StiLicense.setKey(_dash)
-elif _reports:
-    StiLicense.setKey(_reports)
-elif os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip():
-    StiLicense.setFile(str(path_of(os.environ["STIMULSOFT_DASHBOARDS_LICENSE_FILE"]).resolve()))
-elif os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip():
-    StiLicense.setFile(str(path_of(os.environ["STIMULSOFT_REPORTS_LICENSE_FILE"]).resolve()))
+
+load_env()
 
 _mrt = os.environ.get("MRT_PATH", "").strip()
 if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
@@ -103,7 +109,6 @@ app = Flask(__name__)
 
 
 def begin_process_data(args: StiDataEventArgs) -> None:
-    # Docs: change connectionString / parameters on the server side
     args.connectionString = PG_CONN
 
 
@@ -136,8 +141,8 @@ def serve_mrt():
 @app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
-    # Official: Editing a Dashboard Template in the Designer
     designer = StiDesigner()
+    apply_license(designer)
     designer.options.appearance.fullScreenMode = True
     designer.onBeginProcessData += begin_process_data
     designer.onSaveReport += save_report
@@ -154,8 +159,8 @@ def designer():
 
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
-    # Official: Showing a Dashboard in the Viewer
     viewer = StiViewer()
+    apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
 
@@ -169,7 +174,7 @@ def viewer():
 
 
 def main() -> None:
-    print("Stimulsoft Dashboards.PYTHON (latest) — official Flask wiring", flush=True)
+    print("Stimulsoft Dashboards.PYTHON 2024.2.2 — official Flask wiring", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
