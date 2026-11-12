@@ -45,8 +45,8 @@ public sealed class ReportLoader
 
         _log.LogInformation(
             "Loaded: pages={Pages} databases={Db} requestParameters={RP}",
-            report.Pages?.Count ?? 0,
-            report.Dictionary?.Databases?.Count ?? 0,
+            report.Pages.Count,
+            report.Dictionary.Databases.Count,
             report.RequestParameters);
 
         return report;
