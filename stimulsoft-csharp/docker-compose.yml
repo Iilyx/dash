@@ -1,8 +1,5 @@
-# Viewer only. Postgres не поднимаем — берём уже существующую БД.
-#
-# Переменные: ../.env (корень репо) и/или stimulsoft-csharp/.env
-# docker compose up --build -d
-# http://127.0.0.1:8050/
+# Viewer only — Postgres уже должен быть запущен снаружи.
+# cp .env.example .env  →  заполни →  docker compose up --build -d
 
 services:
   viewer:
@@ -10,20 +7,14 @@ services:
     container_name: stimulsoft_net_viewer
     ports:
       - "${VIEWER_PORT:-8050}:8050"
-    # в контейнер как есть (не перезаписываем пустыми ${VAR:-})
+    # только локальный .env (не ../.env — там лишнее и на Windows ломается)
     env_file:
-      - path: ../.env
-        required: false
-      - path: .env
-        required: false
+      - .env
     environment:
-      # только то, что для контейнера фиксировано
-      ASPNETCORE_URLS: http://0.0.0.0:8050
-      MRT_PATH: /data/Report.mrt
-      # если в .env POSTGRES_HOST=127.0.0.1 — из контейнера не достучишься;
-      # для Docker задай POSTGRES_HOST=host.docker.internal или полный PG_CONNECTION_STRING
+      ASPNETCORE_URLS: "http://0.0.0.0:8050"
+      MRT_PATH: "/data/Report.mrt"
     volumes:
-      # путь к .mrt на хосте: MRT_HOST_PATH в .env (рядом с этим compose)
+      # Windows: пиши путь со слэшами /  →  C:/data/Report.mrt
       - ${MRT_HOST_PATH:-./reports/Report.mrt}:/data/Report.mrt:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

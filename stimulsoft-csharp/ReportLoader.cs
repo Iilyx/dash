@@ -27,6 +27,7 @@ public sealed class ReportLoader
             throw new FileNotFoundException($"MRT not found: {path}");
 
         _log.LogInformation("Loading dashboard: {Path}", path);
+        _log.LogInformation("DB connection: {Cs}", _options.MaskedConnectionString());
 
         var report = StiReport.CreateNewDashboard();
         report.Load(path);
@@ -41,16 +42,29 @@ public sealed class ReportLoader
 
         foreach (StiDatabase db in report.Dictionary.Databases)
         {
-            if (db is not StiSqlDatabase sql)
+            if (db is StiSqlDatabase sql)
+            {
+                sql.ConnectionString = cs;
+                n++;
+                _log.LogInformation("Connection applied to SQL database '{Name}' ({Type})", sql.Name, sql.GetType().Name);
                 continue;
+            }
 
-            sql.ConnectionString = cs;
-            n++;
-            _log.LogInformation("Postgres connection applied to database '{Name}'", sql.Name);
+            // на всякий случай — любая БД со свойством ConnectionString
+            var prop = db.GetType().GetProperty("ConnectionString");
+            if (prop?.CanWrite == true && prop.PropertyType == typeof(string))
+            {
+                prop.SetValue(db, cs);
+                n++;
+                _log.LogInformation("Connection applied via reflection to '{Name}'", db.Name);
+            }
         }
 
         if (n == 0)
-            _log.LogWarning("No SQL databases in MRT dictionary — connection string not applied");
+        {
+            _log.LogWarning("No SQL databases in MRT — adding StiPostgreSQLDatabase");
+            report.Dictionary.Databases.Add(new StiPostgreSQLDatabase("PostgreSQL", cs));
+        }
     }
 
     private string ResolveMrtPath()

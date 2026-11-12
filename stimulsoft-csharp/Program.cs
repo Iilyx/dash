@@ -21,6 +21,11 @@ License.Apply(builder.Configuration);
 
 var app = builder.Build();
 
+var dashOpts = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptions<DashboardOptions>>().Value;
+app.Logger.LogInformation("MRT_PATH env={Mrt} DB={Db}",
+    Environment.GetEnvironmentVariable("MRT_PATH"),
+    dashOpts.MaskedConnectionString());
+
 if (!app.Environment.IsDevelopment())
     app.UseExceptionHandler("/Viewer/Error");
 
