@@ -6,6 +6,14 @@ Docs / samples:
   Showing a Dashboard in the Viewer
   How to Activate the Product
   Using Parameters in SQL Query (onBeginProcessData)
+  Setting Dashboard Variables on the Server-Side
+  passQueryParametersToReport / onPrepareVariables / onInteraction
+
+Параметры:
+  POST /api/params  {"Region":"West","Visits":5}
+  GET  /api/params
+  GET  /viewer?Region=West   (query → переменные mrt)
+  клики/фильтры на дашборде → POST /api/params (onInteraction)
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -17,17 +25,26 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import webbrowser
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
-from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
+from stimulsoft_reports.events import (
+    StiDataEventArgs,
+    StiReportEventArgs,
+    StiVariablesEventArgs,
+)
 from stimulsoft_reports.report import StiReport
+from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
+from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
 
 ROOT = Path(__file__).resolve().parent
@@ -108,9 +125,152 @@ if not PG_CONN:
 
 app = Flask(__name__)
 
+# Последние параметры: POST /api/params, query /viewer?X=, клики onInteraction.
+_params_lock = threading.Lock()
+_PARAMS: dict[str, Any] = {}
+_LAST_INTERACTION: dict[str, Any] | None = None
+
+_STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
+
+# Клиентский onInteraction → POST /api/params (в 2024.2.2 нет appendHead).
+_INTERACTION_JS = (
+    "try{"
+    "var params={};"
+    "var src=args.variables;"
+    "if(src){"
+    "if(Array.isArray(src)){src.forEach(function(v){if(v&&v.name!=null)params[v.name]=v.value;});}"
+    "else{Object.keys(src).forEach(function(k){"
+    "var v=src[k];params[k]=(v&&typeof v==='object'&&'value' in v)?v.value:v;"
+    "});}"
+    "}"
+    "fetch('/api/params',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({params:params,interaction:{action:args.action||null,"
+    "variables:args.variables||null,data:args.data||null}})});"
+    "}catch(e){}"
+)
+
+
+def _public_query_params() -> dict[str, str]:
+    return {
+        k: v
+        for k, v in request.args.items()
+        if k not in _STI_QUERY_SKIP and not k.startswith("sti_")
+    }
+
+
+def _body_params() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if request.form:
+        out.update({k: v for k, v in request.form.items()})
+    if request.is_json:
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            nested = body.get("params")
+            if isinstance(nested, dict):
+                out.update(nested)
+            else:
+                out.update(
+                    {
+                        k: v
+                        for k, v in body.items()
+                        if k not in {"params", "interaction"}
+                    }
+                )
+    return out
+
+
+def params_snapshot() -> dict[str, Any]:
+    with _params_lock:
+        return dict(_PARAMS)
+
+
+def params_update(values: dict[str, Any]) -> dict[str, Any]:
+    with _params_lock:
+        for key, value in values.items():
+            if value is None:
+                _PARAMS.pop(key, None)
+            else:
+                _PARAMS[key] = value
+        return dict(_PARAMS)
+
+
+def coerce_value(type_name: str, value: Any) -> Any:
+    if value is None or type_name is None:
+        return value
+    if isinstance(value, (dict, list)):
+        return value
+    text = value if isinstance(value, str) else str(value)
+    try:
+        if type_name in {
+            StiVariableType.INT,
+            StiVariableType.INT16,
+            StiVariableType.INT32,
+            StiVariableType.INT64,
+            StiVariableType.SHORT,
+            StiVariableType.LONG,
+            StiVariableType.BYTE,
+            StiVariableType.SBYTE,
+            StiVariableType.UINT,
+            StiVariableType.UINT16,
+            StiVariableType.UINT32,
+            StiVariableType.UINT64,
+            StiVariableType.USHORT,
+            StiVariableType.ULONG,
+        }:
+            return int(float(text)) if text != "" else value
+        if type_name in {
+            StiVariableType.DOUBLE,
+            StiVariableType.DECIMAL,
+            StiVariableType.SINGLE,
+            "Float",
+        }:
+            return float(text) if text != "" else value
+        if type_name == StiVariableType.BOOLEAN:
+            if isinstance(value, bool):
+                return value
+            return text.strip().lower() in {"1", "true", "yes", "y", "on"}
+        if type_name == StiVariableType.DATETIME:
+            if isinstance(value, datetime):
+                return value
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(text, fmt)
+                except ValueError:
+                    continue
+    except (TypeError, ValueError):
+        return value
+    return value
+
+
+def apply_params_to_variables(args: StiVariablesEventArgs) -> None:
+    incoming = params_snapshot()
+    incoming.update(_public_query_params())
+    if not incoming:
+        return
+    variables = args.variables
+    if variables is None:
+        args.variables = {}
+        variables = args.variables
+    for name, raw in incoming.items():
+        if name in variables:
+            var = variables[name]
+            var.value = coerce_value(var.typeName, raw)
+        else:
+            variables[name] = StiVariable(name, StiVariableType.STRING, str(raw))
+
 
 def begin_process_data(args: StiDataEventArgs) -> None:
     args.connectionString = PG_CONN
+    incoming = params_snapshot()
+    if not incoming or not args.parameters:
+        return
+    for name, param in args.parameters.items():
+        if name in incoming:
+            param.value = incoming[name]
+
+
+def prepare_variables(args: StiVariablesEventArgs) -> None:
+    apply_params_to_variables(args)
 
 
 def save_report(args: StiReportEventArgs):
@@ -138,19 +298,73 @@ def sti_process(component) -> bool:
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.origin = request.origin or "*"
     component.handler.error = None
+    component.handler.passQueryParametersToReport = True
     return handled
 
 
 def sti_response(component):
     component.handler.framework = StiFrameworkType.FLASK
+    component.handler.passQueryParametersToReport = True
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
     return component.getFrameworkResponse()
 
 
+def wire_viewer(viewer: StiViewer) -> None:
+    apply_license(viewer)
+    viewer.options.appearance.fullScreenMode = True
+    viewer.handler.passQueryParametersToReport = True
+    viewer.onBeginProcessData += begin_process_data
+    viewer.onPrepareVariables += prepare_variables
+    viewer.onInteraction += _INTERACTION_JS
+
+
+def wire_designer(designer: StiDesigner) -> None:
+    apply_license(designer)
+    designer.options.appearance.fullScreenMode = True
+    designer.handler.passQueryParametersToReport = True
+    designer.onBeginProcessData += begin_process_data
+    designer.onPrepareVariables += prepare_variables
+    designer.onSaveReport += save_report
+    designer.onSaveAsReport += save_report
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
+
+
+@app.get("/api/params")
+def get_params():
+    with _params_lock:
+        return jsonify(
+            {
+                "params": dict(_PARAMS),
+                "interaction": _LAST_INTERACTION,
+            }
+        )
+
+
+@app.post("/api/params")
+def post_params():
+    global _LAST_INTERACTION
+    incoming = _body_params()
+    incoming.update(_public_query_params())
+    body = request.get_json(silent=True) if request.is_json else None
+    if isinstance(body, dict) and body.get("interaction") is not None:
+        with _params_lock:
+            _LAST_INTERACTION = body.get("interaction")
+    updated = params_update(incoming)
+    return jsonify({"ok": True, "params": updated})
+
+
+@app.delete("/api/params")
+def clear_params():
+    global _LAST_INTERACTION
+    with _params_lock:
+        _PARAMS.clear()
+        _LAST_INTERACTION = None
+    return jsonify({"ok": True, "params": {}})
 
 
 @app.route("/mrt", methods=["GET", "POST"])
@@ -165,14 +379,15 @@ def serve_mrt():
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
     designer = StiDesigner()
-    apply_license(designer)
-    designer.options.appearance.fullScreenMode = True
-    designer.onBeginProcessData += begin_process_data
-    designer.onSaveReport += save_report
-    designer.onSaveAsReport += save_report
+    wire_designer(designer)
 
     if sti_process(designer):
         return sti_response(designer)
+
+    # query на первом открытии тоже кладём в store
+    q = _public_query_params()
+    if q:
+        params_update(q)
 
     report = StiReport()
     report.loadFile("/mrt")
@@ -183,12 +398,14 @@ def designer():
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     viewer = StiViewer()
-    apply_license(viewer)
-    viewer.options.appearance.fullScreenMode = True
-    viewer.onBeginProcessData += begin_process_data
+    wire_viewer(viewer)
 
     if sti_process(viewer):
         return sti_response(viewer)
+
+    q = _public_query_params()
+    if q:
+        params_update(q)
 
     report = StiReport()
     report.loadFile("/mrt")
@@ -201,6 +418,7 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
