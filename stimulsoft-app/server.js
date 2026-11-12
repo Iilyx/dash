@@ -10,6 +10,13 @@ const LICENSE = process.env.STIMULSOFT_LICENSE_KEY || '';
 const PG = process.env.PG_CONNECTION_STRING || '';
 const PG_SSL = String(process.env.PG_SSL).toLowerCase() === 'true';
 
+// Адаптер понимает только схему postgres:// (postgresql:// разбирает неверно) — нормализуем
+function pgUrl() {
+  let url = PG.replace(/^postgresql:\/\//i, 'postgres://');
+  if (PG_SSL && !/[?&]ssl=/.test(url)) url += (url.includes('?') ? '&' : '?') + 'ssl=true';
+  return url;
+}
+
 const app = express();
 
 // Скрипты и стили Stimulsoft отдаём из node_modules (версии берутся из package.json)
@@ -29,14 +36,40 @@ app.post('/handler', express.text({ type: '*/*', limit: '20mb' }), (req, res) =>
 
   // Берём подключение из .env, а не из mrt
   if (command.database === 'PostgreSQL' && PG) {
-    command.connectionString = PG;
-    if (PG_SSL) command.connectionString += (PG.includes('?') ? '&' : '?') + 'ssl=true';
+    command.connectionString = pgUrl();
   }
 
+  const t0 = Date.now();
   adapter.process(command, (result) => {
-    if (result && result.success === false) console.error('[adapter]', result.notice);
+    const ms = Date.now() - t0;
+    if (command.command !== 'GetSupportedAdapters') {
+      const sql = String(command.queryString || '').replace(/\s+/g, ' ').slice(0, 160);
+      const params = (command.parameters || []).map((p) => p.name + '=' + p.value).join(', ');
+      if (result && result.success === false) {
+        console.error(`[adapter] ERROR (${ms}ms) ${command.database} ${command.command}: ${result.notice}\n          SQL: ${sql}\n          params: ${params}`);
+      } else if (process.env.DEBUG_ADAPTER !== 'false') {
+        const rows = result && result.rows ? result.rows.length : '-';
+        console.log(`[adapter] ok (${ms}ms) ${command.command} rows=${rows} SQL: ${sql} ${params ? '| ' + params : ''}`);
+      }
+    }
     res.send(adapter.getResponse(result));
   });
+});
+
+// Проверка подключения к Postgres из .env: http://127.0.0.1:8040/dbcheck
+app.get('/dbcheck', async (req, res) => {
+  if (!PG) return res.status(500).send('PG_CONNECTION_STRING не задан в .env');
+  const { Client } = require('pg');
+  const client = new Client({ connectionString: pgUrl(), connectionTimeoutMillis: 5000 });
+  try {
+    await client.connect();
+    const r = await client.query('select version() as v, current_database() as db, current_user as u');
+    res.json({ ok: true, ...r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.end().catch(() => {});
+  }
 });
 
 // ---------- Отчёт ----------
