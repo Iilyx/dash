@@ -40,31 +40,24 @@ dotnet restore && dotnet run
 
 ## Docker (другой ПК)
 
-Нужен только **Docker**. SDK на машине не обязателен.
+Нужен только **Docker**. Своя БД в этом compose **не поднимается** — используется уже существующий Postgres (например корневой `docker compose up -d` в репо).
 
 ```bash
-git clone <этот-репо> && cd mcp_pg_bi/stimulsoft-csharp   # или скопируй папку
+cd stimulsoft-csharp
 cp .env.example .env
 
-# положи свой CSharp .mrt
-mkdir -p reports
-cp /path/to/dashboard.mrt reports/Report.mrt
+# .mrt
+mkdir -p reports && cp /path/to/dashboard.mrt reports/Report.mrt
+# или в .env: MRT_HOST_PATH=/полный/путь/dashboard.mrt
 
-# в .env:
-#   MRT_HOST_PATH=./reports/Report.mrt
+# в .env (или в ../.env корня) должны быть:
 #   PG_CONNECTION_STRING=postgres://USER:PASS@host.docker.internal:54322/app
+#   либо POSTGRES_HOST/PORT/DB/USER/PASSWORD
 #   STIMULSOFT_LICENSE_KEY=...
 
 docker compose up --build -d
 ```
 
-Открой http://127.0.0.1:8050/
+Compose тянет `../.env` и `.env`, в контейнер явно прокидывает `PG_*` / `POSTGRES_*` / license.
 
-Своя Postgres в том же compose:
-
-```bash
-docker compose --profile db up --build -d
-# тогда в .env: PG_CONNECTION_STRING=postgres://admin:admin123@postgres:5432/app
-```
-
-Логи: `docker compose logs -f viewer` · стоп: `docker compose down`
+http://127.0.0.1:8050/ · логи: `docker compose logs -f viewer`
