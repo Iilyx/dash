@@ -30,20 +30,20 @@ curl -s http://127.0.0.1:8090/ask \
 
 `ask_trace.txt`: … → SQL (MCP) → DASHBOARD → RESULT
 
-## Stimulsoft viewer (.NET) — CSharp `.mrt`
-
-Для шаблонов Windows Designer (`ScriptLanguage: CSharp`): папка `stimulsoft-csharp/` (NuGet **2024.3.3**).
+## Stimulsoft viewer (Python)
 
 ```bash
-cd stimulsoft-csharp && cp .env.example .env
-# Docker на другом ПК:
-#   cp dashboard.mrt reports/Report.mrt && docker compose up --build -d
-# локально с SDK: dotnet restore && dotnet run
+cp .env.example .env   # MRT_PATH, POSTGRES_*, license
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python view_dashboard.py
 ```
 
-Viewer: http://127.0.0.1:8050/ · см. `stimulsoft-csharp/README.md`
+Viewer: http://127.0.0.1:8040/viewer · Designer: `/designer`  
+(порт из `.env`: `VIEWER_PORT`)
 
-## Stimulsoft viewer (Python / JS)
+`Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 
-Python: `view_dashboard.py` (JS-движок). Node: `stimulsoft-app/` (Dashboards.JS 2024.3.3) — CSharp-скрипты в `.mrt` не исполняет.
-
+```bash
+.venv/bin/python convert_mrt.py test.mrt
+MRT_PATH=_converted.mrt .venv/bin/python view_dashboard.py
+```

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 node_modules/
+.DS_Store
 
 # generated / local
 catalog.json
@@ -18,8 +19,3 @@ data/
 init/
 *.error.txt
 *.ipynb
-
-.DS_Store
-stimulsoft-csharp/bin/
-stimulsoft-csharp/obj/
-stimulsoft-csharp/.vs/
