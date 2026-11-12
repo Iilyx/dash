@@ -170,6 +170,25 @@ app.get('/expr-check', (req, res) => {
     var comp = report.pages.getByIndex(0);
     var Parser = Stimulsoft.Report.Engine.StiParser.StiParser;
 
+    // верхнеуровневые блоки {...} с учётом строковых литералов (внутри "{0:N2}" скобки не считаются)
+    function extract(s) {
+      var res = [], i = 0;
+      while (i < s.length) {
+        if (s[i] === '{') {
+          var depth = 0, j = i, q = null;
+          for (; j < s.length; j++) {
+            var c = s[j];
+            if (q) { if (c === '\\\\') j++; else if (c === q) q = null; }
+            else if (c === '"' || c === "'") q = c;
+            else if (c === '{') depth++;
+            else if (c === '}') { depth--; if (depth === 0) break; }
+          }
+          if (j < s.length) { res.push(s.slice(i + 1, j)); i = j + 1; continue; }
+        }
+        i++;
+      }
+      return res;
+    }
     // собираем выражения: ключи Expression и блоки {...} в строках
     var items = [];
     (function walk(n, path) {
@@ -180,8 +199,7 @@ app.get('/expr-check', (req, res) => {
           if (typeof v === 'string') {
             if (k === 'Expression' && v.trim()) items.push({ path: p, expr: v });
             else if (k !== 'Image' && v.length < 5000) {
-              var re = /\\{([^{}]+)\\}/g, m;
-              while ((m = re.exec(v))) items.push({ path: p, expr: m[1] });
+              extract(v).forEach(function (x) { items.push({ path: p, expr: x }); });
             }
           } else walk(v, p);
         });
