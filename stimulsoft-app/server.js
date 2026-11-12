@@ -73,10 +73,15 @@ app.get('/dbcheck', async (req, res) => {
 });
 
 // ---------- Отчёт ----------
+// ?file=_page0.mrt — отдать другой файл из той же папки (нужно для split-mrt.js)
+const pickFile = (req) =>
+  req.query.file ? path.join(path.dirname(REPORT_FILE), path.basename(String(req.query.file))) : REPORT_FILE;
+
 app.get('/mrt', (req, res) => {
-  if (!fs.existsSync(REPORT_FILE)) return res.status(404).send('Report file not found: ' + REPORT_FILE);
+  const file = pickFile(req);
+  if (!fs.existsSync(file)) return res.status(404).send('Report file not found: ' + file);
   res.setHeader('Cache-Control', 'no-cache');
-  res.sendFile(REPORT_FILE);
+  res.sendFile(file);
 });
 // сохранение из дизайнера обратно в файл
 app.post('/mrt', express.text({ type: '*/*', limit: '50mb' }), (req, res) => {
@@ -95,6 +100,18 @@ ${scripts.map((s) => `<script src="/stimulsoft/scripts/${s}"></script>`).join('\
   function showErr(m){var d=document.getElementById('err')||document.body.appendChild(Object.assign(document.createElement('div'),{id:'err'}));d.textContent+=m+'\\n';}
   window.addEventListener('error',function(e){showErr('JS error: '+e.message);});
   window.addEventListener('unhandledrejection',function(e){showErr('Promise: '+(e.reason&&e.reason.message||e.reason));});
+  // Включаем внутренние сообщения движка (по умолчанию он молча оставляет пустой экран)
+  Stimulsoft.System.StiError.consoleErrorLog = true;
+  Stimulsoft.System.StiError.consoleWarningLog = true;
+  Stimulsoft.System.StiError.consoleMessageLog = true;
+  ['error', 'warn'].forEach(function (lvl) {
+    var orig = console[lvl];
+    console[lvl] = function () {
+      var msg = Array.prototype.slice.call(arguments).join(' ');
+      if (!/trial version|Failed to load resource/i.test(msg)) showErr('[' + lvl + '] ' + msg);
+      orig.apply(console, arguments);
+    };
+  });
   Stimulsoft.Base.StiLicense.key = ${JSON.stringify(LICENSE)};
   // В 2024.x настройки доступны как глобальный StiOptions
   (window.StiOptions || Stimulsoft.StiOptions || Stimulsoft.Base.StiOptions).WebServer.url = location.origin + '/handler';
@@ -112,7 +129,7 @@ app.get('/viewer', (req, res) => {
   options.toolbar.showSendEmailButton = false;
   var viewer = new Stimulsoft.Viewer.StiViewer(options, 'StiViewer', false);
   var report = new Stimulsoft.Report.StiReport();
-  report.loadFile('/mrt');
+  report.loadFile('/mrt' + location.search);
   viewer.report = report;
   viewer.renderHtml('viewer');
 </script></body></html>`);
