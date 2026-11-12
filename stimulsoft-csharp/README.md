@@ -58,6 +58,11 @@ mkdir -p reports && cp /path/to/dashboard.mrt reports/Report.mrt
 docker compose up --build -d
 ```
 
-Compose тянет `../.env` и `.env`, в контейнер явно прокидывает `PG_*` / `POSTGRES_*` / license.
+Образы: `mcr.microsoft.com/dotnet/sdk:8.0` и `aspnet:8.0`. Если pull падает — проверь интернет/VPN до `mcr.microsoft.com`, либо вручную:
+
+```bash
+docker pull mcr.microsoft.com/dotnet/sdk:8.0
+docker pull mcr.microsoft.com/dotnet/aspnet:8.0
+```
 
 http://127.0.0.1:8050/ · логи: `docker compose logs -f viewer`
