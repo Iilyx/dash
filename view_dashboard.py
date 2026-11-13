@@ -296,6 +296,15 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
+        # let viewer = ... недоступен из другого script
+        if "window.__dashViewer" not in html:
+            html = html.replace(
+                "viewer.renderHtml('viewerContent');",
+                "viewer.renderHtml('viewerContent');\n"
+                "window.__dashViewer = viewer;\n"
+                "if (viewer.report) window.__dashReport = viewer.report;\n",
+                1,
+            )
         try:
             ver = int((ROOT / "dash_debug.js").stat().st_mtime)
         except OSError:
@@ -306,7 +315,7 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-            resp.set_data(html)
+        resp.set_data(html)
     return resp
 
 
@@ -328,6 +337,14 @@ def remember_interaction(dump: Any) -> None:
 def wire_viewer(viewer: StiViewer) -> None:
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    # Save / PDF явно — иначе на dashboard легко «нет кнопки»
+    viewer.options.toolbar.visible = True
+    viewer.options.toolbar.showSaveButton = True
+    viewer.options.toolbar.showPrintButton = True
+    viewer.options.exports.showExportDialog = True
+    viewer.options.exports.showExportToPdf = True
+    viewer.options.exports.showExportToExcel = True
+    viewer.options.exports.showExportToDocument = True
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
@@ -398,7 +415,18 @@ def clear_params():
 
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
+    """Отдаём .mrt; пустой DashboardViewerSettings=0 прячет Export на dashboard."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        # StiDashboardViewerSettings.All = 1023 (Toolbar+Refresh+Open+FS+Menu+Edit+Snapshots+Exports+…)
+        dvs = data.get("DashboardViewerSettings")
+        if dvs in ("", None, 0, "0"):
+            data["DashboardViewerSettings"] = 1023
+        raw = json.dumps(data, ensure_ascii=False)
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp

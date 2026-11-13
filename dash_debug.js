@@ -134,7 +134,67 @@
     return params;
   }
 
+  function getViewerJs() {
+    var viewer = window.__dashViewer;
+    if (viewer && viewer.jsObject) return viewer.jsObject;
+    return null;
+  }
+
+  function exportPdf() {
+    var js = getViewerJs();
+    if (!js) {
+      alert("Дождитесь загрузки дашборда и нажмите PDF ещё раз");
+      return;
+    }
+    try {
+      // 4-й аргумент true = ExportDashboard (не report)
+      var settings =
+        typeof js.getDefaultExportSettings === "function"
+          ? js.getDefaultExportSettings("Pdf")
+          : {};
+      if (js.options && js.options.exports && js.options.exports.showExportDialog && js.controls && js.controls.forms && js.controls.forms.exportForm) {
+        js.controls.forms.exportForm.show(
+          "Pdf",
+          js.options.actions.exportReport,
+          "Adobe PDF"
+        );
+      } else if (typeof js.postExport === "function") {
+        js.postExport("Pdf", settings, null, true);
+      } else {
+        alert("Stimulsoft export API недоступен");
+      }
+    } catch (e) {
+      if (window.console && console.error) console.error(e);
+      alert("Ошибка экспорта PDF: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  function ensurePdfButton() {
+    if (document.getElementById("dash-export-pdf")) return;
+    var btn = document.createElement("button");
+    btn.id = "dash-export-pdf";
+    btn.type = "button";
+    btn.textContent = "Скачать PDF";
+    btn.style.cssText = [
+      "position:fixed",
+      "top:12px",
+      "right:12px",
+      "z-index:2147483647",
+      "padding:10px 16px",
+      "font:600 13px/1.2 system-ui,sans-serif",
+      "color:#0b1220",
+      "background:#86efac",
+      "border:1px solid #22c55e",
+      "border-radius:8px",
+      "box-shadow:0 6px 20px rgba(0,0,0,.25)",
+      "cursor:pointer",
+    ].join(";");
+    btn.onclick = exportPdf;
+    document.body.appendChild(btn);
+  }
+
   function ensurePanel() {
+    ensurePdfButton();
     var el = document.getElementById("dash-interaction-debug");
     if (el) return el;
     el = document.createElement("div");
