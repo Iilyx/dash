@@ -55,16 +55,7 @@ open 'http://127.0.0.1:8040/viewer?Region=West'
 
 # текущие (+ последний interaction с кликов)
 curl -s http://127.0.0.1:8040/api/params
-
-# параметры → структура .mrt + SQL sources одним JSON
-curl -s -X POST http://127.0.0.1:8040/api/collect \
-  -H 'Content-Type: application/json' \
-  -d '{"params":{"Region":"West"},"page":0,"row_limit":50}'
 ```
-
-`/api/collect` возвращает: `params`, `variables`, `page_index`, `queries`/`sql_results`, `panels`, `interactions`.  
-`run_sql=false` — только структура без запросов к БД.  
-`include_lazy=true` — ещё sources с `connect_on_start=false` (drill-down).
 
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.

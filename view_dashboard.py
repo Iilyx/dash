@@ -24,11 +24,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import threading
 import webbrowser
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -47,8 +46,6 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
-
-from extract_mrt import build_page_index, catalog_for_page, catalog_from_report, load_mrt
 
 ROOT = Path(__file__).resolve().parent
 
@@ -399,242 +396,6 @@ def clear_params():
     return jsonify({"ok": True, "params": {}})
 
 
-_COLLECT_META_KEYS = {
-    "params",
-    "interaction",
-    "page",
-    "include_lazy",
-    "row_limit",
-    "run_sql",
-}
-
-
-def _sql_literal(value: Any) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    if isinstance(value, (datetime, date)):
-        return "'" + value.isoformat(sep=" ", timespec="seconds") + "'"
-    if isinstance(value, list):
-        if not value:
-            return "NULL"
-        return ",".join(_sql_literal(v) for v in value)
-    text = str(value).replace("'", "''")
-    return f"'{text}'"
-
-
-def fill_sql_params(sql: str, params: dict[str, Any]) -> str:
-    """Подстановка {Name}, @Name, :Name (без учёта регистра)."""
-    if not sql or not params:
-        return sql
-    by_key = {str(k).lower(): v for k, v in params.items()}
-
-    def repl_brace(match: re.Match[str]) -> str:
-        key = match.group(1).lower()
-        if key not in by_key:
-            return match.group(0)
-        return _sql_literal(by_key[key])
-
-    def repl_at(match: re.Match[str]) -> str:
-        key = match.group(1).lower()
-        if key not in by_key:
-            return match.group(0)
-        return _sql_literal(by_key[key])
-
-    out = re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", repl_brace, sql)
-    out = re.sub(r"[@:]([A-Za-z_][A-Za-z0-9_]*)", repl_at, out)
-    return out
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, (bytes, bytearray)):
-        return value.hex()
-    return value
-
-
-def run_sql(sql: str, *, row_limit: int = 100) -> dict[str, Any]:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-    except ImportError as exc:
-        return {"ok": False, "error": f"psycopg missing: {exc}"}
-    if not _db:
-        return {"ok": False, "error": "no database url"}
-    try:
-        with psycopg.connect(_db) as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql)
-                if cur.description is None:
-                    return {"ok": True, "rows": [], "rowcount": cur.rowcount}
-                rows = cur.fetchmany(max(1, row_limit))
-                more = cur.fetchone() is not None
-                return {
-                    "ok": True,
-                    "rows": _jsonable(rows),
-                    "rowcount": len(rows),
-                    "truncated": more,
-                }
-    except Exception as exc:  # noqa: BLE001 — отдаём клиенту текст ошибки SQL
-        return {"ok": False, "error": str(exc)}
-
-
-def collect_dashboard(
-    *,
-    params: dict[str, Any] | None = None,
-    page: int | None = None,
-    include_lazy: bool = False,
-    row_limit: int = 100,
-    run_sql_flag: bool = True,
-) -> dict[str, Any]:
-    """Параметры → catalog(.mrt) → (опционально) SQL sources → снимок."""
-    if params:
-        params_update(params)
-    current = params_snapshot()
-
-    report = load_mrt(MRT_PATH)
-    catalog = catalog_from_report(report)
-    page_index = build_page_index(catalog)
-    page_catalog = None
-    if page is not None:
-        try:
-            page_catalog = catalog_for_page(catalog, int(page))
-        except (KeyError, TypeError, ValueError) as exc:
-            page_catalog = {"error": str(exc)}
-
-    variables = catalog.get("variables") or []
-    variables_resolved = []
-    for var in variables:
-        if not isinstance(var, dict):
-            continue
-        item = dict(var)
-        name = item.get("name")
-        if isinstance(name, str) and name in current:
-            item["value"] = current[name]
-            item["from_params"] = True
-        variables_resolved.append(item)
-
-    sources = catalog.get("sources") or []
-    queries: list[dict[str, Any]] = []
-    sql_results: list[dict[str, Any]] = []
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        sql = source.get("sql")
-        if not isinstance(sql, str) or not sql.strip():
-            continue
-        lazy = source.get("connect_on_start") is False
-        if lazy and not include_lazy:
-            queries.append(
-                {
-                    "name": source.get("name"),
-                    "skipped": "connect_on_start=false (pass include_lazy=true)",
-                    "sql": sql,
-                }
-            )
-            continue
-        filled = fill_sql_params(sql, current)
-        entry = {
-            "name": source.get("name"),
-            "sql": sql,
-            "sql_filled": filled,
-            "lazy": lazy,
-        }
-        queries.append(entry)
-        if run_sql_flag:
-            result = run_sql(filled, row_limit=row_limit)
-            sql_results.append({"name": source.get("name"), **result, "sql_filled": filled})
-
-    with _params_lock:
-        interactions = list(_INTERACTIONS)
-        last = _LAST_INTERACTION
-
-    return {
-        "ok": True,
-        "mrt": str(MRT_PATH),
-        "params": current,
-        "interaction": last,
-        "interactions": interactions,
-        "report": catalog.get("report"),
-        "page_index": page_index,
-        "page": page_catalog,
-        "variables": variables_resolved,
-        "sources": [
-            {
-                "name": s.get("name"),
-                "type": s.get("type"),
-                "connect_on_start": s.get("connect_on_start", True),
-                "has_sql": bool(s.get("sql")),
-            }
-            for s in sources
-            if isinstance(s, dict)
-        ],
-        "queries": queries,
-        "sql_results": sql_results if run_sql_flag else [],
-        "panels": catalog.get("panels") if page is None else (page_catalog or {}).get("panels"),
-    }
-
-
-@app.post("/api/collect")
-@app.get("/api/collect")
-def api_collect():
-    """Передал параметры → собрал структуру дашборда + SQL.
-
-    POST JSON:
-      {"params": {"Region":"West"}, "page": 0, "include_lazy": false, "row_limit": 100, "run_sql": true}
-    GET:
-      /api/collect?Region=West&page=0&run_sql=1
-    """
-    body = request.get_json(silent=True) if request.is_json else None
-    body = body if isinstance(body, dict) else {}
-
-    incoming = _body_params()
-    incoming.update(_public_query_params())
-    for key in list(incoming):
-        if key in _COLLECT_META_KEYS:
-            incoming.pop(key, None)
-    # params из вложенного объекта уже в _body_params; meta из body:
-    if isinstance(body.get("params"), dict):
-        for key, value in body["params"].items():
-            if key not in _COLLECT_META_KEYS:
-                incoming[key] = value
-
-    page_raw = body.get("page", request.args.get("page"))
-    page = None
-    if page_raw is not None and str(page_raw).strip() != "":
-        try:
-            page = int(page_raw)
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": f"bad page: {page_raw}"}), 400
-
-    include_lazy = bool(body.get("include_lazy")) or request.args.get(
-        "include_lazy", ""
-    ).lower() in {"1", "true", "yes"}
-    row_limit = int(body.get("row_limit") or request.args.get("row_limit") or 100)
-    run_flag = body.get("run_sql", request.args.get("run_sql", "1"))
-    run_sql_flag = str(run_flag).lower() not in {"0", "false", "no"}
-
-    try:
-        payload = collect_dashboard(
-            params=incoming or None,
-            page=page,
-            include_lazy=include_lazy,
-            row_limit=max(1, min(row_limit, 5000)),
-            run_sql_flag=run_sql_flag,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify(payload)
-
-
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
@@ -688,7 +449,6 @@ def main() -> None:
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
-    print(f"Collect:  POST/GET http://{HOST}:{PORT}/api/collect", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
     if OPEN_BROWSER:
         try:
