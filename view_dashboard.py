@@ -120,6 +120,8 @@ FILTERS_PANEL_POSITION = (
 FILTERS_COLUMNS = int(os.environ.get("FILTERS_COLUMNS", "8") or "8")
 # 1 = всегда раскладывать по колонкам (иначе при ≤5 фильтрах Stimulsoft держит 1 столбец)
 FILTERS_MIN_FOR_MULTI = int(os.environ.get("FILTERS_MIN_FOR_MULTI", "1") or "1")
+# ширина полей параметров в .mrt (px); дефолт Stimulsoft ~230
+FILTERS_FIELD_WIDTH = int(os.environ.get("FILTERS_FIELD_WIDTH", "320") or "320")
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -419,9 +421,25 @@ def clear_params():
     return jsonify({"ok": True, "params": {}})
 
 
+def patch_mrt_params_layout(raw: str) -> str:
+    """ParameterWidth в .mrt → ширина input; иначе поля остаются ~230px."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(data, dict):
+        return raw
+    width = max(120, FILTERS_FIELD_WIDTH)
+    data["ParameterWidth"] = str(width)
+    # на всякий случай оба регистра/ключа, которые встречаются в выгрузках
+    data["parameterWidth"] = width
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
+    raw = patch_mrt_params_layout(raw)
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp

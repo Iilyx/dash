@@ -194,11 +194,69 @@
     if (pre) pre.textContent = JSON.stringify(dump, null, 2);
   }
 
+  function injectParamsCss() {
+    if (document.getElementById("dash-params-layout-css")) return;
+    var style = document.createElement("style");
+    style.id = "dash-params-layout-css";
+    style.textContent = [
+      ".stiJsViewerParametersPanelTop .stiJsViewerInnerContainerParametersPanel{",
+      "display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px 12px;}",
+      ".stiJsViewerParametersPanelTop .stiJsViewerInnerContainerParametersPanel > table:not([id$='MainButtons']){",
+      "flex:1 1 auto;}",
+      ".stiJsViewerParametersPanelTop table[id$='MainButtons']{",
+      "margin:8px 12px 8px auto !important;float:none !important;",
+      "order:99;align-self:flex-end;}",
+      ".stiJsViewerParametersPanel input,",
+      ".stiJsViewerParametersPanel select,",
+      ".stiJsViewerParametersPanel textarea,",
+      ".stiJsViewerParametersPanel .stiJsViewerTextBox{",
+      "min-width:280px !important;width:320px !important;",
+      "height:34px !important;font-size:14px !important;",
+      "box-sizing:border-box;}",
+      ".stiJsViewerParametersPanel .stiJsViewerFormButton{",
+      "min-height:34px;min-width:88px;}",
+    ].join("");
+    document.head.appendChild(style);
+  }
+
+  function layoutParamsPanel() {
+    injectParamsCss();
+    var panel =
+      document.querySelector(".stiJsViewerParametersPanel") ||
+      document.querySelector("[id$='_ParametersPanel']");
+    if (!panel) return;
+    var container =
+      panel.querySelector(".stiJsViewerInnerContainerParametersPanel") ||
+      panel;
+    var buttons = panel.querySelector("table[id$='MainButtons']");
+    if (buttons && container && buttons.parentElement !== container) {
+      container.appendChild(buttons);
+    }
+    if (buttons) {
+      buttons.style.marginLeft = "auto";
+      buttons.style.marginRight = "12px";
+      buttons.style.marginTop = "8px";
+      buttons.setAttribute("align", "right");
+    }
+    var nodes = panel.querySelectorAll("input, select, textarea");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.type === "hidden" || el.type === "checkbox" || el.type === "radio") {
+        continue;
+      }
+      el.style.minWidth = "280px";
+      el.style.width = "320px";
+      el.style.height = "34px";
+      el.style.fontSize = "14px";
+    }
+  }
+
   window.dashCaptureInteraction = function (args) {
     try {
       var dump = dumpArgs(args);
       var params = flattenParams(args);
       showDump(dump);
+      layoutParamsPanel();
       if (window.console && console.log) {
         console.log("[dash interaction]", dump.action, dump);
       }
@@ -215,10 +273,21 @@
     }
   };
 
-  // панель сразу, чтобы было видно что дебаг включён
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", ensurePanel);
-  } else {
+  function bootLayout() {
     ensurePanel();
+    injectParamsCss();
+    layoutParamsPanel();
+    var obs = new MutationObserver(function () {
+      layoutParamsPanel();
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(layoutParamsPanel, 400);
+    setTimeout(layoutParamsPanel, 1200);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootLayout);
+  } else {
+    bootLayout();
   }
 })();
