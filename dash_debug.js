@@ -148,49 +148,30 @@
   }
 
   function dashExportSettings(format) {
-    var S = window.Stimulsoft;
-    var Pack =
-      S && S.Dashboard && S.Dashboard.Export && S.Dashboard.Export.Settings
-        ? S.Dashboard.Export.Settings
-        : null;
+    var js = getViewerJs();
+    // База как у кнопки Save в тулбаре (DashboardPdf / DashboardExcel)
     var settings = null;
     try {
-      if (format === "Pdf" && Pack && Pack.StiPdfDashboardExportSettings) {
-        settings = new Pack.StiPdfDashboardExportSettings();
-      } else if (format === "Excel" && Pack && Pack.StiExcelDashboardExportSettings) {
-        settings = new Pack.StiExcelDashboardExportSettings();
+      if (js && typeof js.getDefaultExportSettings === "function") {
+        settings = js.getDefaultExportSettings(format, true);
       }
     } catch (e) {
       settings = null;
     }
-    if (settings) {
-      if (S.Report && S.Report.Components && S.Report.Components.StiPageOrientation) {
-        settings.orientation = S.Report.Components.StiPageOrientation.Landscape;
-      }
-      if (
-        format === "Pdf" &&
-        S.System &&
-        S.System.Drawing &&
-        S.System.Drawing.Printing &&
-        S.System.Drawing.Printing.PaperKind
-      ) {
-        // A3 — меньше сжимает широкий dashboard, чем A4
-        settings.paperSize = S.System.Drawing.Printing.PaperKind.A3;
-      }
-      // Для таблиц: false даёт разворот по страницам там, где Stimulsoft это умеет.
-      // (для целого dashboard layout движок всё равно часто форсит single page)
-      settings.renderSinglePage = false;
-      if ("imageQuality" in settings) settings.imageQuality = 200;
-      if ("openAfterExport" in settings) settings.openAfterExport = false;
-      return settings;
+    if (!settings || typeof settings !== "object") {
+      settings = {};
     }
-    return {
-      Orientation: "Landscape",
-      PaperSize: format === "Pdf" ? "A3" : "A4",
-      RenderSinglePage: false,
-      ImageQuality: 200,
-      OpenAfterExport: false,
-    };
+    // Копия — не портим defaultSettings в options
+    var out = {};
+    Object.keys(settings).forEach(function (k) {
+      out[k] = settings[k];
+    });
+    out.Orientation = out.Orientation || "Landscape";
+    out.PaperSize = out.PaperSize || (format === "Pdf" ? "A3" : "A4");
+    out.RenderSinglePage = false;
+    out.ImageQuality = out.ImageQuality != null ? out.ImageQuality : 200;
+    out.OpenAfterExport = false;
+    return out;
   }
 
   function saveBlob(data, name, mime) {
@@ -213,78 +194,89 @@
     }, 2000);
   }
 
+  /** Графики в PDF = растр; если экспортировать слишком рано — серые прямоугольники. */
+  function waitForChartsReady(timeoutMs) {
+    timeoutMs = timeoutMs || 8000;
+    var start = Date.now();
+    return new Promise(function (resolve) {
+      function tick() {
+        var root =
+          document.getElementById("viewerContent") ||
+          document.querySelector("[id$='Content']") ||
+          document.body;
+        var charts = root
+          ? root.querySelectorAll("svg, canvas, img")
+          : [];
+        var ready = false;
+        for (var i = 0; i < charts.length; i++) {
+          var el = charts[i];
+          if (el.tagName === "IMG") {
+            if (el.complete && el.naturalWidth > 2) {
+              ready = true;
+              break;
+            }
+          } else if (el.tagName === "CANVAS") {
+            if (el.width > 2 && el.height > 2) {
+              ready = true;
+              break;
+            }
+          } else if (el.tagName === "SVG") {
+            var box = el.getBoundingClientRect();
+            if (box.width > 2 && box.height > 2) {
+              ready = true;
+              break;
+            }
+          }
+        }
+        if (ready || Date.now() - start > timeoutMs) {
+          // ещё кадр — дорисовать анимации
+          requestAnimationFrame(function () {
+            setTimeout(resolve, 400);
+          });
+          return;
+        }
+        setTimeout(tick, 200);
+      }
+      tick();
+    });
+  }
+
   function exportDashboard(format) {
     var isPdf = format === "Pdf";
     var btnId = isPdf ? "dash-export-pdf" : "dash-export-excel";
     var btn = document.getElementById(btnId);
     var label = isPdf ? "Скачать PDF" : "Скачать Excel";
-    var report = getReport();
     var js = getViewerJs();
-    if (!report && !js) {
+    if (!js || typeof js.postExport !== "function") {
       alert("Дождитесь загрузки дашборда");
       return;
     }
     if (btn) {
       btn.disabled = true;
-      btn.textContent = isPdf ? "PDF…" : "Excel…";
+      btn.textContent = isPdf ? "ждём графики…" : "Excel…";
     }
-    var settings = dashExportSettings(format);
     var done = function () {
       if (btn) {
         btn.disabled = false;
         btn.textContent = label;
       }
     };
-    var mime = isPdf
-      ? "application/pdf"
-      : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-    var ext = isPdf ? ".pdf" : ".xlsx";
 
-    try {
-      if (
-        report &&
-        typeof report.exportDocumentAsync2 === "function" &&
-        window.Stimulsoft &&
-        window.Stimulsoft.Report &&
-        window.Stimulsoft.Report.StiExportFormat
-      ) {
-        var fmt = isPdf
-          ? window.Stimulsoft.Report.StiExportFormat.Pdf
-          : window.Stimulsoft.Report.StiExportFormat.Excel ||
-            window.Stimulsoft.Report.StiExportFormat.Excel2007;
-        // exportDocument по report уже проходит все dashboard-страницы
-        report
-          .exportDocumentAsync2(fmt, null, settings)
-          .then(function (data) {
-            var name =
-              (report.reportAlias || report.reportName || "dashboard") + ext;
-            saveBlob(data, name, mime);
-            done();
-          })
-          .catch(function (e) {
-            if (window.console && console.error) console.error(e);
-            if (js && typeof js.postExport === "function") {
-              js.postExport(format, settings, null, true);
-              done();
-            } else {
-              alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
-              done();
-            }
-          });
-        return;
-      }
-      if (js && typeof js.postExport === "function") {
+    // Только штатный ExportDashboard viewer (как Save → PDF).
+    // Свой report.exportDocumentAsync2 перерисовывает чарты заново → часто серые плитки.
+    waitForChartsReady(10000)
+      .then(function () {
+        if (btn) btn.textContent = isPdf ? "PDF…" : "Excel…";
+        var settings = dashExportSettings(format);
         js.postExport(format, settings, null, true);
+        // postExport сам качает файл; кнопку отпускаем с запасом
+        setTimeout(done, 2500);
+      })
+      .catch(function (e) {
+        if (window.console && console.error) console.error(e);
+        alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
         done();
-        return;
-      }
-      alert("Stimulsoft export API недоступен");
-      done();
-    } catch (e) {
-      if (window.console && console.error) console.error(e);
-      alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
-      done();
-    }
+      });
   }
 
   function makeExportButton(id, text, topPx, onClick, title) {
