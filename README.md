@@ -60,17 +60,20 @@ curl -s http://127.0.0.1:8040/api/params
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
 
-### Готовая страница «как на экране»
+### Заполненные данные только через API
 
-После рендера (таблицы, кнопки, графики) в viewer:
-
-- **Ctrl+Shift+S** — скачает PNG + JSON (`datasets` + `params`) и положит копию в `data/filled/`
-- или в консоли: `await dashDownloadFilled()`
+`POST /api/filled` — params → SQL из `.mrt` → `datasets` (строки из Postgres). Без скринов/браузера.
 
 ```bash
-curl -s http://127.0.0.1:8040/api/filled      # метаданные последнего снимка
-curl -s http://127.0.0.1:8040/api/filled.png  -o filled.png
+curl -s -X POST http://127.0.0.1:8040/api/filled \
+  -H 'Content-Type: application/json' \
+  -d '{"params":{"Region":"West"},"row_limit":100}'
+
+# или с уже заданными /api/params:
+curl -s 'http://127.0.0.1:8040/api/filled?row_limit=100'
 ```
+
+В ответе: `params`, `datasets` (`ok`, `sql_filled`, `columns`, `rows`).
 
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 

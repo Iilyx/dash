@@ -22,18 +22,21 @@ Docs / samples:
 
 from __future__ import annotations
 
-import base64
 import json
 import os
+import re
 import sys
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
+import psycopg
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
+from extract_mrt import catalog_from_report, load_mrt
 from flask import Flask, Response, jsonify, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
@@ -47,6 +50,12 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
+
+BRACE_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+QUOTED_BRACE = re.compile(
+    r"(?P<q>['\"])\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}(?P=q)"
+)
+AT_PARAM = re.compile(r"@([A-Za-z_][A-Za-z0-9_]*)")
 
 ROOT = Path(__file__).resolve().parent
 
@@ -136,10 +145,170 @@ _INTERACTIONS_MAX = 50
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
 _DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
 
-# Последний полный снимок с клиента: PNG (как на экране) + datasets/params.
+# Последний ответ POST/GET /api/filled (только JSON, без скринов).
 _LAST_FILLED: dict[str, Any] | None = None
-_FILLED_DIR = ROOT / "data" / "filled"
-_FILLED_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _pg_url() -> str:
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        return url
+    user = os.environ.get("POSTGRES_USER", "").strip()
+    password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+    db = os.environ.get("POSTGRES_DB", "").strip()
+    host = os.environ.get("POSTGRES_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.environ.get("POSTGRES_PORT", "5432").strip() or "5432"
+    if user and password and db:
+        return f"postgresql://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{db}"
+    raise RuntimeError("Нет DATABASE_URL / POSTGRES_*")
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float, Decimal)):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return "'" + value.isoformat().replace("'", "''") + "'"
+    if isinstance(value, (list, tuple)):
+        parts = ", ".join(_sql_literal(v) for v in value)
+        return f"({parts})" if parts else "(NULL)"
+    text = str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _fill_sql(sql: str, params: dict[str, Any]) -> str:
+    by_key = {str(k).lower(): v for k, v in params.items()}
+
+    def repl_quoted(match: re.Match[str]) -> str:
+        key = match.group("name").lower()
+        if key not in by_key:
+            return match.group(0)
+        value = by_key[key]
+        if value is None:
+            return "NULL"
+        quote = match.group("q")
+        inner = str(value).replace("'", "''").replace('"', '""')
+        return f"{quote}{inner}{quote}"
+
+    def repl_bare(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        if key not in by_key:
+            return match.group(0)
+        return _sql_literal(by_key[key])
+
+    def repl_at(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        if key not in by_key:
+            return match.group(0)
+        return _sql_literal(by_key[key])
+
+    out = QUOTED_BRACE.sub(repl_quoted, sql)
+    out = BRACE_NAME.sub(repl_bare, out)
+    return AT_PARAM.sub(repl_at, out)
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (bytes, memoryview)):
+        return bytes(value).hex()
+    return str(value)
+
+
+def _run_sql(sql: str, row_limit: int) -> dict[str, Any]:
+    with psycopg.connect(_pg_url()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            if cur.description is None:
+                return {
+                    "columns": [],
+                    "rowcount": cur.rowcount,
+                    "rows": [],
+                }
+            columns = [d.name for d in cur.description]
+            rows_raw = cur.fetchmany(row_limit)
+            rows = [
+                {columns[i]: _jsonable(row[i]) for i in range(len(columns))}
+                for row in rows_raw
+            ]
+            return {
+                "columns": columns,
+                "rowcount": len(rows),
+                "rows": rows,
+                "truncated": len(rows) >= row_limit,
+            }
+
+
+def _default_params_from_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for var in catalog.get("variables") or []:
+        if not isinstance(var, dict) or not var.get("name"):
+            continue
+        if "value" in var and var["value"] is not None:
+            out[str(var["name"])] = var["value"]
+    return out
+
+
+def build_filled(
+    params: dict[str, Any],
+    *,
+    row_limit: int = 500,
+    source_names: list[str] | None = None,
+    include_lazy: bool = False,
+) -> dict[str, Any]:
+    """params → SQL из .mrt → datasets (без браузера / скринов)."""
+    report = load_mrt(MRT_PATH)
+    catalog = catalog_from_report(report)
+    resolved = _default_params_from_catalog(catalog)
+    resolved.update(params)
+
+    want = None
+    if source_names:
+        want = {n.lower() for n in source_names if isinstance(n, str)}
+
+    datasets: dict[str, Any] = {}
+    for source in catalog.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        name = source.get("name")
+        sql = source.get("sql")
+        if not isinstance(name, str) or not isinstance(sql, str) or not sql.strip():
+            continue
+        if want is not None and name.lower() not in want:
+            continue
+        if not include_lazy and source.get("connect_on_start") is False:
+            continue
+        filled = _fill_sql(sql, resolved)
+        try:
+            result = _run_sql(filled, row_limit)
+            datasets[name] = {
+                "ok": True,
+                "sql": sql,
+                "sql_filled": filled,
+                **result,
+            }
+        except Exception as exc:  # noqa: BLE001
+            datasets[name] = {
+                "ok": False,
+                "sql": sql,
+                "sql_filled": filled,
+                "error": str(exc),
+            }
+
+    return {
+        "ok": True,
+        "params": resolved,
+        "sources_total": len(catalog.get("sources") or []),
+        "datasets": datasets,
+        "pages_count": len(catalog.get("pages") or []),
+    }
 
 
 def _public_query_params() -> dict[str, str]:
@@ -302,15 +471,6 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
-        # нужен для dashDownloadFilled() — без зелёных кнопок
-        if "window.__dashViewer" not in html:
-            html = html.replace(
-                "viewer.renderHtml('viewerContent');",
-                "viewer.renderHtml('viewerContent');\n"
-                "window.__dashViewer = viewer;\n"
-                "if (viewer.report) window.__dashReport = viewer.report;\n",
-                1,
-            )
         try:
             ver = int((ROOT / "dash_debug.js").stat().st_mtime)
         except OSError:
@@ -321,7 +481,7 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-        resp.set_data(html)
+            resp.set_data(html)
     return resp
 
 
@@ -413,60 +573,87 @@ def clear_params():
 
 @app.post("/api/filled")
 def post_filled():
-    """Клиент шлёт готовый снимок: то, что видно (png) + datasets/params."""
+    """Только API: params → SQL из .mrt → datasets (строки из Postgres). Без скринов."""
     global _LAST_FILLED
     body = request.get_json(silent=True) if request.is_json else None
     if not isinstance(body, dict):
-        return jsonify({"ok": False, "error": "json body required"}), 400
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    meta = {
-        "ts": ts,
-        "params": body.get("params") if isinstance(body.get("params"), dict) else {},
-        "datasets": body.get("datasets") if isinstance(body.get("datasets"), dict) else {},
-        "page": body.get("page"),
-        "pages_count": body.get("pages_count"),
-    }
-    png_b64 = body.get("png_base64")
-    png_name = None
-    if isinstance(png_b64, str) and png_b64:
-        raw = png_b64.split(",", 1)[-1]
-        try:
-            png_bytes = base64.b64decode(raw)
-            png_name = f"filled-{ts}.png"
-            (_FILLED_DIR / png_name).write_bytes(png_bytes)
-            meta["png"] = png_name
-            meta["png_bytes"] = len(png_bytes)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"ok": False, "error": f"bad png: {exc}"}), 400
-    json_name = f"filled-{ts}.json"
-    (_FILLED_DIR / json_name).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    meta["json"] = json_name
+        body = {}
+    incoming = _body_params()
+    incoming.update(_public_query_params())
+    nested = body.get("params") if isinstance(body.get("params"), dict) else None
+    if nested:
+        incoming.update(nested)
+    # плоский JSON тоже принимаем как params
+    for k, v in body.items():
+        if k in {"params", "row_limit", "source_names", "include_lazy", "run_sql"}:
+            continue
+        incoming[k] = v
+    if incoming:
+        params_update(incoming)
+
     with _params_lock:
-        _LAST_FILLED = meta
-    return jsonify({"ok": True, "filled": meta})
+        merged = dict(_PARAMS)
+    merged.update(incoming)
+
+    row_limit = body.get("row_limit", 500)
+    try:
+        row_limit = max(1, min(int(row_limit), 5000))
+    except (TypeError, ValueError):
+        row_limit = 500
+    names = body.get("source_names")
+    if not isinstance(names, list):
+        names = None
+    include_lazy = bool(body.get("include_lazy"))
+
+    try:
+        result = build_filled(
+            merged,
+            row_limit=row_limit,
+            source_names=names,
+            include_lazy=include_lazy,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    result["ts"] = datetime.now().isoformat(timespec="seconds")
+    with _params_lock:
+        _LAST_FILLED = result
+    return jsonify(result)
 
 
 @app.get("/api/filled")
 def get_filled():
-    with _params_lock:
-        if _LAST_FILLED is None:
-            return jsonify({"ok": False, "error": "no snapshot yet"}), 404
-        return jsonify({"ok": True, "filled": _LAST_FILLED})
+    """Повторить filled с текущими /api/params (+ query). Или вернуть последний кэш ?cache=1."""
+    global _LAST_FILLED
+    if request.args.get("cache", "").lower() in {"1", "true", "yes"}:
+        with _params_lock:
+            if _LAST_FILLED is None:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": "no cache — сначала POST /api/filled",
+                    }
+                ), 404
+            return jsonify(_LAST_FILLED)
 
-
-@app.get("/api/filled.png")
-def get_filled_png():
+    incoming = _public_query_params()
+    if incoming:
+        params_update(incoming)
     with _params_lock:
-        meta = _LAST_FILLED
-    if not meta or not meta.get("png"):
-        return jsonify({"ok": False, "error": "no png yet"}), 404
-    path = _FILLED_DIR / str(meta["png"])
-    if not path.is_file():
-        return jsonify({"ok": False, "error": "png missing on disk"}), 404
-    return Response(path.read_bytes(), mimetype="image/png")
+        merged = dict(_PARAMS)
+    merged.update(incoming)
+    try:
+        row_limit = max(1, min(int(request.args.get("row_limit", 500)), 5000))
+    except (TypeError, ValueError):
+        row_limit = 500
+    try:
+        result = build_filled(merged, row_limit=row_limit)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    result["ts"] = datetime.now().isoformat(timespec="seconds")
+    with _params_lock:
+        _LAST_FILLED = result
+    return jsonify(result)
 
 
 @app.route("/mrt", methods=["GET", "POST"])
@@ -534,13 +721,13 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
-    print(f"Filled:   Ctrl+Shift+S в viewer → GET /api/filled (+ /api/filled.png)", flush=True)
+    print(f"Filled:   POST/GET http://{HOST}:{PORT}/api/filled", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
         except Exception:
             pass
-    app.run(host=HOST, port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
