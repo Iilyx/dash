@@ -46,6 +46,9 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums.StiParametersPanelPosition import (
+    StiParametersPanelPosition,
+)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -100,6 +103,14 @@ if not MRT_PATH.is_file():
 HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
+# Панель параметров/фильтров: top = в строку, left = столбцом.
+_FILTERS_POS = os.environ.get("FILTERS_PANEL", "top").strip().lower() or "top"
+FILTERS_PANEL_POSITION = (
+    StiParametersPanelPosition.LEFT
+    if _FILTERS_POS == "left"
+    else StiParametersPanelPosition.TOP
+)
+FILTERS_COLUMNS = int(os.environ.get("FILTERS_COLUMNS", "8") or "8")
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -324,6 +335,9 @@ def remember_interaction(dump: Any) -> None:
 def wire_viewer(viewer: StiViewer) -> None:
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    # фильтры/параметры — сверху в строку (не слева столбцом)
+    viewer.options.appearance.parametersPanelPosition = FILTERS_PANEL_POSITION
+    viewer.options.appearance.parametersPanelColumnsCount = max(1, FILTERS_COLUMNS)
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
