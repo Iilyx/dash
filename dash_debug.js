@@ -229,10 +229,27 @@
   window._dashPendingResults = null;
   var _dashExportTimer = null;
 
-  function getViewerReport() {
+  function getViewerReport(args) {
     try {
-      if (typeof viewer !== "undefined" && viewer && viewer.report) return viewer.report;
-    } catch (e) {}
+      if (args && args.report) return args.report;
+      if (window.__dashReport) return window.__dashReport;
+      if (window.__dashViewer && window.__dashViewer.report) {
+        return window.__dashViewer.report;
+      }
+      // StiJsViewer на панели параметров
+      var panel =
+        document.querySelector(".stiJsViewerParametersPanel") ||
+        document.querySelector("[id$='_ParametersPanel']");
+      if (panel && panel.jsObject) {
+        if (panel.jsObject.report) return panel.jsObject.report;
+        if (panel.jsObject.getReport) {
+          var r = panel.jsObject.getReport();
+          if (r) return r;
+        }
+      }
+    } catch (e) {
+      if (window.console && console.warn) console.warn("[dash] getViewerReport", e);
+    }
     return null;
   }
 
@@ -328,14 +345,15 @@
       variables: dumpVariables(report),
       datasets: dumpDataSources(report),
     };
+    // document JSON часто битый/огромный — не роняем экспорт
     try {
       if (report && typeof report.saveDocumentToJsonString === "function") {
         var doc = report.saveDocumentToJsonString();
-        if (doc) {
+        if (doc && typeof doc === "string" && doc.charAt(0) === "{") {
           try {
             payload.document = JSON.parse(doc);
           } catch (e) {
-            payload.document_raw = doc;
+            payload.document_error = "parse: " + String(e);
           }
         }
       }
@@ -345,29 +363,61 @@
     return payload;
   }
 
-  function exportComputedResults(params) {
+  function exportComputedResults(params, args) {
     setStatus("export…");
-    var report = getViewerReport();
+    var report = getViewerReport(args);
     if (!report) {
-      setStatus("no report");
-      alert("Нет viewer.report — дождись загрузки дашборда и нажми Submit снова");
+      setStatus("no report — retry");
+      // ещё несколько попыток: report появляется асинхронно
+      var left = 8;
+      var timer = setInterval(function () {
+        report = getViewerReport(args);
+        left--;
+        if (report || left <= 0) {
+          clearInterval(timer);
+          if (!report) {
+            setStatus("no report");
+            if (window.console && console.error) {
+              console.error("[dash] no report", {
+                dashViewer: !!window.__dashViewer,
+                dashReport: !!window.__dashReport,
+              });
+            }
+            return;
+          }
+          finishExport(report, params);
+        }
+      }, 400);
       return;
     }
-    var payload = buildComputedPayload(report, params);
-    var stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadJson("dashboard-results-" + stamp + ".json", payload);
-    setStatus("downloaded results");
-    if (window.console && console.log) {
-      console.log("[dash results]", payload);
-    }
-    fetch("/api/results", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(function () {});
+    finishExport(report, params);
   }
 
-  window.dashOnEndProcessData = function () {
+  function finishExport(report, params) {
+    try {
+      if (report) window.__dashReport = report;
+      var payload = buildComputedPayload(report, params);
+      var stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      downloadJson("dashboard-results-" + stamp + ".json", payload);
+      setStatus("downloaded results");
+      if (window.console && console.log) {
+        console.log("[dash results]", payload);
+      }
+      fetch("/api/results", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }).catch(function () {});
+    } catch (e) {
+      setStatus("export error");
+      if (window.console && console.error) console.error("[dash export]", e);
+    }
+  }
+
+  window.dashOnEndProcessData = function (args) {
+    try {
+      if (args && args.report) window.__dashReport = args.report;
+    } catch (e) {}
     if (!window._dashPendingResults) return;
     if (_dashExportTimer) clearTimeout(_dashExportTimer);
     // несколько sources → несколько EndProcessData; берём последний с паузой
@@ -375,12 +425,13 @@
       var p = window._dashPendingResults;
       window._dashPendingResults = null;
       _dashExportTimer = null;
-      exportComputedResults(p);
+      exportComputedResults(p, args);
     }, 700);
   };
 
   window.dashCaptureInteraction = function (args) {
     try {
+      if (args && args.report) window.__dashReport = args.report;
       var dump = dumpArgs(args);
       var params = flattenParams(args);
       showDump(dump);
@@ -405,7 +456,7 @@
           if (window._dashPendingResults) {
             var p = window._dashPendingResults;
             window._dashPendingResults = null;
-            exportComputedResults(p);
+            exportComputedResults(p, args);
           }
         }, 5000);
       }

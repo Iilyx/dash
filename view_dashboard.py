@@ -311,7 +311,16 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-            resp.set_data(html)
+        # let viewer = ... недоступен из другого script — пробрасываем на window
+        if "window.__dashViewer" not in html and "viewer.renderHtml(" in html:
+            html = html.replace(
+                "viewer.renderHtml('viewerContent');",
+                "viewer.renderHtml('viewerContent');\n"
+                "window.__dashViewer = viewer;\n"
+                "if (viewer.report) window.__dashReport = viewer.report;\n",
+                1,
+            )
+        resp.set_data(html)
     return resp
 
 
