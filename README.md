@@ -66,7 +66,11 @@ curl -s -X POST http://127.0.0.1:8040/api/collect \
 `run_sql=false` — только структура без запросов к БД.  
 `include_lazy=true` — ещё sources с `connect_on_start=false` (drill-down).
 
-В viewer: **Submit** на панели параметров → скачивается `dashboard-collect-….json`.
+В viewer: **Submit** → скачивается `dashboard-results-….json` с **уже посчитанными**
+`datasets` (строки dataSources после рендера), не структура `.mrt`.
+То же на сервере: `GET /api/results`.
+
+Структура шаблона + свой SQL (без рендера Stimulsoft) — отдельно: `POST /api/collect`.
 
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.

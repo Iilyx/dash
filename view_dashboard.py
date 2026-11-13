@@ -5,7 +5,7 @@ Docs / samples:
   Editing a Dashboard Template in the Designer
   Showing a Dashboard in the Viewer
   How to Activate the Product
-  Using Parameters in SQL Query (onBeginProcessData)
+  Using Parameters in SQL Query (onBeginProcessData)ог
   Setting Dashboard Variables on the Server-Side
   passQueryParametersToReport / onPrepareVariables / onInteraction
 
@@ -134,6 +134,8 @@ _PARAMS: dict[str, Any] = {}
 _LAST_INTERACTION: dict[str, Any] | None = None
 _INTERACTIONS: list[dict[str, Any]] = []
 _INTERACTIONS_MAX = 50
+# Последний посчитанный снимок с клиента (datasets после Submit)
+_LAST_RESULTS: dict[str, Any] | None = None
 
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
 _DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
@@ -334,6 +336,8 @@ def wire_viewer(viewer: StiViewer) -> None:
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
+    # после подгрузки данных (Submit) — клиент снимет datasets
+    viewer.onEndProcessData += "dashOnEndProcessData"
     # alnum → вызов window.dashCaptureInteraction(args) из dash_debug.js
     viewer.onInteraction += "dashCaptureInteraction"
 
@@ -391,12 +395,34 @@ def post_params():
 
 @app.delete("/api/params")
 def clear_params():
-    global _LAST_INTERACTION
+    global _LAST_INTERACTION, _LAST_RESULTS
     with _params_lock:
         _PARAMS.clear()
         _LAST_INTERACTION = None
         _INTERACTIONS.clear()
+        _LAST_RESULTS = None
     return jsonify({"ok": True, "params": {}})
+
+
+@app.get("/api/results")
+def get_results():
+    """Уже посчитанные данные с viewer (datasets), не структура .mrt."""
+    with _params_lock:
+        if _LAST_RESULTS is None:
+            return jsonify({"ok": False, "error": "no results yet — нажми Submit в viewer"}), 404
+        return jsonify(_LAST_RESULTS)
+
+
+@app.post("/api/results")
+def post_results():
+    """Клиент шлёт снимок после рендера (dash_debug.js)."""
+    global _LAST_RESULTS
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "json object required"}), 400
+    with _params_lock:
+        _LAST_RESULTS = body
+    return jsonify({"ok": True, "datasets": list((body.get("datasets") or {}).keys())})
 
 
 _COLLECT_META_KEYS = {
@@ -688,7 +714,8 @@ def main() -> None:
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
-    print(f"Collect:  POST/GET http://{HOST}:{PORT}/api/collect", flush=True)
+    print(f"Collect:  POST/GET http://{HOST}:{PORT}/api/collect  (структура+SQL)", flush=True)
+    print(f"Results:  GET  http://{HOST}:{PORT}/api/results   (посчитанные datasets после Submit)", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
     if OPEN_BROWSER:
         try:
