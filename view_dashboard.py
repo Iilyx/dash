@@ -22,6 +22,7 @@ Docs / samples:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -134,6 +135,11 @@ _INTERACTIONS_MAX = 50
 
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
 _DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
+
+# Последний полный снимок с клиента: PNG (как на экране) + datasets/params.
+_LAST_FILLED: dict[str, Any] | None = None
+_FILLED_DIR = ROOT / "data" / "filled"
+_FILLED_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _public_query_params() -> dict[str, str]:
@@ -296,6 +302,15 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
+        # нужен для dashDownloadFilled() — без зелёных кнопок
+        if "window.__dashViewer" not in html:
+            html = html.replace(
+                "viewer.renderHtml('viewerContent');",
+                "viewer.renderHtml('viewerContent');\n"
+                "window.__dashViewer = viewer;\n"
+                "if (viewer.report) window.__dashReport = viewer.report;\n",
+                1,
+            )
         try:
             ver = int((ROOT / "dash_debug.js").stat().st_mtime)
         except OSError:
@@ -306,7 +321,7 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-            resp.set_data(html)
+        resp.set_data(html)
     return resp
 
 
@@ -396,6 +411,64 @@ def clear_params():
     return jsonify({"ok": True, "params": {}})
 
 
+@app.post("/api/filled")
+def post_filled():
+    """Клиент шлёт готовый снимок: то, что видно (png) + datasets/params."""
+    global _LAST_FILLED
+    body = request.get_json(silent=True) if request.is_json else None
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "json body required"}), 400
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    meta = {
+        "ts": ts,
+        "params": body.get("params") if isinstance(body.get("params"), dict) else {},
+        "datasets": body.get("datasets") if isinstance(body.get("datasets"), dict) else {},
+        "page": body.get("page"),
+        "pages_count": body.get("pages_count"),
+    }
+    png_b64 = body.get("png_base64")
+    png_name = None
+    if isinstance(png_b64, str) and png_b64:
+        raw = png_b64.split(",", 1)[-1]
+        try:
+            png_bytes = base64.b64decode(raw)
+            png_name = f"filled-{ts}.png"
+            (_FILLED_DIR / png_name).write_bytes(png_bytes)
+            meta["png"] = png_name
+            meta["png_bytes"] = len(png_bytes)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"bad png: {exc}"}), 400
+    json_name = f"filled-{ts}.json"
+    (_FILLED_DIR / json_name).write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    meta["json"] = json_name
+    with _params_lock:
+        _LAST_FILLED = meta
+    return jsonify({"ok": True, "filled": meta})
+
+
+@app.get("/api/filled")
+def get_filled():
+    with _params_lock:
+        if _LAST_FILLED is None:
+            return jsonify({"ok": False, "error": "no snapshot yet"}), 404
+        return jsonify({"ok": True, "filled": _LAST_FILLED})
+
+
+@app.get("/api/filled.png")
+def get_filled_png():
+    with _params_lock:
+        meta = _LAST_FILLED
+    if not meta or not meta.get("png"):
+        return jsonify({"ok": False, "error": "no png yet"}), 404
+    path = _FILLED_DIR / str(meta["png"])
+    if not path.is_file():
+        return jsonify({"ok": False, "error": "png missing on disk"}), 404
+    return Response(path.read_bytes(), mimetype="image/png")
+
+
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
     """Отдаём .mrt; пустой DashboardViewerSettings=0 прячет Export на dashboard."""
@@ -461,6 +534,7 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
+    print(f"Filled:   Ctrl+Shift+S в viewer → GET /api/filled (+ /api/filled.png)", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")

@@ -60,6 +60,18 @@ curl -s http://127.0.0.1:8040/api/params
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
 
+### Готовая страница «как на экране»
+
+После рендера (таблицы, кнопки, графики) в viewer:
+
+- **Ctrl+Shift+S** — скачает PNG + JSON (`datasets` + `params`) и положит копию в `data/filled/`
+- или в консоли: `await dashDownloadFilled()`
+
+```bash
+curl -s http://127.0.0.1:8040/api/filled      # метаданные последнего снимка
+curl -s http://127.0.0.1:8040/api/filled.png  -o filled.png
+```
+
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 
 ```bash
