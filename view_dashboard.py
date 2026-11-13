@@ -46,9 +46,16 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums.StiInterfaceType import StiInterfaceType
 from stimulsoft_reports.viewer.enums.StiParametersPanelPosition import (
     StiParametersPanelPosition,
 )
+from stimulsoft_reports.viewer.options.StiAppearanceOptions import StiAppearanceOptions
+
+# В JS: multi-column только если vars > minParametersCountForMultiColumns (дефолт 5).
+# В Python-классе поля нет — без патча getHtml его не отдаст.
+if not hasattr(StiAppearanceOptions, "minParametersCountForMultiColumns"):
+    StiAppearanceOptions.minParametersCountForMultiColumns = 5
 
 ROOT = Path(__file__).resolve().parent
 
@@ -111,6 +118,8 @@ FILTERS_PANEL_POSITION = (
     else StiParametersPanelPosition.TOP
 )
 FILTERS_COLUMNS = int(os.environ.get("FILTERS_COLUMNS", "8") or "8")
+# 1 = всегда раскладывать по колонкам (иначе при ≤5 фильтрах Stimulsoft держит 1 столбец)
+FILTERS_MIN_FOR_MULTI = int(os.environ.get("FILTERS_MIN_FOR_MULTI", "1") or "1")
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -334,10 +343,14 @@ def remember_interaction(dump: Any) -> None:
 
 def wire_viewer(viewer: StiViewer) -> None:
     apply_license(viewer)
-    viewer.options.appearance.fullScreenMode = True
-    # фильтры/параметры — сверху в строку (не слева столбцом)
-    viewer.options.appearance.parametersPanelPosition = FILTERS_PANEL_POSITION
-    viewer.options.appearance.parametersPanelColumnsCount = max(1, FILTERS_COLUMNS)
+    appearance = viewer.options.appearance
+    appearance.fullScreenMode = True
+    # Mobile/Auto иначе форсит Left + 1 колонку
+    appearance.interfaceType = StiInterfaceType.MOUSE
+    # фильтры сверху в строку (не слева столбцом)
+    appearance.parametersPanelPosition = FILTERS_PANEL_POSITION
+    appearance.parametersPanelColumnsCount = max(1, FILTERS_COLUMNS)
+    appearance.minParametersCountForMultiColumns = max(1, FILTERS_MIN_FOR_MULTI)
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
