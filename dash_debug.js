@@ -140,44 +140,163 @@
     return null;
   }
 
-  function exportPdf() {
-    var js = getViewerJs();
-    if (!js) {
-      alert("Дождитесь загрузки дашборда и нажмите PDF ещё раз");
-      return;
-    }
+  function getReport() {
+    var viewer = window.__dashViewer;
+    if (viewer && viewer.report) return viewer.report;
+    if (window.__dashReport) return window.__dashReport;
+    return null;
+  }
+
+  function dashExportSettings(format) {
+    var S = window.Stimulsoft;
+    var Pack =
+      S && S.Dashboard && S.Dashboard.Export && S.Dashboard.Export.Settings
+        ? S.Dashboard.Export.Settings
+        : null;
+    var settings = null;
     try {
-      // 4-й аргумент true = ExportDashboard (не report)
-      var settings =
-        typeof js.getDefaultExportSettings === "function"
-          ? js.getDefaultExportSettings("Pdf")
-          : {};
-      if (js.options && js.options.exports && js.options.exports.showExportDialog && js.controls && js.controls.forms && js.controls.forms.exportForm) {
-        js.controls.forms.exportForm.show(
-          "Pdf",
-          js.options.actions.exportReport,
-          "Adobe PDF"
-        );
-      } else if (typeof js.postExport === "function") {
-        js.postExport("Pdf", settings, null, true);
-      } else {
-        alert("Stimulsoft export API недоступен");
+      if (format === "Pdf" && Pack && Pack.StiPdfDashboardExportSettings) {
+        settings = new Pack.StiPdfDashboardExportSettings();
+      } else if (format === "Excel" && Pack && Pack.StiExcelDashboardExportSettings) {
+        settings = new Pack.StiExcelDashboardExportSettings();
       }
     } catch (e) {
+      settings = null;
+    }
+    if (settings) {
+      if (S.Report && S.Report.Components && S.Report.Components.StiPageOrientation) {
+        settings.orientation = S.Report.Components.StiPageOrientation.Landscape;
+      }
+      if (
+        format === "Pdf" &&
+        S.System &&
+        S.System.Drawing &&
+        S.System.Drawing.Printing &&
+        S.System.Drawing.Printing.PaperKind
+      ) {
+        // A3 — меньше сжимает широкий dashboard, чем A4
+        settings.paperSize = S.System.Drawing.Printing.PaperKind.A3;
+      }
+      // Для таблиц: false даёт разворот по страницам там, где Stimulsoft это умеет.
+      // (для целого dashboard layout движок всё равно часто форсит single page)
+      settings.renderSinglePage = false;
+      if ("imageQuality" in settings) settings.imageQuality = 200;
+      if ("openAfterExport" in settings) settings.openAfterExport = false;
+      return settings;
+    }
+    return {
+      Orientation: "Landscape",
+      PaperSize: format === "Pdf" ? "A3" : "A4",
+      RenderSinglePage: false,
+      ImageQuality: 200,
+      OpenAfterExport: false,
+    };
+  }
+
+  function saveBlob(data, name, mime) {
+    if (
+      window.Stimulsoft &&
+      window.Stimulsoft.System &&
+      window.Stimulsoft.System.StiObject &&
+      window.Stimulsoft.System.StiObject.saveAs
+    ) {
+      window.Stimulsoft.System.StiObject.saveAs(data, name, mime);
+      return;
+    }
+    var blob = new Blob([data], { type: mime });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(function () {
+      URL.revokeObjectURL(a.href);
+    }, 2000);
+  }
+
+  function exportDashboard(format) {
+    var isPdf = format === "Pdf";
+    var btnId = isPdf ? "dash-export-pdf" : "dash-export-excel";
+    var btn = document.getElementById(btnId);
+    var label = isPdf ? "Скачать PDF" : "Скачать Excel";
+    var report = getReport();
+    var js = getViewerJs();
+    if (!report && !js) {
+      alert("Дождитесь загрузки дашборда");
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = isPdf ? "PDF…" : "Excel…";
+    }
+    var settings = dashExportSettings(format);
+    var done = function () {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+    };
+    var mime = isPdf
+      ? "application/pdf"
+      : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    var ext = isPdf ? ".pdf" : ".xlsx";
+
+    try {
+      if (
+        report &&
+        typeof report.exportDocumentAsync2 === "function" &&
+        window.Stimulsoft &&
+        window.Stimulsoft.Report &&
+        window.Stimulsoft.Report.StiExportFormat
+      ) {
+        var fmt = isPdf
+          ? window.Stimulsoft.Report.StiExportFormat.Pdf
+          : window.Stimulsoft.Report.StiExportFormat.Excel ||
+            window.Stimulsoft.Report.StiExportFormat.Excel2007;
+        // exportDocument по report уже проходит все dashboard-страницы
+        report
+          .exportDocumentAsync2(fmt, null, settings)
+          .then(function (data) {
+            var name =
+              (report.reportAlias || report.reportName || "dashboard") + ext;
+            saveBlob(data, name, mime);
+            done();
+          })
+          .catch(function (e) {
+            if (window.console && console.error) console.error(e);
+            if (js && typeof js.postExport === "function") {
+              js.postExport(format, settings, null, true);
+              done();
+            } else {
+              alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
+              done();
+            }
+          });
+        return;
+      }
+      if (js && typeof js.postExport === "function") {
+        js.postExport(format, settings, null, true);
+        done();
+        return;
+      }
+      alert("Stimulsoft export API недоступен");
+      done();
+    } catch (e) {
       if (window.console && console.error) console.error(e);
-      alert("Ошибка экспорта PDF: " + (e && e.message ? e.message : e));
+      alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
+      done();
     }
   }
 
-  function ensurePdfButton() {
-    if (document.getElementById("dash-export-pdf")) return;
+  function makeExportButton(id, text, topPx, onClick, title) {
+    if (document.getElementById(id)) return;
     var btn = document.createElement("button");
-    btn.id = "dash-export-pdf";
+    btn.id = id;
     btn.type = "button";
-    btn.textContent = "Скачать PDF";
+    btn.textContent = text;
+    btn.title = title || "";
     btn.style.cssText = [
       "position:fixed",
-      "top:12px",
+      "top:" + topPx + "px",
       "right:12px",
       "z-index:2147483647",
       "padding:10px 16px",
@@ -189,8 +308,29 @@
       "box-shadow:0 6px 20px rgba(0,0,0,.25)",
       "cursor:pointer",
     ].join(";");
-    btn.onclick = exportPdf;
+    btn.onclick = onClick;
     document.body.appendChild(btn);
+  }
+
+  function ensurePdfButton() {
+    makeExportButton(
+      "dash-export-pdf",
+      "Скачать PDF",
+      12,
+      function () {
+        exportDashboard("Pdf");
+      },
+      "Все страницы → один PDF (A3). Таблицы в PDF — снимок как на экране, не все строки."
+    );
+    makeExportButton(
+      "dash-export-excel",
+      "Скачать Excel",
+      56,
+      function () {
+        exportDashboard("Excel");
+      },
+      "Excel обычно вытягивает таблицы полнее, чем PDF."
+    );
   }
 
   function ensurePanel() {
