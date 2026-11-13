@@ -60,6 +60,16 @@ curl -s http://127.0.0.1:8040/api/params
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
 
+Готовая страница (тексты, кнопки, datasets) после Submit в viewer:
+
+```bash
+# 1) открыть viewer, выставить фильтры, нажать Submit
+# 2) снять снимок
+curl -s http://127.0.0.1:8040/api/runtime | jq .
+```
+
+Submit / Variables / фильтры сами шлют `POST /api/runtime`. Вручную: кнопка **runtime** в debug-панели или `await dashPushRuntime()` в консоли.
+
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 
 ```bash

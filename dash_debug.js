@@ -1,4 +1,4 @@
-/* Viewer interaction dump: click → overlay + POST /api/params */
+/* Interaction dump + runtime snapshot (Submit → POST /api/runtime → GET) */
 (function () {
   var ACTIONS = [
     "InitVars",
@@ -161,7 +161,8 @@
     head.innerHTML =
       '<strong style="color:#86efac">interaction</strong>' +
       '<span id="dash-interaction-action" style="color:#93c5fd"></span>' +
-      '<span style="margin-left:auto;color:#94a3b8">click dashboard</span>' +
+      '<span style="margin-left:auto;color:#94a3b8">Submit→runtime</span>' +
+      '<button type="button" id="dash-runtime-push" style="background:#1f2937;color:#86efac;border:1px solid #475569;padding:2px 8px;cursor:pointer">runtime</button>' +
       '<button type="button" id="dash-interaction-clear" style="background:#1f2937;color:#e2e8f0;border:1px solid #475569;padding:2px 8px;cursor:pointer">clear</button>' +
       '<button type="button" id="dash-interaction-hide" style="background:#1f2937;color:#e2e8f0;border:1px solid #475569;padding:2px 8px;cursor:pointer">hide</button>';
     var pre = document.createElement("pre");
@@ -169,9 +170,9 @@
     pre.style.cssText =
       "margin:0;padding:10px;overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;color:#bbf7d0;";
     pre.textContent =
-      "Кликай по элементам дашборда — сюда придёт полный args.\n\n" +
-      "actions:\n- " +
-      ACTIONS.join("\n- ");
+      "Submit в viewer → runtime уходит на сервер.\n" +
+      "Потом: GET /api/runtime\n\n" +
+      "Или кнопка runtime / await dashPushRuntime()\n";
     el.appendChild(head);
     el.appendChild(pre);
     document.body.appendChild(el);
@@ -181,6 +182,11 @@
     document.getElementById("dash-interaction-clear").onclick = function () {
       pre.textContent = "";
       fetch("/api/params", { method: "DELETE" }).catch(function () {});
+    };
+    document.getElementById("dash-runtime-push").onclick = function () {
+      window.dashPushRuntime("manual").then(function (res) {
+        if (pre) pre.textContent = JSON.stringify(res, null, 2);
+      });
     };
     return el;
   }
@@ -210,9 +216,273 @@
           interaction: dump,
         }),
       }).catch(function () {});
+      // Submit / Variables / фильтры → снять готовую страницу
+      var act = dump.action || "";
+      if (
+        act === "Variables" ||
+        act === "InitVars" ||
+        act === "DashboardFiltering" ||
+        act === "DashboardResetAllFilters"
+      ) {
+        setTimeout(function () {
+          window.dashPushRuntime(act || "interaction").catch(function (err) {
+            if (window.console && console.error) console.error(err);
+          });
+        }, 800);
+      }
     } catch (e) {
       if (window.console && console.error) console.error(e);
     }
+  };
+
+  function getReport() {
+    if (window.__dashViewer && window.__dashViewer.report) {
+      return window.__dashViewer.report;
+    }
+    return window.__dashReport || null;
+  }
+
+  function safeStr(v) {
+    if (v == null) return null;
+    try {
+      return String(v);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function componentList(container) {
+    if (!container) return [];
+    try {
+      if (container.list) return container.list;
+      if (typeof container.toList === "function") return container.toList();
+      if (container.count != null && container.getByIndex) {
+        var arr = [];
+        for (var i = 0; i < container.count; i++) arr.push(container.getByIndex(i));
+        return arr;
+      }
+    } catch (e) {}
+    return [];
+  }
+
+  function walkComponents(comp, out, depth) {
+    if (!comp || depth > 12) return;
+    var ident = "";
+    try {
+      ident =
+        comp.ident ||
+        (comp.GetType && String(comp.GetType())) ||
+        (comp.constructor && comp.constructor.name) ||
+        "";
+    } catch (e) {
+      ident = "";
+    }
+    var name = safeStr(comp.name) || safeStr(comp.alias) || "";
+    var item = { name: name, type: safeStr(ident) || "unknown" };
+    try {
+      if (comp.text != null) item.text = safeStr(comp.text);
+      if (comp.textValue != null) item.textValue = safeStr(comp.textValue);
+      if (comp.title != null) {
+        var t = comp.title;
+        item.title =
+          typeof t === "object" && t && t.text != null
+            ? safeStr(t.text)
+            : safeStr(t);
+      }
+      if (comp.tooltip != null) item.tooltip = safeStr(comp.tooltip);
+    } catch (e2) {}
+
+    var typeStr = String(item.type || "");
+    var isButton =
+      /Button/i.test(typeStr) ||
+      /Button/i.test(name) ||
+      (comp.onClick != null && /Dashboard/i.test(typeStr));
+    var isText =
+      /Text/i.test(typeStr) ||
+      item.text != null ||
+      item.textValue != null;
+
+    if (isButton) {
+      item.role = "button";
+      out.buttons.push(item);
+    }
+    if (isText && (item.text || item.textValue || item.title)) {
+      item.role = item.role || "text";
+      out.texts.push(item);
+    }
+    out.elements.push(item);
+
+    var nested = componentList(comp.components);
+    for (var i = 0; i < nested.length; i++) {
+      walkComponents(nested[i], out, depth + 1);
+    }
+  }
+
+  function collectElements(report) {
+    var out = { elements: [], texts: [], buttons: [] };
+    if (!report || !report.pages) return out;
+    var pages = componentList(report.pages);
+    // pages may be indexed collection
+    if (!pages.length && report.pages.count != null) {
+      pages = componentList(report.pages);
+    }
+    for (var p = 0; p < pages.length; p++) {
+      var page = pages[p];
+      if (!page) continue;
+      walkComponents(page, out, 0);
+      var comps = componentList(page.components);
+      for (var c = 0; c < comps.length; c++) {
+        walkComponents(comps[c], out, 0);
+      }
+    }
+    return out;
+  }
+
+  function cellValue(row, colIndex) {
+    try {
+      if (row && typeof row.getValue === "function") return row.getValue(colIndex);
+      if (row && row.values) return row.values[colIndex];
+      if (Array.isArray(row)) return row[colIndex];
+    } catch (e) {}
+    return null;
+  }
+
+  function collectDatasets(rowLimit) {
+    rowLimit = rowLimit || 2000;
+    var report = getReport();
+    var out = {};
+    if (!report || !report.dictionary || !report.dictionary.dataSources) return out;
+    var sources = report.dictionary.dataSources;
+    var list = componentList(sources);
+    list.forEach(function (ds) {
+      if (!ds) return;
+      var name = ds.name || ds.alias || "source";
+      var columns = [];
+      try {
+        var cols = componentList(ds.columns);
+        for (var c = 0; c < cols.length; c++) {
+          columns.push(cols[c].name || cols[c].alias || String(c));
+        }
+      } catch (e) {}
+      try {
+        var count =
+          ds.count != null
+            ? ds.count
+            : ds.dataTable && ds.dataTable.rows
+              ? ds.dataTable.rows.count
+              : 0;
+        var n = Math.min(count, rowLimit);
+        var rows = [];
+        for (var r = 0; r < n; r++) {
+          var rowObj = {};
+          var row =
+            typeof ds.getDataRow === "function"
+              ? ds.getDataRow(r)
+              : ds.dataTable &&
+                  ds.dataTable.rows &&
+                  ds.dataTable.rows.getByIndex
+                ? ds.dataTable.rows.getByIndex(r)
+                : null;
+          for (var ci = 0; ci < columns.length; ci++) {
+            rowObj[columns[ci]] = cellValue(row, ci);
+          }
+          rows.push(rowObj);
+        }
+        out[name] = { columns: columns, rowcount: count, rows: rows };
+      } catch (e2) {
+        out[name] = { columns: columns, error: String(e2) };
+      }
+    });
+    return out;
+  }
+
+  /** Видимый текст с экрана (fallback для Text / подписей). */
+  function scrapeDomTexts() {
+    var root =
+      document.getElementById("viewerContent") ||
+      document.querySelector("[id$='Content']");
+    if (!root) return [];
+    var nodes = root.querySelectorAll(
+      "span, div, p, label, td, th, button, a, h1, h2, h3, h4"
+    );
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < nodes.length && out.length < 400; i++) {
+      var el = nodes[i];
+      if (!el || el.children.length > 3) continue;
+      var t = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!t || t.length < 1 || t.length > 200) continue;
+      if (seen[t]) continue;
+      seen[t] = 1;
+      out.push({
+        text: t,
+        tag: el.tagName.toLowerCase(),
+        className: el.className ? String(el.className).slice(0, 80) : "",
+      });
+    }
+    return out;
+  }
+
+  window.dashCollectRuntime = function (trigger) {
+    var report = getReport();
+    var parts = collectElements(report);
+    var snap = {
+      trigger: trigger || "manual",
+      params: {},
+      elements: parts.elements,
+      texts: parts.texts,
+      buttons: parts.buttons,
+      datasets: collectDatasets(2000),
+      dom_texts: scrapeDomTexts(),
+      page: null,
+      pages_count: null,
+    };
+    try {
+      if (report && report.pages) {
+        snap.pages_count = report.pages.count;
+        snap.page = report.currentPage != null ? report.currentPage : 0;
+      }
+    } catch (e) {}
+    return fetch("/api/params")
+      .then(function (r) {
+        return r.json();
+      })
+      .catch(function () {
+        return {};
+      })
+      .then(function (p) {
+        if (p && p.params) snap.params = p.params;
+        // variables с report
+        try {
+          if (report && report.dictionary && report.dictionary.variables) {
+            var vars = componentList(report.dictionary.variables);
+            vars.forEach(function (v) {
+              if (v && v.name != null) {
+                snap.params[v.name] =
+                  v.value != null ? v.value : snap.params[v.name];
+              }
+            });
+          }
+        } catch (e2) {}
+        return snap;
+      });
+  };
+
+  window.dashPushRuntime = function (trigger) {
+    return window.dashCollectRuntime(trigger).then(function (snap) {
+      return fetch("/api/runtime", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snap),
+      }).then(function (r) {
+        return r.json().then(function (data) {
+          if (window.console && console.log) {
+            console.log("[dash runtime]", data);
+          }
+          return data;
+        });
+      });
+    });
   };
 
   if (document.readyState === "loading") {

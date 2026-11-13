@@ -13,7 +13,8 @@ Docs / samples:
   POST /api/params  {"Region":"West","Visits":5}
   GET  /api/params
   GET  /viewer?Region=West   (query → переменные mrt)
-  клики/фильтры на дашборде → POST /api/params (onInteraction)
+  клики/фильтры → POST /api/params (onInteraction)
+  Submit → клиент шлёт runtime (тексты/кнопки/datasets) → GET /api/runtime
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -134,6 +135,9 @@ _INTERACTIONS_MAX = 50
 
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
 _DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
+
+# Последний runtime-снимок с клиента (после Submit): texts / buttons / datasets.
+_LAST_RUNTIME: dict[str, Any] | None = None
 
 
 def _public_query_params() -> dict[str, str]:
@@ -296,6 +300,14 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
+        if "window.__dashViewer" not in html:
+            html = html.replace(
+                "viewer.renderHtml('viewerContent');",
+                "viewer.renderHtml('viewerContent');\n"
+                "window.__dashViewer = viewer;\n"
+                "if (viewer.report) window.__dashReport = viewer.report;\n",
+                1,
+            )
         try:
             ver = int((ROOT / "dash_debug.js").stat().st_mtime)
         except OSError:
@@ -306,7 +318,7 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-            resp.set_data(html)
+        resp.set_data(html)
     return resp
 
 
@@ -388,12 +400,58 @@ def post_params():
 
 @app.delete("/api/params")
 def clear_params():
-    global _LAST_INTERACTION
+    global _LAST_INTERACTION, _LAST_RUNTIME
     with _params_lock:
         _PARAMS.clear()
         _LAST_INTERACTION = None
         _INTERACTIONS.clear()
+        _LAST_RUNTIME = None
     return jsonify({"ok": True, "params": {}})
+
+
+@app.post("/api/runtime")
+def post_runtime():
+    """Клиент после Submit шлёт уже посчитанное: texts, buttons, datasets, params."""
+    global _LAST_RUNTIME
+    body = request.get_json(silent=True) if request.is_json else None
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "json body required"}), 400
+    snap = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "params": body.get("params") if isinstance(body.get("params"), dict) else {},
+        "elements": body.get("elements") if isinstance(body.get("elements"), list) else [],
+        "texts": body.get("texts") if isinstance(body.get("texts"), list) else [],
+        "buttons": body.get("buttons") if isinstance(body.get("buttons"), list) else [],
+        "datasets": body.get("datasets") if isinstance(body.get("datasets"), dict) else {},
+        "dom_texts": body.get("dom_texts") if isinstance(body.get("dom_texts"), list) else [],
+        "page": body.get("page"),
+        "pages_count": body.get("pages_count"),
+        "trigger": body.get("trigger"),
+    }
+    if snap["params"]:
+        params_update(snap["params"])
+    with _params_lock:
+        _LAST_RUNTIME = snap
+    print(
+        f"[runtime] trigger={snap.get('trigger')!r} "
+        f"texts={len(snap['texts'])} buttons={len(snap['buttons'])} "
+        f"datasets={len(snap['datasets'])}",
+        flush=True,
+    )
+    return jsonify({"ok": True, "runtime": snap})
+
+
+@app.get("/api/runtime")
+def get_runtime():
+    with _params_lock:
+        if _LAST_RUNTIME is None:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "no runtime yet — открой /viewer, Submit, потом снова GET",
+                }
+            ), 404
+        return jsonify({"ok": True, "runtime": _LAST_RUNTIME})
 
 
 @app.route("/mrt", methods=["GET", "POST"])
@@ -461,12 +519,13 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
+    print(f"Runtime:  Submit в viewer → GET http://{HOST}:{PORT}/api/runtime", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
         except Exception:
             pass
-    app.run(host=HOST, port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
