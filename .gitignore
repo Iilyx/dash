@@ -6,6 +6,16 @@ node_modules/
 .DS_Store
 
 # generated / local
-_converted.mrt
+catalog.json
+catalog_pages/
+ask_trace.txt
+sql_filled.txt
+sql_trace.txt
+sql_trace.json
+sql_trace*.json
+sql_trace*.txt
+page.txt
+data/
+init/
 *.error.txt
 *.ipynb
