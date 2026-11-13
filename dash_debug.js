@@ -194,73 +194,6 @@
     if (pre) pre.textContent = JSON.stringify(dump, null, 2);
   }
 
-  function setStatus(text) {
-    ensurePanel();
-    var actionEl = document.getElementById("dash-interaction-action");
-    if (actionEl) actionEl.textContent = text;
-  }
-
-  function cleanParams(params) {
-    var out = {};
-    Object.keys(params || {}).forEach(function (k) {
-      if (k === "__action" || k.indexOf("filteringParameters") === 0) return;
-      out[k] = params[k];
-    });
-    return out;
-  }
-
-  function downloadJson(filename, data) {
-    var blob = new Blob([JSON.stringify(data, null, 2)], {
-      type: "application/json;charset=utf-8",
-    });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () {
-      URL.revokeObjectURL(url);
-    }, 1000);
-  }
-
-  function collectAndDownload(params) {
-    setStatus("collect…");
-    var body = {
-      params: cleanParams(params),
-      row_limit: 200,
-      run_sql: true,
-      include_lazy: false,
-    };
-    return fetch("/api/collect", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    })
-      .then(function (r) {
-        return r.json().then(function (data) {
-          if (!r.ok || data.ok === false) {
-            throw new Error((data && data.error) || r.statusText || "collect failed");
-          }
-          return data;
-        });
-      })
-      .then(function (data) {
-        var stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        downloadJson("dashboard-collect-" + stamp + ".json", data);
-        setStatus("downloaded");
-        if (window.console && console.log) {
-          console.log("[dash collect]", data);
-        }
-      })
-      .catch(function (err) {
-        setStatus("collect error");
-        if (window.console && console.error) console.error(err);
-        alert("Collect failed: " + (err && err.message ? err.message : err));
-      });
-  }
-
   window.dashCaptureInteraction = function (args) {
     try {
       var dump = dumpArgs(args);
@@ -273,15 +206,10 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          params: cleanParams(params),
+          params: params,
           interaction: dump,
         }),
       }).catch(function () {});
-
-      // Submit на панели параметров → скачать полный снимок
-      if (args && args.action === "Variables") {
-        collectAndDownload(params);
-      }
     } catch (e) {
       if (window.console && console.error) console.error(e);
     }
