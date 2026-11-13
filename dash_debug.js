@@ -194,48 +194,11 @@
     if (pre) pre.textContent = JSON.stringify(dump, null, 2);
   }
 
-  function layoutParamsPanel() {
-    var W =
-      (window.DASH_FILTERS && window.DASH_FILTERS.width) || 320;
-    var panel =
-      document.querySelector(".stiJsViewerParametersPanel") ||
-      document.querySelector("[id$='_ParametersPanel']");
-    if (!panel) return;
-    try {
-      var js = panel.jsObject || (panel.container && panel.container.jsObject);
-      if (js && js.options) js.options.currentParameterWidth = W;
-    } catch (e) {}
-    var container =
-      panel.querySelector(".stiJsViewerInnerContainerParametersPanel") ||
-      panel;
-    var buttons = panel.querySelector("table[id$='MainButtons']");
-    if (buttons) {
-      if (buttons.parentElement !== container) container.appendChild(buttons);
-      buttons.setAttribute("align", "right");
-      buttons.style.setProperty("float", "right", "important");
-      buttons.style.setProperty("margin-left", "auto", "important");
-      buttons.style.setProperty("margin-right", "12px", "important");
-    }
-    var nodes = panel.querySelectorAll("input, select, textarea");
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      if (el.type === "hidden" || el.type === "checkbox" || el.type === "radio") {
-        continue;
-      }
-      el.style.setProperty("width", W + "px", "important");
-      el.style.setProperty("min-width", W + "px", "important");
-      el.style.setProperty("height", "34px", "important");
-      el.style.setProperty("font-size", "14px", "important");
-    }
-    document.documentElement.setAttribute("data-dash-filters-layout", "1");
-  }
-
   window.dashCaptureInteraction = function (args) {
     try {
       var dump = dumpArgs(args);
       var params = flattenParams(args);
       showDump(dump);
-      layoutParamsPanel();
       if (window.console && console.log) {
         console.log("[dash interaction]", dump.action, dump);
       }
@@ -252,23 +215,9 @@
     }
   };
 
-  function bootLayout() {
-    ensurePanel();
-    layoutParamsPanel();
-    var timer = null;
-    var obs = new MutationObserver(function () {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(layoutParamsPanel, 50);
-    });
-    obs.observe(document.body, { childList: true, subtree: true });
-    setTimeout(layoutParamsPanel, 400);
-    setTimeout(layoutParamsPanel, 1200);
-    setTimeout(layoutParamsPanel, 3000);
-  }
-
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", bootLayout);
+    document.addEventListener("DOMContentLoaded", ensurePanel);
   } else {
-    bootLayout();
+    ensurePanel();
   }
 })();

@@ -46,16 +46,6 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
 from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
-from stimulsoft_reports.viewer.enums.StiInterfaceType import StiInterfaceType
-from stimulsoft_reports.viewer.enums.StiParametersPanelPosition import (
-    StiParametersPanelPosition,
-)
-from stimulsoft_reports.viewer.options.StiAppearanceOptions import StiAppearanceOptions
-
-# В JS: multi-column только если vars > minParametersCountForMultiColumns (дефолт 5).
-# В Python-классе поля нет — без патча getHtml его не отдаст.
-if not hasattr(StiAppearanceOptions, "minParametersCountForMultiColumns"):
-    StiAppearanceOptions.minParametersCountForMultiColumns = 5
 
 ROOT = Path(__file__).resolve().parent
 
@@ -110,18 +100,6 @@ if not MRT_PATH.is_file():
 HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
-# Панель параметров/фильтров: top = в строку, left = столбцом.
-_FILTERS_POS = os.environ.get("FILTERS_PANEL", "top").strip().lower() or "top"
-FILTERS_PANEL_POSITION = (
-    StiParametersPanelPosition.LEFT
-    if _FILTERS_POS == "left"
-    else StiParametersPanelPosition.TOP
-)
-FILTERS_COLUMNS = int(os.environ.get("FILTERS_COLUMNS", "8") or "8")
-# 1 = всегда раскладывать по колонкам (иначе при ≤5 фильтрах Stimulsoft держит 1 столбец)
-FILTERS_MIN_FOR_MULTI = int(os.environ.get("FILTERS_MIN_FOR_MULTI", "1") or "1")
-# ширина полей параметров в .mrt (px); дефолт Stimulsoft ~230
-FILTERS_FIELD_WIDTH = int(os.environ.get("FILTERS_FIELD_WIDTH", "320") or "320")
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -310,83 +288,6 @@ def sti_process(component) -> bool:
     return handled
 
 
-def _viewer_layout_tags() -> str:
-    """Inline CSS/JS + cache-bust: внешний dash-debug.js часто остаётся в кэше браузера."""
-    width = max(120, FILTERS_FIELD_WIDTH)
-    # версия от mtime, чтобы после pull сразу новый файл
-    try:
-        ver = int((ROOT / "dash_debug.js").stat().st_mtime)
-    except OSError:
-        ver = 1
-    return f"""
-<style id="dash-params-layout-css">
-#viewer_ParametersPanel table[id$="MainButtons"],
-.stiJsViewerParametersPanel table[id$="MainButtons"] {{
-  margin-left: auto !important;
-  margin-right: 12px !important;
-  float: right !important;
-}}
-.stiJsViewerParametersPanel input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]),
-.stiJsViewerParametersPanel select,
-.stiJsViewerParametersPanel textarea,
-.stiJsViewerParametersPanel .stiJsViewerTextBox,
-.stiJsViewerParametersPanel .stiJsViewerTextBoxDefault {{
-  min-width: {width}px !important;
-  width: {width}px !important;
-  height: 34px !important;
-  font-size: 14px !important;
-  box-sizing: border-box !important;
-}}
-.stiJsViewerParametersPanel .stiJsViewerFormButton,
-.stiJsViewerParametersPanel .stiJsViewerFormButtonDefault {{
-  min-height: 34px !important;
-  min-width: 96px !important;
-}}
-</style>
-<script>
-window.DASH_FILTERS = {{ width: {width}, panel: {FILTERS_PANEL_POSITION!r}, columns: {FILTERS_COLUMNS} }};
-(function(){{
-  var W = {width};
-  function apply(){{
-    var panel = document.querySelector(".stiJsViewerParametersPanel") ||
-                document.querySelector("[id$='_ParametersPanel']");
-    if (!panel) return false;
-    try {{
-      var js = panel.jsObject || (panel.container && panel.container.jsObject);
-      if (js && js.options) js.options.currentParameterWidth = W;
-    }} catch (e) {{}}
-    var container = panel.querySelector(".stiJsViewerInnerContainerParametersPanel") || panel;
-    var buttons = panel.querySelector("table[id$='MainButtons']");
-    if (buttons) {{
-      if (buttons.parentElement !== container) container.appendChild(buttons);
-      buttons.setAttribute("align", "right");
-      buttons.style.setProperty("float", "right", "important");
-      buttons.style.setProperty("margin-left", "auto", "important");
-    }}
-    panel.querySelectorAll("input, select, textarea").forEach(function(el){{
-      if (el.type === "hidden" || el.type === "checkbox" || el.type === "radio") return;
-      el.style.setProperty("width", W + "px", "important");
-      el.style.setProperty("min-width", W + "px", "important");
-      el.style.setProperty("height", "34px", "important");
-      el.style.setProperty("font-size", "14px", "important");
-    }});
-    document.documentElement.setAttribute("data-dash-filters-layout", "1");
-    return true;
-  }}
-  var n = 0;
-  var t = setInterval(function(){{
-    apply();
-    if (++n > 40) clearInterval(t);
-  }}, 250);
-  document.addEventListener("DOMContentLoaded", apply);
-  setTimeout(apply, 800);
-  setTimeout(apply, 2000);
-}})();
-</script>
-<script src="/dash-debug.js?v={ver}"></script>
-"""
-
-
 def sti_response(component, inject_debug: bool = False):
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.passQueryParametersToReport = True
@@ -395,12 +296,16 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
-        if "data-dash-filters-layout" not in html and "DASH_FILTERS" not in html:
-            tags = _viewer_layout_tags()
+        try:
+            ver = int((ROOT / "dash_debug.js").stat().st_mtime)
+        except OSError:
+            ver = 1
+        tag = f'<script src="/dash-debug.js?v={ver}"></script>\n'
+        if "dash-debug.js" not in html:
             if "</head>" in html:
-                html = html.replace("</head>", tags + "</head>", 1)
+                html = html.replace("</head>", tag + "</head>", 1)
             else:
-                html = tags + html
+                html = tag + html
             resp.set_data(html)
     return resp
 
@@ -422,14 +327,7 @@ def remember_interaction(dump: Any) -> None:
 
 def wire_viewer(viewer: StiViewer) -> None:
     apply_license(viewer)
-    appearance = viewer.options.appearance
-    appearance.fullScreenMode = True
-    # Mobile/Auto иначе форсит Left + 1 колонку
-    appearance.interfaceType = StiInterfaceType.MOUSE
-    # фильтры сверху в строку (не слева столбцом)
-    appearance.parametersPanelPosition = FILTERS_PANEL_POSITION
-    appearance.parametersPanelColumnsCount = max(1, FILTERS_COLUMNS)
-    appearance.minParametersCountForMultiColumns = max(1, FILTERS_MIN_FOR_MULTI)
+    viewer.options.appearance.fullScreenMode = True
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
@@ -498,25 +396,9 @@ def clear_params():
     return jsonify({"ok": True, "params": {}})
 
 
-def patch_mrt_params_layout(raw: str) -> str:
-    """ParameterWidth в .mrt → ширина input; иначе поля остаются ~230px."""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-    if not isinstance(data, dict):
-        return raw
-    width = max(120, FILTERS_FIELD_WIDTH)
-    # Stimulsoft читает report.parameterWidth (число); в JSON бывает оба ключа
-    data["ParameterWidth"] = width
-    data["parameterWidth"] = width
-    return json.dumps(data, ensure_ascii=False)
-
-
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    raw = patch_mrt_params_layout(raw)
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp

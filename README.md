@@ -57,8 +57,7 @@ open 'http://127.0.0.1:8040/viewer?Region=West'
 curl -s http://127.0.0.1:8040/api/params
 ```
 
-Клики/фильтры на дашборде: на `/viewer` справа внизу панель с полным `args`
-(`action`, `variables`, `filteringParameters`, `sortingParameters`, …).
+Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
 
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
