@@ -296,15 +296,6 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
-        # let viewer = ... недоступен из другого script
-        if "window.__dashViewer" not in html:
-            html = html.replace(
-                "viewer.renderHtml('viewerContent');",
-                "viewer.renderHtml('viewerContent');\n"
-                "window.__dashViewer = viewer;\n"
-                "if (viewer.report) window.__dashReport = viewer.report;\n",
-                1,
-            )
         try:
             ver = int((ROOT / "dash_debug.js").stat().st_mtime)
         except OSError:
@@ -315,7 +306,7 @@ def sti_response(component, inject_debug: bool = False):
                 html = html.replace("</head>", tag + "</head>", 1)
             else:
                 html = tag + html
-        resp.set_data(html)
+            resp.set_data(html)
     return resp
 
 
@@ -337,14 +328,6 @@ def remember_interaction(dump: Any) -> None:
 def wire_viewer(viewer: StiViewer) -> None:
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
-    # Save / PDF явно — иначе на dashboard легко «нет кнопки»
-    viewer.options.toolbar.visible = True
-    viewer.options.toolbar.showSaveButton = True
-    viewer.options.toolbar.showPrintButton = True
-    viewer.options.exports.showExportDialog = True
-    viewer.options.exports.showExportToPdf = True
-    viewer.options.exports.showExportToExcel = True
-    viewer.options.exports.showExportToDocument = True
     viewer.handler.passQueryParametersToReport = True
     viewer.onBeginProcessData += begin_process_data
     viewer.onPrepareVariables += prepare_variables
