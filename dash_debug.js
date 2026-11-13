@@ -225,159 +225,41 @@
     }, 1000);
   }
 
-  // После Submit ждём onEndProcessData (данные уже в report), потом снимаем datasets.
-  window._dashPendingResults = null;
-  var _dashExportTimer = null;
-
-  function getViewerReport() {
-    try {
-      if (typeof viewer !== "undefined" && viewer && viewer.report) return viewer.report;
-    } catch (e) {}
-    return null;
-  }
-
-  function rowValue(row, col, idx) {
-    try {
-      if (row && typeof row.getValue === "function") return row.getValue(col);
-      if (row && typeof row.getByIndex === "function") return row.getByIndex(idx);
-      if (row && row.list) return row.list[idx];
-      if (Array.isArray(row)) return row[idx];
-      if (row && typeof row === "object") return row[col];
-    } catch (e) {}
-    return null;
-  }
-
-  function dumpDataSources(report) {
-    var out = {};
-    try {
-      var sources =
-        report &&
-        report.dictionary &&
-        report.dictionary.dataSources &&
-        report.dictionary.dataSources.list
-          ? report.dictionary.dataSources.list
-          : [];
-      sources.forEach(function (src) {
-        var name = src.name || "unknown";
-        var cols = [];
-        try {
-          var colList =
-            (src.columns && src.columns.list) ||
-            (src.dataTable && src.dataTable.columns && src.dataTable.columns.list) ||
-            [];
-          cols = colList.map(function (c) {
-            return c.name || c.columnName || c.caption || "";
-          }).filter(Boolean);
-        } catch (e) {}
-        var rows = [];
-        try {
-          var table = src.dataTable;
-          var list =
-            table && table.rows && table.rows.list
-              ? table.rows.list
-              : [];
-          list.forEach(function (row) {
-            var obj = {};
-            if (cols.length) {
-              cols.forEach(function (col, idx) {
-                obj[col] = rowValue(row, col, idx);
-              });
-            } else if (row && row.list) {
-              obj = row.list.slice();
-            }
-            rows.push(obj);
-          });
-        } catch (e) {
-          out[name] = { error: String(e), rows: [] };
-          return;
-        }
-        out[name] = { columns: cols, rowcount: rows.length, rows: rows };
-      });
-    } catch (e) {
-      out._error = String(e);
-    }
-    return out;
-  }
-
-  function dumpVariables(report) {
-    var out = {};
-    try {
-      var list =
-        report &&
-        report.dictionary &&
-        report.dictionary.variables &&
-        report.dictionary.variables.list
-          ? report.dictionary.variables.list
-          : [];
-      list.forEach(function (v) {
-        if (!v || !v.name) return;
-        out[v.name] = v.value;
-      });
-    } catch (e) {
-      out._error = String(e);
-    }
-    return out;
-  }
-
-  function buildComputedPayload(report, params) {
-    var payload = {
-      kind: "computed",
-      ok: true,
-      at: new Date().toISOString(),
-      params: cleanParams(params || {}),
-      variables: dumpVariables(report),
-      datasets: dumpDataSources(report),
+  function collectAndDownload(params) {
+    setStatus("collect…");
+    var body = {
+      params: cleanParams(params),
+      row_limit: 200,
+      run_sql: true,
+      include_lazy: false,
     };
-    try {
-      if (report && typeof report.saveDocumentToJsonString === "function") {
-        var doc = report.saveDocumentToJsonString();
-        if (doc) {
-          try {
-            payload.document = JSON.parse(doc);
-          } catch (e) {
-            payload.document_raw = doc;
-          }
-        }
-      }
-    } catch (e) {
-      payload.document_error = String(e);
-    }
-    return payload;
-  }
-
-  function exportComputedResults(params) {
-    setStatus("export…");
-    var report = getViewerReport();
-    if (!report) {
-      setStatus("no report");
-      alert("Нет viewer.report — дождись загрузки дашборда и нажми Submit снова");
-      return;
-    }
-    var payload = buildComputedPayload(report, params);
-    var stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadJson("dashboard-results-" + stamp + ".json", payload);
-    setStatus("downloaded results");
-    if (window.console && console.log) {
-      console.log("[dash results]", payload);
-    }
-    fetch("/api/results", {
+    return fetch("/api/collect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch(function () {});
+      body: JSON.stringify(body),
+    })
+      .then(function (r) {
+        return r.json().then(function (data) {
+          if (!r.ok || data.ok === false) {
+            throw new Error((data && data.error) || r.statusText || "collect failed");
+          }
+          return data;
+        });
+      })
+      .then(function (data) {
+        var stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        downloadJson("dashboard-collect-" + stamp + ".json", data);
+        setStatus("downloaded");
+        if (window.console && console.log) {
+          console.log("[dash collect]", data);
+        }
+      })
+      .catch(function (err) {
+        setStatus("collect error");
+        if (window.console && console.error) console.error(err);
+        alert("Collect failed: " + (err && err.message ? err.message : err));
+      });
   }
-
-  window.dashOnEndProcessData = function () {
-    if (!window._dashPendingResults) return;
-    if (_dashExportTimer) clearTimeout(_dashExportTimer);
-    // несколько sources → несколько EndProcessData; берём последний с паузой
-    _dashExportTimer = setTimeout(function () {
-      var p = window._dashPendingResults;
-      window._dashPendingResults = null;
-      _dashExportTimer = null;
-      exportComputedResults(p);
-    }, 700);
-  };
 
   window.dashCaptureInteraction = function (args) {
     try {
@@ -396,18 +278,9 @@
         }),
       }).catch(function () {});
 
-      // Submit → ждём загрузку данных, потом снимаем УЖЕ ПОСЧИТАННЫЕ datasets
+      // Submit на панели параметров → скачать полный снимок
       if (args && args.action === "Variables") {
-        window._dashPendingResults = cleanParams(params);
-        setStatus("waiting data…");
-        // запасной таймер, если EndProcessData не придёт
-        setTimeout(function () {
-          if (window._dashPendingResults) {
-            var p = window._dashPendingResults;
-            window._dashPendingResults = null;
-            exportComputedResults(p);
-          }
-        }, 5000);
+        collectAndDownload(params);
       }
     } catch (e) {
       if (window.console && console.error) console.error(e);
