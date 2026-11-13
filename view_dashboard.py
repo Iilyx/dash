@@ -14,7 +14,7 @@ Docs / samples:
   GET  /api/params
   GET  /viewer?Region=West   (query → переменные mrt)
   клики/фильтры → POST /api/params (onInteraction)
-  Submit → клиент шлёт runtime (тексты/кнопки/datasets) → GET /api/runtime
+  кнопка page в viewer → POST/GET /api/page (texts, buttons, datasets)
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -136,8 +136,8 @@ _INTERACTIONS_MAX = 50
 _STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
 _DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
 
-# Последний runtime-снимок с клиента (после Submit): texts / buttons / datasets.
-_LAST_RUNTIME: dict[str, Any] | None = None
+# Последний снимок с кнопки page: texts / buttons / datasets.
+_LAST_PAGE: dict[str, Any] | None = None
 
 
 def _public_query_params() -> dict[str, str]:
@@ -400,19 +400,19 @@ def post_params():
 
 @app.delete("/api/params")
 def clear_params():
-    global _LAST_INTERACTION, _LAST_RUNTIME
+    global _LAST_INTERACTION, _LAST_PAGE
     with _params_lock:
         _PARAMS.clear()
         _LAST_INTERACTION = None
         _INTERACTIONS.clear()
-        _LAST_RUNTIME = None
+        _LAST_PAGE = None
     return jsonify({"ok": True, "params": {}})
 
 
-@app.post("/api/runtime")
-def post_runtime():
-    """Клиент после Submit шлёт уже посчитанное: texts, buttons, datasets, params."""
-    global _LAST_RUNTIME
+@app.post("/api/page")
+def post_page():
+    """Кнопка page: texts, buttons, datasets, params с отрендеренной страницы."""
+    global _LAST_PAGE
     body = request.get_json(silent=True) if request.is_json else None
     if not isinstance(body, dict):
         return jsonify({"ok": False, "error": "json body required"}), 400
@@ -426,32 +426,30 @@ def post_runtime():
         "dom_texts": body.get("dom_texts") if isinstance(body.get("dom_texts"), list) else [],
         "page": body.get("page"),
         "pages_count": body.get("pages_count"),
-        "trigger": body.get("trigger"),
     }
     if snap["params"]:
         params_update(snap["params"])
     with _params_lock:
-        _LAST_RUNTIME = snap
+        _LAST_PAGE = snap
     print(
-        f"[runtime] trigger={snap.get('trigger')!r} "
-        f"texts={len(snap['texts'])} buttons={len(snap['buttons'])} "
+        f"[page] texts={len(snap['texts'])} buttons={len(snap['buttons'])} "
         f"datasets={len(snap['datasets'])}",
         flush=True,
     )
-    return jsonify({"ok": True, "runtime": snap})
+    return jsonify({"ok": True, "page": snap})
 
 
-@app.get("/api/runtime")
-def get_runtime():
+@app.get("/api/page")
+def get_page():
     with _params_lock:
-        if _LAST_RUNTIME is None:
+        if _LAST_PAGE is None:
             return jsonify(
                 {
                     "ok": False,
-                    "error": "no runtime yet — открой /viewer, Submit, потом снова GET",
+                    "error": "no page yet — нажми page в /viewer, потом снова GET",
                 }
             ), 404
-        return jsonify({"ok": True, "runtime": _LAST_RUNTIME})
+        return jsonify({"ok": True, "page": _LAST_PAGE})
 
 
 @app.route("/mrt", methods=["GET", "POST"])
@@ -519,7 +517,7 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
     print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
-    print(f"Runtime:  Submit в viewer → GET http://{HOST}:{PORT}/api/runtime", flush=True)
+    print(f"Page:     кнопка page → GET http://{HOST}:{PORT}/api/page", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")

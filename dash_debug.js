@@ -1,4 +1,4 @@
-/* Interaction dump + runtime snapshot (Submit → POST /api/runtime → GET) */
+/* Interaction dump + кнопка «page» → POST /api/page → GET /api/page */
 (function () {
   var ACTIONS = [
     "InitVars",
@@ -59,7 +59,6 @@
       }
       out[k] = safeClone(args[k]);
     }
-    // на случай non-enumerable / пропущенных полей из доки
     [
       "event",
       "sender",
@@ -110,7 +109,6 @@
         if (v && typeof v === "object" && "value" in v && !Array.isArray(v)) {
           put(prefix ? prefix + "." + k : k, v.value);
         } else if (v && typeof v === "object" && !Array.isArray(v)) {
-          // плоские поля Stimulsoft (ComponentName, DataBand, …)
           var nestedKeys = Object.keys(v);
           var looksNested = nestedKeys.some(function (nk) {
             return v[nk] && typeof v[nk] === "object";
@@ -159,10 +157,10 @@
     head.style.cssText =
       "display:flex;align-items:center;gap:8px;padding:8px 10px;background:#111827;border-bottom:1px solid #334155;cursor:move;user-select:none;";
     head.innerHTML =
-      '<strong style="color:#86efac">interaction</strong>' +
+      '<strong style="color:#86efac">dash</strong>' +
       '<span id="dash-interaction-action" style="color:#93c5fd"></span>' +
-      '<span style="margin-left:auto;color:#94a3b8">Submit→runtime</span>' +
-      '<button type="button" id="dash-runtime-push" style="background:#1f2937;color:#86efac;border:1px solid #475569;padding:2px 8px;cursor:pointer">runtime</button>' +
+      '<span style="margin-left:auto"></span>' +
+      '<button type="button" id="dash-page-btn" style="background:#1f2937;color:#86efac;border:1px solid #475569;padding:2px 8px;cursor:pointer">page</button>' +
       '<button type="button" id="dash-interaction-clear" style="background:#1f2937;color:#e2e8f0;border:1px solid #475569;padding:2px 8px;cursor:pointer">clear</button>' +
       '<button type="button" id="dash-interaction-hide" style="background:#1f2937;color:#e2e8f0;border:1px solid #475569;padding:2px 8px;cursor:pointer">hide</button>';
     var pre = document.createElement("pre");
@@ -170,9 +168,8 @@
     pre.style.cssText =
       "margin:0;padding:10px;overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;color:#bbf7d0;";
     pre.textContent =
-      "Submit в viewer → runtime уходит на сервер.\n" +
-      "Потом: GET /api/runtime\n\n" +
-      "Или кнопка runtime / await dashPushRuntime()\n";
+      "Кнопка page → снимок экрана на сервер.\n" +
+      "Потом: curl /api/page\n";
     el.appendChild(head);
     el.appendChild(pre);
     document.body.appendChild(el);
@@ -183,8 +180,8 @@
       pre.textContent = "";
       fetch("/api/params", { method: "DELETE" }).catch(function () {});
     };
-    document.getElementById("dash-runtime-push").onclick = function () {
-      window.dashPushRuntime("manual").then(function (res) {
+    document.getElementById("dash-page-btn").onclick = function () {
+      window.dashPushPage().then(function (res) {
         if (pre) pre.textContent = JSON.stringify(res, null, 2);
       });
     };
@@ -216,20 +213,6 @@
           interaction: dump,
         }),
       }).catch(function () {});
-      // Submit / Variables / фильтры → снять готовую страницу
-      var act = dump.action || "";
-      if (
-        act === "Variables" ||
-        act === "InitVars" ||
-        act === "DashboardFiltering" ||
-        act === "DashboardResetAllFilters"
-      ) {
-        setTimeout(function () {
-          window.dashPushRuntime(act || "interaction").catch(function (err) {
-            if (window.console && console.error) console.error(err);
-          });
-        }, 800);
-      }
     } catch (e) {
       if (window.console && console.error) console.error(e);
     }
@@ -293,20 +276,14 @@
     } catch (e2) {}
 
     var typeStr = String(item.type || "");
-    var isButton =
-      /Button/i.test(typeStr) ||
-      /Button/i.test(name) ||
-      (comp.onClick != null && /Dashboard/i.test(typeStr));
-    var isText =
-      /Text/i.test(typeStr) ||
-      item.text != null ||
-      item.textValue != null;
-
-    if (isButton) {
+    if (/Button/i.test(typeStr) || /Button/i.test(name)) {
       item.role = "button";
       out.buttons.push(item);
     }
-    if (isText && (item.text || item.textValue || item.title)) {
+    if (
+      (/Text/i.test(typeStr) || item.text != null || item.textValue != null) &&
+      (item.text || item.textValue || item.title)
+    ) {
       item.role = item.role || "text";
       out.texts.push(item);
     }
@@ -322,10 +299,6 @@
     var out = { elements: [], texts: [], buttons: [] };
     if (!report || !report.pages) return out;
     var pages = componentList(report.pages);
-    // pages may be indexed collection
-    if (!pages.length && report.pages.count != null) {
-      pages = componentList(report.pages);
-    }
     for (var p = 0; p < pages.length; p++) {
       var page = pages[p];
       if (!page) continue;
@@ -352,8 +325,7 @@
     var report = getReport();
     var out = {};
     if (!report || !report.dictionary || !report.dictionary.dataSources) return out;
-    var sources = report.dictionary.dataSources;
-    var list = componentList(sources);
+    var list = componentList(report.dictionary.dataSources);
     list.forEach(function (ds) {
       if (!ds) return;
       var name = ds.name || ds.alias || "source";
@@ -396,7 +368,6 @@
     return out;
   }
 
-  /** Видимый текст с экрана (fallback для Text / подписей). */
   function scrapeDomTexts() {
     var root =
       document.getElementById("viewerContent") ||
@@ -423,11 +394,10 @@
     return out;
   }
 
-  window.dashCollectRuntime = function (trigger) {
+  window.dashCollectPage = function () {
     var report = getReport();
     var parts = collectElements(report);
     var snap = {
-      trigger: trigger || "manual",
       params: {},
       elements: parts.elements,
       texts: parts.texts,
@@ -452,11 +422,9 @@
       })
       .then(function (p) {
         if (p && p.params) snap.params = p.params;
-        // variables с report
         try {
           if (report && report.dictionary && report.dictionary.variables) {
-            var vars = componentList(report.dictionary.variables);
-            vars.forEach(function (v) {
+            componentList(report.dictionary.variables).forEach(function (v) {
               if (v && v.name != null) {
                 snap.params[v.name] =
                   v.value != null ? v.value : snap.params[v.name];
@@ -468,17 +436,15 @@
       });
   };
 
-  window.dashPushRuntime = function (trigger) {
-    return window.dashCollectRuntime(trigger).then(function (snap) {
-      return fetch("/api/runtime", {
+  window.dashPushPage = function () {
+    return window.dashCollectPage().then(function (snap) {
+      return fetch("/api/page", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(snap),
       }).then(function (r) {
         return r.json().then(function (data) {
-          if (window.console && console.log) {
-            console.log("[dash runtime]", data);
-          }
+          if (window.console && console.log) console.log("[dash page]", data);
           return data;
         });
       });
