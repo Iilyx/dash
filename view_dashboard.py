@@ -13,7 +13,9 @@ Docs / samples:
   POST /api/params  {"Region":"West","Visits":5}
   GET  /api/params
   GET  /viewer?Region=West   (query → переменные mrt)
-  клики/фильтры на дашборде → POST /api/params (onInteraction)
+  Submit в viewer → variables/SQL params в store
+  GET  /api/filled           (datasets по текущим params)
+  клики/фильтры → POST /api/params (onInteraction)
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -403,6 +405,23 @@ def coerce_value(type_name: str, value: Any) -> Any:
     return value
 
 
+def harvest_variables_from_args(args: StiVariablesEventArgs) -> None:
+    """Submit в viewer присылает variables сюда — кладём в store для GET /api/filled."""
+    variables = args.variables
+    if not variables:
+        return
+    incoming: dict[str, Any] = {}
+    for name, var in variables.items():
+        if not name:
+            continue
+        try:
+            incoming[str(name)] = var.value if hasattr(var, "value") else var
+        except Exception:
+            continue
+    if incoming:
+        params_update(incoming)
+
+
 def apply_params_to_variables(args: StiVariablesEventArgs) -> None:
     incoming = params_snapshot()
     incoming.update(_public_query_params())
@@ -422,6 +441,18 @@ def apply_params_to_variables(args: StiVariablesEventArgs) -> None:
 
 def begin_process_data(args: StiDataEventArgs) -> None:
     args.connectionString = PG_CONN
+    # SQL @param с клиента (после Submit) тоже в store
+    if args.parameters:
+        from_sql: dict[str, Any] = {}
+        for name, param in args.parameters.items():
+            if not name:
+                continue
+            try:
+                from_sql[str(name)] = param.value
+            except Exception:
+                continue
+        if from_sql:
+            params_update(from_sql)
     incoming = params_snapshot()
     if not incoming or not args.parameters:
         return
@@ -431,6 +462,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 
 def prepare_variables(args: StiVariablesEventArgs) -> None:
+    harvest_variables_from_args(args)
     apply_params_to_variables(args)
 
 
