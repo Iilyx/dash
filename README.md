@@ -60,26 +60,6 @@ curl -s http://127.0.0.1:8040/api/params
 Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
 То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
 
-### Заполненные данные через GET (после Submit в viewer)
-
-1. Открой `/viewer`, заполни фильтры, нажми **Submit**
-2. Параметры с формы сохраняются на сервере
-3. Забери данные:
-
-```bash
-curl -s 'http://127.0.0.1:8040/api/filled?row_limit=100'
-```
-
-Или сразу params в POST (без viewer):
-
-```bash
-curl -s -X POST http://127.0.0.1:8040/api/filled \
-  -H 'Content-Type: application/json' \
-  -d '{"params":{"Region":"West"},"row_limit":100}'
-```
-
-В ответе: `params`, `datasets` (`ok`, `sql_filled`, `columns`, `rows`).
-
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 
 ```bash
