@@ -310,6 +310,83 @@ def sti_process(component) -> bool:
     return handled
 
 
+def _viewer_layout_tags() -> str:
+    """Inline CSS/JS + cache-bust: внешний dash-debug.js часто остаётся в кэше браузера."""
+    width = max(120, FILTERS_FIELD_WIDTH)
+    # версия от mtime, чтобы после pull сразу новый файл
+    try:
+        ver = int((ROOT / "dash_debug.js").stat().st_mtime)
+    except OSError:
+        ver = 1
+    return f"""
+<style id="dash-params-layout-css">
+#viewer_ParametersPanel table[id$="MainButtons"],
+.stiJsViewerParametersPanel table[id$="MainButtons"] {{
+  margin-left: auto !important;
+  margin-right: 12px !important;
+  float: right !important;
+}}
+.stiJsViewerParametersPanel input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]),
+.stiJsViewerParametersPanel select,
+.stiJsViewerParametersPanel textarea,
+.stiJsViewerParametersPanel .stiJsViewerTextBox,
+.stiJsViewerParametersPanel .stiJsViewerTextBoxDefault {{
+  min-width: {width}px !important;
+  width: {width}px !important;
+  height: 34px !important;
+  font-size: 14px !important;
+  box-sizing: border-box !important;
+}}
+.stiJsViewerParametersPanel .stiJsViewerFormButton,
+.stiJsViewerParametersPanel .stiJsViewerFormButtonDefault {{
+  min-height: 34px !important;
+  min-width: 96px !important;
+}}
+</style>
+<script>
+window.DASH_FILTERS = {{ width: {width}, panel: {FILTERS_PANEL_POSITION!r}, columns: {FILTERS_COLUMNS} }};
+(function(){{
+  var W = {width};
+  function apply(){{
+    var panel = document.querySelector(".stiJsViewerParametersPanel") ||
+                document.querySelector("[id$='_ParametersPanel']");
+    if (!panel) return false;
+    try {{
+      var js = panel.jsObject || (panel.container && panel.container.jsObject);
+      if (js && js.options) js.options.currentParameterWidth = W;
+    }} catch (e) {{}}
+    var container = panel.querySelector(".stiJsViewerInnerContainerParametersPanel") || panel;
+    var buttons = panel.querySelector("table[id$='MainButtons']");
+    if (buttons) {{
+      if (buttons.parentElement !== container) container.appendChild(buttons);
+      buttons.setAttribute("align", "right");
+      buttons.style.setProperty("float", "right", "important");
+      buttons.style.setProperty("margin-left", "auto", "important");
+    }}
+    panel.querySelectorAll("input, select, textarea").forEach(function(el){{
+      if (el.type === "hidden" || el.type === "checkbox" || el.type === "radio") return;
+      el.style.setProperty("width", W + "px", "important");
+      el.style.setProperty("min-width", W + "px", "important");
+      el.style.setProperty("height", "34px", "important");
+      el.style.setProperty("font-size", "14px", "important");
+    }});
+    document.documentElement.setAttribute("data-dash-filters-layout", "1");
+    return true;
+  }}
+  var n = 0;
+  var t = setInterval(function(){{
+    apply();
+    if (++n > 40) clearInterval(t);
+  }}, 250);
+  document.addEventListener("DOMContentLoaded", apply);
+  setTimeout(apply, 800);
+  setTimeout(apply, 2000);
+}})();
+</script>
+<script src="/dash-debug.js?v={ver}"></script>
+"""
+
+
 def sti_response(component, inject_debug: bool = False):
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.passQueryParametersToReport = True
@@ -318,12 +395,12 @@ def sti_response(component, inject_debug: bool = False):
     resp = component.getFrameworkResponse()
     if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
-        tag = '<script src="/dash-debug.js"></script>\n'
-        if "dash-debug.js" not in html:
+        if "data-dash-filters-layout" not in html and "DASH_FILTERS" not in html:
+            tags = _viewer_layout_tags()
             if "</head>" in html:
-                html = html.replace("</head>", tag + "</head>", 1)
+                html = html.replace("</head>", tags + "</head>", 1)
             else:
-                html = tag + html
+                html = tags + html
             resp.set_data(html)
     return resp
 
@@ -430,10 +507,10 @@ def patch_mrt_params_layout(raw: str) -> str:
     if not isinstance(data, dict):
         return raw
     width = max(120, FILTERS_FIELD_WIDTH)
-    data["ParameterWidth"] = str(width)
-    # на всякий случай оба регистра/ключа, которые встречаются в выгрузках
+    # Stimulsoft читает report.parameterWidth (число); в JSON бывает оба ключа
+    data["ParameterWidth"] = width
     data["parameterWidth"] = width
-    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    return json.dumps(data, ensure_ascii=False)
 
 
 @app.route("/mrt", methods=["GET", "POST"])

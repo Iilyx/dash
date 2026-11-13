@@ -194,49 +194,27 @@
     if (pre) pre.textContent = JSON.stringify(dump, null, 2);
   }
 
-  function injectParamsCss() {
-    if (document.getElementById("dash-params-layout-css")) return;
-    var style = document.createElement("style");
-    style.id = "dash-params-layout-css";
-    style.textContent = [
-      ".stiJsViewerParametersPanelTop .stiJsViewerInnerContainerParametersPanel{",
-      "display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px 12px;}",
-      ".stiJsViewerParametersPanelTop .stiJsViewerInnerContainerParametersPanel > table:not([id$='MainButtons']){",
-      "flex:1 1 auto;}",
-      ".stiJsViewerParametersPanelTop table[id$='MainButtons']{",
-      "margin:8px 12px 8px auto !important;float:none !important;",
-      "order:99;align-self:flex-end;}",
-      ".stiJsViewerParametersPanel input,",
-      ".stiJsViewerParametersPanel select,",
-      ".stiJsViewerParametersPanel textarea,",
-      ".stiJsViewerParametersPanel .stiJsViewerTextBox{",
-      "min-width:280px !important;width:320px !important;",
-      "height:34px !important;font-size:14px !important;",
-      "box-sizing:border-box;}",
-      ".stiJsViewerParametersPanel .stiJsViewerFormButton{",
-      "min-height:34px;min-width:88px;}",
-    ].join("");
-    document.head.appendChild(style);
-  }
-
   function layoutParamsPanel() {
-    injectParamsCss();
+    var W =
+      (window.DASH_FILTERS && window.DASH_FILTERS.width) || 320;
     var panel =
       document.querySelector(".stiJsViewerParametersPanel") ||
       document.querySelector("[id$='_ParametersPanel']");
     if (!panel) return;
+    try {
+      var js = panel.jsObject || (panel.container && panel.container.jsObject);
+      if (js && js.options) js.options.currentParameterWidth = W;
+    } catch (e) {}
     var container =
       panel.querySelector(".stiJsViewerInnerContainerParametersPanel") ||
       panel;
     var buttons = panel.querySelector("table[id$='MainButtons']");
-    if (buttons && container && buttons.parentElement !== container) {
-      container.appendChild(buttons);
-    }
     if (buttons) {
-      buttons.style.marginLeft = "auto";
-      buttons.style.marginRight = "12px";
-      buttons.style.marginTop = "8px";
+      if (buttons.parentElement !== container) container.appendChild(buttons);
       buttons.setAttribute("align", "right");
+      buttons.style.setProperty("float", "right", "important");
+      buttons.style.setProperty("margin-left", "auto", "important");
+      buttons.style.setProperty("margin-right", "12px", "important");
     }
     var nodes = panel.querySelectorAll("input, select, textarea");
     for (var i = 0; i < nodes.length; i++) {
@@ -244,11 +222,12 @@
       if (el.type === "hidden" || el.type === "checkbox" || el.type === "radio") {
         continue;
       }
-      el.style.minWidth = "280px";
-      el.style.width = "320px";
-      el.style.height = "34px";
-      el.style.fontSize = "14px";
+      el.style.setProperty("width", W + "px", "important");
+      el.style.setProperty("min-width", W + "px", "important");
+      el.style.setProperty("height", "34px", "important");
+      el.style.setProperty("font-size", "14px", "important");
     }
+    document.documentElement.setAttribute("data-dash-filters-layout", "1");
   }
 
   window.dashCaptureInteraction = function (args) {
@@ -275,14 +254,16 @@
 
   function bootLayout() {
     ensurePanel();
-    injectParamsCss();
     layoutParamsPanel();
+    var timer = null;
     var obs = new MutationObserver(function () {
-      layoutParamsPanel();
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(layoutParamsPanel, 50);
     });
     obs.observe(document.body, { childList: true, subtree: true });
     setTimeout(layoutParamsPanel, 400);
     setTimeout(layoutParamsPanel, 1200);
+    setTimeout(layoutParamsPanel, 3000);
   }
 
   if (document.readyState === "loading") {
