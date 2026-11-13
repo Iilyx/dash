@@ -1,0 +1,12 @@
+---
+description: After finishing code changes, always commit and push to origin
+alwaysApply: true
+---
+
+# Auto git push
+
+When work on a task produces file changes in this repo, **commit and push to `origin` without waiting** for the user to say «на гит».
+
+Follow the usual commit protocol (status/diff/log, HEREDOC message, no secrets, no force-push, no amend unless rules allow). Push with `git push origin HEAD` after a successful commit.
+
+Only skip push if there is nothing to commit, or the user explicitly says not to push.
