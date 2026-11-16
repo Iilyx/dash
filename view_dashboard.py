@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Stimulsoft Dashboards.PYTHON 2024.2.2 — по официальным sample Flask.
+"""Stimulsoft Dashboards.PYTHON 2024.2.2 — viewer/designer + snapshot данных.
 
-Docs / samples:
-  Editing a Dashboard Template in the Designer
-  Showing a Dashboard in the Viewer
-  How to Activate the Product
-  Using Parameters in SQL Query (onBeginProcessData)
+Snapshot (после фильтров на экране):
+  кнопка snapshot во viewer → StiElementDataCache.getOrCreate
+  POST/GET /api/snapshot
+  клики/фильтры → onInteraction → POST /api/interaction
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -17,12 +16,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import webbrowser
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
@@ -31,6 +32,10 @@ from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 
 ROOT = Path(__file__).resolve().parent
+
+_lock = threading.Lock()
+_SNAPSHOT: dict[str, Any] | None = None
+_LAST_INTERACTION: dict[str, Any] | None = None
 
 
 def load_env() -> None:
@@ -141,16 +146,79 @@ def sti_process(component) -> bool:
     return handled
 
 
-def sti_response(component):
+def sti_response(component, inject_snapshot: bool = False):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
-    return component.getFrameworkResponse()
+    resp = component.getFrameworkResponse()
+    if inject_snapshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
+        html = resp.get_data(as_text=True)
+        if "dash-snapshot.js" not in html and ("</head>" in html or "<html" in html.lower()):
+            tag = '<script src="/dash-snapshot.js"></script>\n'
+            if "</head>" in html:
+                html = html.replace("</head>", tag + "</head>", 1)
+            else:
+                html = tag + html
+            resp.set_data(html)
+    return resp
 
 
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
+
+
+@app.get("/dash-snapshot.js")
+def dash_snapshot_js():
+    try:
+        js = (ROOT / "dash_snapshot.js").read_text(encoding="utf-8")
+    except OSError as exc:
+        return Response(f"/* missing dash_snapshot.js: {exc} */", status=404)
+    resp = Response(js, mimetype="application/javascript; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/api/snapshot")
+def get_snapshot():
+    with _lock:
+        if _SNAPSHOT is None:
+            return jsonify({"ok": False, "snapshot": None, "error": "no snapshot yet"})
+        return jsonify({"ok": True, "snapshot": _SNAPSHOT})
+
+
+@app.post("/api/snapshot")
+def post_snapshot():
+    global _SNAPSHOT
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object required"}), 400
+    with _lock:
+        _SNAPSHOT = body
+    n = len(body.get("elements") or []) if isinstance(body.get("elements"), list) else 0
+    skipped = body.get("skipped_count")
+    print(f"[snapshot] elements={n} skipped={skipped} ok={body.get('ok')!r}", flush=True)
+    return jsonify({"ok": True, "elements": n, "skipped": skipped})
+
+
+@app.get("/api/interaction")
+def get_interaction():
+    with _lock:
+        if _LAST_INTERACTION is None:
+            return jsonify({"ok": False, "interaction": None, "error": "no interaction yet"})
+        return jsonify({"ok": True, "interaction": _LAST_INTERACTION})
+
+
+@app.post("/api/interaction")
+def post_interaction():
+    global _LAST_INTERACTION
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object required"}), 400
+    with _lock:
+        _LAST_INTERACTION = body
+    print(f"[interaction] action={body.get('action')!r}", flush=True)
+    return jsonify({"ok": True})
 
 
 @app.route("/mrt", methods=["GET", "POST"])
@@ -186,6 +254,8 @@ def viewer():
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
+    # JS: window.dashCaptureInteraction(args) из dash_snapshot.js
+    viewer.onInteraction += "dashCaptureInteraction"
 
     if sti_process(viewer):
         return sti_response(viewer)
@@ -193,14 +263,16 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer)
+    return sti_response(viewer, inject_snapshot=True)
 
 
 def main() -> None:
-    print("Stimulsoft Dashboards.PYTHON 2024.2.2 — official Flask wiring", flush=True)
+    print("Stimulsoft Dashboards.PYTHON 2024.2.2 — viewer + snapshot", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
-    print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
-    print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Designer:  http://{HOST}:{PORT}/designer", flush=True)
+    print(f"Viewer:    http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Snapshot:  POST/GET http://{HOST}:{PORT}/api/snapshot", flush=True)
+    print(f"Clicks:    POST/GET http://{HOST}:{PORT}/api/interaction", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
