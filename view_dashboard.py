@@ -273,10 +273,12 @@ def _store_document(name: str, document: str) -> Path:
     global _DOCUMENT_JSON, _DOCUMENT_NAME
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in (name or "dashboard.mdc"))
-    if not safe.lower().endswith(".mdc"):
+    lower = safe.lower()
+    if not (lower.endswith(".mdc") or lower.endswith(".mrt") or lower.endswith(".mdz")):
         safe += ".mdc"
     path = SNAPSHOTS_DIR / safe
     path.write_text(document, encoding="utf-8")
+    # всегда дублируем как last.mdc — /document.mdc читает его
     latest = SNAPSHOTS_DIR / "last.mdc"
     if path.resolve() != latest.resolve():
         latest.write_text(document, encoding="utf-8")
@@ -286,25 +288,49 @@ def _store_document(name: str, document: str) -> Path:
     return path
 
 
-@app.get("/api/document")
-def get_document():
+def _read_stored_document() -> tuple[str | None, str]:
     with _lock:
         doc = _DOCUMENT_JSON
         name = _DOCUMENT_NAME
-    if not doc:
-        latest = SNAPSHOTS_DIR / "last.mdc"
-        if latest.is_file():
-            doc = latest.read_text(encoding="utf-8")
-            name = "last.mdc"
+    if doc:
+        return doc, name
+    latest = SNAPSHOTS_DIR / "last.mdc"
+    if latest.is_file():
+        return latest.read_text(encoding="utf-8"), "last.mdc"
+    return None, name
+
+
+@app.get("/api/document")
+def get_document():
+    doc, name = _read_stored_document()
     if not doc:
         return jsonify({"ok": False, "error": "no document yet — нажми mdc во viewer"}), 404
-    if request.args.get("download") == "1":
-        return Response(
-            doc,
-            mimetype="application/json; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{name}"'},
-        )
-    return jsonify({"ok": True, "filename": name, "chars": len(doc), "document": doc})
+    # по умолчанию без тела (оно большое); ?include=1 — целиком в JSON
+    if request.args.get("include") == "1" or request.args.get("download") == "1":
+        if request.args.get("download") == "1":
+            return Response(
+                doc,
+                mimetype="application/json; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            )
+        return jsonify({"ok": True, "filename": name, "chars": len(doc), "document": doc})
+    return jsonify({"ok": True, "filename": name, "chars": len(doc), "url": "/document.mdc"})
+
+
+@app.get("/document.mdc")
+def document_mdc_file():
+    """Сырой .mdc для Stimulsoft loadDocumentFile / скачивания."""
+    doc, name = _read_stored_document()
+    if not doc:
+        return Response("no document", status=404, mimetype="text/plain")
+    return Response(
+        doc,
+        mimetype="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'inline; filename="{name}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/api/document")
@@ -337,34 +363,88 @@ def open_document_page():
   <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.dashboards.js"></script>
   <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.viewer.js"></script>
   <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.handler.js"></script>
+  <style>
+    #status {{
+      position: fixed; left: 12px; top: 12px; z-index: 99999;
+      background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+      border-radius: 8px; padding: 8px 12px; font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+      max-width: min(520px, 90vw); white-space: pre-wrap;
+    }}
+  </style>
 </head>
-<body onload="start()">
+<body>
+  <div id="status">загрузка…</div>
   <div id="viewerContent"></div>
   <script>
   {lic}
-  async function start() {{
-    const r = await fetch('/api/document');
-    const data = await r.json();
-    if (!r.ok || !data.document) {{
-      document.body.innerHTML = '<pre style="padding:16px;font:14px monospace">Нет .mdc. Открой /viewer, нажми mdc.</pre>';
-      return;
-    }}
-    const options = new Stimulsoft.Viewer.StiViewerOptions();
-    options.appearance.fullScreenMode = true;
-    options.toolbar.showFullScreenButton = false;
-    const viewer = window.viewer = new Stimulsoft.Viewer.StiViewer(options, 'viewerDoc', false);
-    const report = new Stimulsoft.Report.StiReport();
-    if (typeof report.loadDocument === 'function') {{
-      report.loadDocument(data.document);
-    }} else if (typeof report.loadDocumentFromJsonString === 'function') {{
-      report.loadDocumentFromJsonString(data.document);
-    }} else {{
-      report.load(data.document);
-    }}
-    viewer.report = report;
-    viewer.renderHtml('viewerContent');
-    console.log('[document] opened', data.filename, data.chars);
+  function setStatus(t) {{
+    var el = document.getElementById('status');
+    if (el) el.textContent = t;
   }}
+  async function start() {{
+    try {{
+      if (typeof Stimulsoft === 'undefined') {{
+        setStatus('Stimulsoft JS не загрузился (проверь /viewer?sti_event=GetResource…)');
+        return;
+      }}
+      setStatus('проверяю /api/document…');
+      const metaResp = await fetch('/api/document');
+      const meta = await metaResp.json();
+      if (!metaResp.ok) {{
+        setStatus('Нет .mdc.\\nОткрой /viewer → кнопка mdc.\\nПотом снова /document');
+        return;
+      }}
+      setStatus('качаю /document.mdc (' + (meta.chars || '?') + ' chars)…');
+      const rawResp = await fetch('/document.mdc', {{ cache: 'no-store' }});
+      if (!rawResp.ok) {{
+        setStatus('Не удалось скачать /document.mdc: HTTP ' + rawResp.status);
+        return;
+      }}
+      const text = await rawResp.text();
+      if (!text || text.length < 2) {{
+        setStatus('Файл .mdc пустой. Пересохрани кнопкой mdc во viewer.');
+        return;
+      }}
+      setStatus('открываю в viewer…');
+      const options = new Stimulsoft.Viewer.StiViewerOptions();
+      options.appearance.fullScreenMode = true;
+      options.toolbar.showFullScreenButton = false;
+      const viewer = window.viewer = new Stimulsoft.Viewer.StiViewer(options, 'viewerDoc', false);
+      const report = new Stimulsoft.Report.StiReport();
+
+      // loadDocument принимает string JSON / XML / object
+      try {{
+        report.loadDocument(text);
+      }} catch (e1) {{
+        try {{
+          report.loadDocument(JSON.parse(text));
+        }} catch (e2) {{
+          // иногда saveDocument сохраняет template-like JSON — пробуем как обычный report
+          try {{
+            report.load(text);
+          }} catch (e3) {{
+            setStatus('Не открылось как document/report:\\n' + e1 + '\\n' + e2 + '\\n' + e3);
+            console.error(e1, e2, e3);
+            return;
+          }}
+        }}
+      }}
+
+      viewer.report = report;
+      viewer.renderHtml('viewerContent');
+      setStatus('открыто: ' + (meta.filename || 'document') + ' (' + text.length + ' chars). Можно закрыть это сообщение.');
+      console.log('[document] opened', meta.filename, text.length, {{
+        isDocument: report.isDocument,
+        isRendered: report.isRendered,
+        isDashboard: !!(report.isDashboard || (report.pages && report.pages.count))
+      }});
+    }} catch (e) {{
+      setStatus('Ошибка: ' + e);
+      console.error(e);
+    }}
+  }}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
   </script>
 </body>
 </html>

@@ -452,6 +452,21 @@
 
     var json = null;
     var method = null;
+    var ext = ".mdc";
+
+    function asText(data) {
+      if (data == null) return null;
+      if (typeof data === "string") return data;
+      try {
+        return new TextDecoder("utf-8").decode(data);
+      } catch (e) {}
+      try {
+        return String.fromCharCode.apply(null, data);
+      } catch (e2) {
+        return null;
+      }
+    }
+
     try {
       if (typeof report.saveDocumentToJsonString === "function") {
         json = report.saveDocumentToJsonString();
@@ -461,11 +476,11 @@
       if (window.console && console.warn) console.warn("saveDocumentToJsonString failed", e);
     }
 
-    // fallback: export Document (snapshot)
-    if (!json) {
+    // для dashboard saveDocument часто возвращает "" — пробуем export Document
+    if (!json || json.length < 2) {
       try {
         if (typeof report.exportDocumentAsync === "function" && Stimulsoft.Report.StiExportFormat) {
-          json = await new Promise(function (resolve, reject) {
+          var exported = await new Promise(function (resolve, reject) {
             try {
               report.exportDocumentAsync(function (data) {
                 resolve(data);
@@ -474,28 +489,31 @@
               reject(e2);
             }
           });
+          json = asText(exported);
           method = "exportDocumentAsync.Document";
-          if (json && typeof json !== "string") {
-            try {
-              json = new TextDecoder("utf-8").decode(json);
-            } catch (e3) {
-              try {
-                json = String.fromCharCode.apply(null, json);
-              } catch (e4) {
-                json = String(json);
-              }
-            }
-          }
         }
       } catch (e5) {
         if (window.console && console.warn) console.warn("export Document failed", e5);
       }
     }
 
+    // последний fallback: сохранить текущий report JSON (это .mrt-like, не классический document)
+    if (!json || json.length < 2) {
+      try {
+        if (typeof report.saveToJsonString === "function") {
+          json = report.saveToJsonString();
+          method = "saveToJsonString";
+          ext = ".mrt";
+        }
+      } catch (e6) {
+        if (window.console && console.warn) console.warn("saveToJsonString failed", e6);
+      }
+    }
+
     if (!json || typeof json !== "string" || json.length < 2) {
       var err2 = {
         ok: false,
-        error: "не удалось сериализовать document (.mdc)",
+        error: "пустое сохранение — для dashboard .mdc часто не работает без render; смотри консоль",
       };
       setStatus(err2.error);
       return err2;
@@ -504,9 +522,9 @@
     var alias = "dashboard";
     try {
       alias = report.reportAlias || report.reportName || alias;
-    } catch (e6) {}
+    } catch (e7) {}
     var safe = String(alias).replace(/[^\w\-]+/g, "_") || "dashboard";
-    var filename = safe + ".mdc";
+    var filename = safe + ext;
 
     downloadText(filename, json, "application/json;charset=utf-8");
 
