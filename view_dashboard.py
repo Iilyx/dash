@@ -59,22 +59,47 @@ def path_of(raw: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-def apply_license(component) -> None:
-    """В 2024.2.x лицензия вешается на instance: component.license.setKey/setFile."""
-    key = (
+def license_key() -> str:
+    return (
         os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
         or os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
         or os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
     )
-    file_raw = (
+
+
+def license_file() -> str:
+    raw = (
         os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip()
         or os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip()
         or os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
     )
+    return str(path_of(raw).resolve()) if raw else ""
+
+
+def apply_license(component) -> None:
+    """В 2024.2.x лицензия вешается на instance: component.license.setKey/setFile."""
+    key = license_key()
+    file_path = license_file()
     if key:
         component.license.setKey(key)
-    elif file_raw:
-        component.license.setFile(str(path_of(file_raw).resolve()))
+    elif file_path:
+        component.license.setFile(file_path)
+
+
+def license_js_snippet() -> str:
+    """JS для кастомных HTML-страниц (например /document)."""
+    key = license_key()
+    if key:
+        return f"Stimulsoft.Base.StiLicense.Key = {json.dumps(key)};\n"
+    file_path = license_file()
+    if file_path:
+        try:
+            raw = Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+        if raw:
+            return f"Stimulsoft.Base.StiLicense.Key = {json.dumps(raw)};\n"
+    return "console.warn('[dash] Stimulsoft license not set in .env');\n"
 
 
 load_env()
@@ -302,7 +327,8 @@ def post_document():
 @app.get("/document")
 def open_document_page():
     """Открыть последний .mdc во viewer без повторного SQL."""
-    html = """<!DOCTYPE html>
+    lic = license_js_snippet()
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -315,29 +341,30 @@ def open_document_page():
 <body onload="start()">
   <div id="viewerContent"></div>
   <script>
-  async function start() {
+  {lic}
+  async function start() {{
     const r = await fetch('/api/document');
     const data = await r.json();
-    if (!r.ok || !data.document) {
+    if (!r.ok || !data.document) {{
       document.body.innerHTML = '<pre style="padding:16px;font:14px monospace">Нет .mdc. Открой /viewer, нажми mdc.</pre>';
       return;
-    }
+    }}
     const options = new Stimulsoft.Viewer.StiViewerOptions();
     options.appearance.fullScreenMode = true;
     options.toolbar.showFullScreenButton = false;
     const viewer = window.viewer = new Stimulsoft.Viewer.StiViewer(options, 'viewerDoc', false);
     const report = new Stimulsoft.Report.StiReport();
-    if (typeof report.loadDocument === 'function') {
+    if (typeof report.loadDocument === 'function') {{
       report.loadDocument(data.document);
-    } else if (typeof report.loadDocumentFromJsonString === 'function') {
+    }} else if (typeof report.loadDocumentFromJsonString === 'function') {{
       report.loadDocumentFromJsonString(data.document);
-    } else {
+    }} else {{
       report.load(data.document);
-    }
+    }}
     viewer.report = report;
     viewer.renderHtml('viewerContent');
     console.log('[document] opened', data.filename, data.chars);
-  }
+  }}
   </script>
 </body>
 </html>
@@ -393,6 +420,13 @@ def viewer():
 def main() -> None:
     print("Stimulsoft Dashboards.PYTHON 2024.2.2 — viewer + snapshot", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
+    if license_key() or license_file():
+        print("License: set", flush=True)
+    else:
+        print(
+            "License: MISSING — задай STIMULSOFT_DASHBOARDS_LICENSE_KEY в .env",
+            flush=True,
+        )
     print(f"Designer:  http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:    http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Data JSON: POST/GET http://{HOST}:{PORT}/api/snapshot", flush=True)
