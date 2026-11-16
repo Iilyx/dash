@@ -42,30 +42,6 @@ cp .env.example .env   # MRT_PATH, POSTGRES_*, license
 Viewer: http://127.0.0.1:8040/viewer · Designer: `/designer`  
 (порт из `.env`: `VIEWER_PORT`)
 
-Параметры дашборда (имена = variables / SQL `@param` в `.mrt`):
-
-```bash
-# задать
-curl -s -X POST http://127.0.0.1:8040/api/params \
-  -H 'Content-Type: application/json' \
-  -d '{"Region":"West","Visits":5}'
-
-# или query
-open 'http://127.0.0.1:8040/viewer?Region=West'
-
-# текущие (+ последний interaction с кликов)
-curl -s http://127.0.0.1:8040/api/params
-```
-
-Клики на дашборде: на `/viewer` справа внизу debug-панель с полным `args`.
-То же в `GET /api/interactions` и в `interaction` у `GET /api/params`.
-
-Отрендеренная страница (тексты, кнопки, datasets): кнопка **page** справа внизу на `/viewer`, потом:
-
-```bash
-curl -s http://127.0.0.1:8040/api/page | jq .
-```
-
 `Format(x, "N2")` → JS-вид (`Format("{0:N2}", x)`):
 
 ```bash

@@ -6,15 +6,6 @@ Docs / samples:
   Showing a Dashboard in the Viewer
   How to Activate the Product
   Using Parameters in SQL Query (onBeginProcessData)
-  Setting Dashboard Variables on the Server-Side
-  passQueryParametersToReport / onPrepareVariables / onInteraction
-
-Параметры:
-  POST /api/params  {"Region":"West","Visits":5}
-  GET  /api/params
-  GET  /viewer?Region=West   (query → переменные mrt)
-  клики/фильтры → POST /api/params (onInteraction)
-  кнопка page в viewer → POST/GET /api/page (texts, buttons, datasets)
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -26,26 +17,17 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import webbrowser
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
-from stimulsoft_reports.events import (
-    StiDataEventArgs,
-    StiReportEventArgs,
-    StiVariablesEventArgs,
-)
+from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
 from stimulsoft_reports.report import StiReport
-from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
-from stimulsoft_reports.report.enums.StiVariableType import StiVariableType
 from stimulsoft_reports.viewer import StiViewer
 
 ROOT = Path(__file__).resolve().parent
@@ -126,141 +108,9 @@ if not PG_CONN:
 
 app = Flask(__name__)
 
-# Последние параметры: POST /api/params, query /viewer?X=, клики onInteraction.
-_params_lock = threading.Lock()
-_PARAMS: dict[str, Any] = {}
-_LAST_INTERACTION: dict[str, Any] | None = None
-_INTERACTIONS: list[dict[str, Any]] = []
-_INTERACTIONS_MAX = 50
-
-_STI_QUERY_SKIP = {"sti_event", "sti_data", "sti_handler"}
-_DEBUG_JS = (ROOT / "dash_debug.js").read_text(encoding="utf-8")
-
-# Последний снимок с кнопки page: texts / buttons / datasets.
-_LAST_PAGE: dict[str, Any] | None = None
-
-
-def _public_query_params() -> dict[str, str]:
-    return {
-        k: v
-        for k, v in request.args.items()
-        if k not in _STI_QUERY_SKIP and not k.startswith("sti_")
-    }
-
-
-def _body_params() -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    if request.form:
-        out.update({k: v for k, v in request.form.items()})
-    if request.is_json:
-        body = request.get_json(silent=True)
-        if isinstance(body, dict):
-            nested = body.get("params")
-            if isinstance(nested, dict):
-                out.update(nested)
-            else:
-                out.update(
-                    {
-                        k: v
-                        for k, v in body.items()
-                        if k not in {"params", "interaction"}
-                    }
-                )
-    return out
-
-
-def params_snapshot() -> dict[str, Any]:
-    with _params_lock:
-        return dict(_PARAMS)
-
-
-def params_update(values: dict[str, Any]) -> dict[str, Any]:
-    with _params_lock:
-        for key, value in values.items():
-            if value is None:
-                _PARAMS.pop(key, None)
-            else:
-                _PARAMS[key] = value
-        return dict(_PARAMS)
-
-
-def coerce_value(type_name: str, value: Any) -> Any:
-    if value is None or type_name is None:
-        return value
-    if isinstance(value, (dict, list)):
-        return value
-    text = value if isinstance(value, str) else str(value)
-    try:
-        if type_name in {
-            StiVariableType.INT,
-            StiVariableType.INT16,
-            StiVariableType.INT32,
-            StiVariableType.INT64,
-            StiVariableType.SHORT,
-            StiVariableType.LONG,
-            StiVariableType.BYTE,
-            StiVariableType.SBYTE,
-            StiVariableType.UINT,
-            StiVariableType.UINT16,
-            StiVariableType.UINT32,
-            StiVariableType.UINT64,
-            StiVariableType.USHORT,
-            StiVariableType.ULONG,
-        }:
-            return int(float(text)) if text != "" else value
-        if type_name in {
-            StiVariableType.DOUBLE,
-            StiVariableType.DECIMAL,
-            StiVariableType.SINGLE,
-            "Float",
-        }:
-            return float(text) if text != "" else value
-        if type_name == StiVariableType.BOOLEAN:
-            if isinstance(value, bool):
-                return value
-            return text.strip().lower() in {"1", "true", "yes", "y", "on"}
-        if type_name == StiVariableType.DATETIME:
-            if isinstance(value, datetime):
-                return value
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-                try:
-                    return datetime.strptime(text, fmt)
-                except ValueError:
-                    continue
-    except (TypeError, ValueError):
-        return value
-    return value
-
-
-def apply_params_to_variables(args: StiVariablesEventArgs) -> None:
-    incoming = params_snapshot()
-    incoming.update(_public_query_params())
-    if not incoming:
-        return
-    variables = args.variables
-    if variables is None:
-        args.variables = {}
-        variables = args.variables
-    for name, raw in incoming.items():
-        if name in variables:
-            var = variables[name]
-            var.value = coerce_value(var.typeName, raw)
-        else:
-            variables[name] = StiVariable(name, StiVariableType.STRING, str(raw))
-
 
 def begin_process_data(args: StiDataEventArgs) -> None:
     args.connectionString = PG_CONN
-    incoming = params_snapshot()
-    if not incoming or not args.parameters:
-        return
-    for name, param in args.parameters.items():
-        if name in incoming:
-            param.value = incoming[name]
-
-
-def prepare_variables(args: StiVariablesEventArgs) -> None:
-    apply_params_to_variables(args)
 
 
 def save_report(args: StiReportEventArgs):
@@ -288,73 +138,14 @@ def sti_process(component) -> bool:
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.origin = request.origin or "*"
     component.handler.error = None
-    component.handler.passQueryParametersToReport = True
     return handled
 
 
-def sti_response(component, inject_debug: bool = False):
+def sti_response(component):
     component.handler.framework = StiFrameworkType.FLASK
-    component.handler.passQueryParametersToReport = True
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
-    resp = component.getFrameworkResponse()
-    if inject_debug and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
-        html = resp.get_data(as_text=True)
-        if "window.__dashViewer" not in html:
-            html = html.replace(
-                "viewer.renderHtml('viewerContent');",
-                "viewer.renderHtml('viewerContent');\n"
-                "window.__dashViewer = viewer;\n"
-                "if (viewer.report) window.__dashReport = viewer.report;\n",
-                1,
-            )
-        try:
-            ver = int((ROOT / "dash_debug.js").stat().st_mtime)
-        except OSError:
-            ver = 1
-        tag = f'<script src="/dash-debug.js?v={ver}"></script>\n'
-        if "dash-debug.js" not in html:
-            if "</head>" in html:
-                html = html.replace("</head>", tag + "</head>", 1)
-            else:
-                html = tag + html
-        resp.set_data(html)
-    return resp
-
-
-def remember_interaction(dump: Any) -> None:
-    global _LAST_INTERACTION
-    if not isinstance(dump, dict):
-        dump = {"raw": dump}
-    with _params_lock:
-        _LAST_INTERACTION = dump
-        _INTERACTIONS.append(dump)
-        overflow = len(_INTERACTIONS) - _INTERACTIONS_MAX
-        if overflow > 0:
-            del _INTERACTIONS[:overflow]
-    action = dump.get("action")
-    keys = dump.get("__keys")
-    print(f"[interaction] action={action!r} keys={keys}", flush=True)
-
-
-def wire_viewer(viewer: StiViewer) -> None:
-    apply_license(viewer)
-    viewer.options.appearance.fullScreenMode = True
-    viewer.handler.passQueryParametersToReport = True
-    viewer.onBeginProcessData += begin_process_data
-    viewer.onPrepareVariables += prepare_variables
-    # alnum → вызов window.dashCaptureInteraction(args) из dash_debug.js
-    viewer.onInteraction += "dashCaptureInteraction"
-
-
-def wire_designer(designer: StiDesigner) -> None:
-    apply_license(designer)
-    designer.options.appearance.fullScreenMode = True
-    designer.handler.passQueryParametersToReport = True
-    designer.onBeginProcessData += begin_process_data
-    designer.onPrepareVariables += prepare_variables
-    designer.onSaveReport += save_report
-    designer.onSaveAsReport += save_report
+    return component.getFrameworkResponse()
 
 
 @app.get("/favicon.ico")
@@ -362,110 +153,9 @@ def favicon():
     return Response(status=204)
 
 
-@app.get("/dash-debug.js")
-def dash_debug_js():
-    resp = Response(_DEBUG_JS, mimetype="application/javascript; charset=utf-8")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.get("/api/params")
-def get_params():
-    with _params_lock:
-        return jsonify(
-            {
-                "params": dict(_PARAMS),
-                "interaction": _LAST_INTERACTION,
-                "interactions_count": len(_INTERACTIONS),
-            }
-        )
-
-
-@app.get("/api/interactions")
-def get_interactions():
-    with _params_lock:
-        return jsonify({"interactions": list(_INTERACTIONS)})
-
-
-@app.post("/api/params")
-def post_params():
-    incoming = _body_params()
-    incoming.update(_public_query_params())
-    body = request.get_json(silent=True) if request.is_json else None
-    if isinstance(body, dict) and body.get("interaction") is not None:
-        remember_interaction(body.get("interaction"))
-    updated = params_update(incoming)
-    return jsonify({"ok": True, "params": updated})
-
-
-@app.delete("/api/params")
-def clear_params():
-    global _LAST_INTERACTION, _LAST_PAGE
-    with _params_lock:
-        _PARAMS.clear()
-        _LAST_INTERACTION = None
-        _INTERACTIONS.clear()
-        _LAST_PAGE = None
-    return jsonify({"ok": True, "params": {}})
-
-
-@app.post("/api/page")
-def post_page():
-    """Кнопка page: texts, buttons, datasets, params с отрендеренной страницы."""
-    global _LAST_PAGE
-    body = request.get_json(silent=True) if request.is_json else None
-    if not isinstance(body, dict):
-        return jsonify({"ok": False, "error": "json body required"}), 400
-    snap = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "params": body.get("params") if isinstance(body.get("params"), dict) else {},
-        "elements": body.get("elements") if isinstance(body.get("elements"), list) else [],
-        "texts": body.get("texts") if isinstance(body.get("texts"), list) else [],
-        "buttons": body.get("buttons") if isinstance(body.get("buttons"), list) else [],
-        "datasets": body.get("datasets") if isinstance(body.get("datasets"), dict) else {},
-        "dom_texts": body.get("dom_texts") if isinstance(body.get("dom_texts"), list) else [],
-        "page": body.get("page"),
-        "pages_count": body.get("pages_count"),
-    }
-    if snap["params"]:
-        params_update(snap["params"])
-    with _params_lock:
-        _LAST_PAGE = snap
-    print(
-        f"[page] texts={len(snap['texts'])} buttons={len(snap['buttons'])} "
-        f"datasets={len(snap['datasets'])}",
-        flush=True,
-    )
-    return jsonify({"ok": True, "page": snap})
-
-
-@app.get("/api/page")
-def get_page():
-    with _params_lock:
-        if _LAST_PAGE is None:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "no page yet — нажми page в /viewer, потом снова GET",
-                }
-            ), 404
-        return jsonify({"ok": True, "page": _LAST_PAGE})
-
-
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
-    """Отдаём .mrt; пустой DashboardViewerSettings=0 прячет Export на dashboard."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        # StiDashboardViewerSettings.All = 1023 (Toolbar+Refresh+Open+FS+Menu+Edit+Snapshots+Exports+…)
-        dvs = data.get("DashboardViewerSettings")
-        if dvs in ("", None, 0, "0"):
-            data["DashboardViewerSettings"] = 1023
-        raw = json.dumps(data, ensure_ascii=False)
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -475,15 +165,14 @@ def serve_mrt():
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
     designer = StiDesigner()
-    wire_designer(designer)
+    apply_license(designer)
+    designer.options.appearance.fullScreenMode = True
+    designer.onBeginProcessData += begin_process_data
+    designer.onSaveReport += save_report
+    designer.onSaveAsReport += save_report
 
     if sti_process(designer):
         return sti_response(designer)
-
-    # query на первом открытии тоже кладём в store
-    q = _public_query_params()
-    if q:
-        params_update(q)
 
     report = StiReport()
     report.loadFile("/mrt")
@@ -494,20 +183,17 @@ def designer():
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     viewer = StiViewer()
-    wire_viewer(viewer)
+    apply_license(viewer)
+    viewer.options.appearance.fullScreenMode = True
+    viewer.onBeginProcessData += begin_process_data
 
     if sti_process(viewer):
-        # handler/ajax — без debug overlay
         return sti_response(viewer)
-
-    q = _public_query_params()
-    if q:
-        params_update(q)
 
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer, inject_debug=True)
+    return sti_response(viewer)
 
 
 def main() -> None:
@@ -515,15 +201,12 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
-    print(f"Params:   POST/GET http://{HOST}:{PORT}/api/params", flush=True)
-    print(f"Clicks:   GET http://{HOST}:{PORT}/api/interactions", flush=True)
-    print(f"Page:     кнопка page → GET http://{HOST}:{PORT}/api/page", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
         except Exception:
             pass
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    app.run(host=HOST, port=PORT, debug=False)
 
 
 if __name__ == "__main__":
