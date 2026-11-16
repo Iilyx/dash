@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Stimulsoft Dashboards.PYTHON 2024.2.2 — viewer/designer + snapshot данных.
+"""Stimulsoft Dashboards.PYTHON 2024.2.2 — viewer/designer + snapshot + .mdc.
 
-Snapshot (после фильтров на экране):
-  кнопка snapshot во viewer → StiElementDataCache.getOrCreate
-  POST/GET /api/snapshot
-  клики/фильтры → onInteraction → POST /api/interaction
+После фильтров на экране:
+  data  → StiElementDataCache → POST/GET /api/snapshot
+  mdc   → saveDocumentToJsonString → скачать .mdc + POST/GET /api/document
+  open  → /document открывает последний .mdc без повторного SQL
+  клики → onInteraction → POST/GET /api/interaction
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -36,6 +37,9 @@ ROOT = Path(__file__).resolve().parent
 _lock = threading.Lock()
 _SNAPSHOT: dict[str, Any] | None = None
 _LAST_INTERACTION: dict[str, Any] | None = None
+_DOCUMENT_JSON: str | None = None
+_DOCUMENT_NAME = "dashboard.mdc"
+SNAPSHOTS_DIR = ROOT / "snapshots"
 
 
 def load_env() -> None:
@@ -153,12 +157,31 @@ def sti_response(component, inject_snapshot: bool = False):
     resp = component.getFrameworkResponse()
     if inject_snapshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         html = resp.get_data(as_text=True)
-        if "dash-snapshot.js" not in html and ("</head>" in html or "<html" in html.lower()):
-            tag = '<script src="/dash-snapshot.js"></script>\n'
-            if "</head>" in html:
-                html = html.replace("</head>", tag + "</head>", 1)
-            else:
-                html = tag + html
+        if "</head>" in html or "<html" in html.lower():
+            if "dash-snapshot.js" not in html:
+                tag = '<script src="/dash-snapshot.js"></script>\n'
+                if "</head>" in html:
+                    html = html.replace("</head>", tag + "</head>", 1)
+                else:
+                    html = tag + html
+            # Stimulsoft генерит `let viewer = ...` внутри start() — снаружи не видно.
+            # Пробрасываем на window, чтобы snapshot читал уже отрендеренный report.
+            html = html.replace(
+                "let viewer = new Stimulsoft.Viewer.StiViewer",
+                "let viewer = window.viewer = new Stimulsoft.Viewer.StiViewer",
+                1,
+            )
+            if "viewer.renderHtml(" in html and "dashSnapshotHook" not in html:
+                html = html.replace(
+                    "viewer.renderHtml('viewerContent');",
+                    "viewer.renderHtml('viewerContent');\n"
+                    "window.viewer = viewer;\n"
+                    "setTimeout(function(){ "
+                    "if (window.dashCaptureSnapshot) "
+                    "console.log('[dash] viewer ready, press snapshot'); "
+                    "}, 1500);",
+                    1,
+                )
             resp.set_data(html)
     return resp
 
@@ -221,6 +244,107 @@ def post_interaction():
     return jsonify({"ok": True})
 
 
+def _store_document(name: str, document: str) -> Path:
+    global _DOCUMENT_JSON, _DOCUMENT_NAME
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in (name or "dashboard.mdc"))
+    if not safe.lower().endswith(".mdc"):
+        safe += ".mdc"
+    path = SNAPSHOTS_DIR / safe
+    path.write_text(document, encoding="utf-8")
+    latest = SNAPSHOTS_DIR / "last.mdc"
+    if path.resolve() != latest.resolve():
+        latest.write_text(document, encoding="utf-8")
+    with _lock:
+        _DOCUMENT_JSON = document
+        _DOCUMENT_NAME = safe
+    return path
+
+
+@app.get("/api/document")
+def get_document():
+    with _lock:
+        doc = _DOCUMENT_JSON
+        name = _DOCUMENT_NAME
+    if not doc:
+        latest = SNAPSHOTS_DIR / "last.mdc"
+        if latest.is_file():
+            doc = latest.read_text(encoding="utf-8")
+            name = "last.mdc"
+    if not doc:
+        return jsonify({"ok": False, "error": "no document yet — нажми mdc во viewer"}), 404
+    if request.args.get("download") == "1":
+        return Response(
+            doc,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+    return jsonify({"ok": True, "filename": name, "chars": len(doc), "document": doc})
+
+
+@app.post("/api/document")
+def post_document():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "JSON object required"}), 400
+    document = body.get("document")
+    if not isinstance(document, str) or len(document) < 2:
+        return jsonify({"ok": False, "error": "document string required"}), 400
+    name = str(body.get("filename") or "dashboard.mdc")
+    path = _store_document(name, document)
+    print(
+        f"[document] saved {path.name} method={body.get('method')!r} chars={len(document)}",
+        flush=True,
+    )
+    return jsonify({"ok": True, "filename": path.name, "chars": len(document), "path": str(path)})
+
+
+@app.get("/document")
+def open_document_page():
+    """Открыть последний .mdc во viewer без повторного SQL."""
+    html = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Open document (.mdc)</title>
+  <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.reports.js"></script>
+  <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.dashboards.js"></script>
+  <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.viewer.js"></script>
+  <script src="/viewer?sti_event=GetResource&sti_data=stimulsoft.handler.js"></script>
+</head>
+<body onload="start()">
+  <div id="viewerContent"></div>
+  <script>
+  async function start() {
+    const r = await fetch('/api/document');
+    const data = await r.json();
+    if (!r.ok || !data.document) {
+      document.body.innerHTML = '<pre style="padding:16px;font:14px monospace">Нет .mdc. Открой /viewer, нажми mdc.</pre>';
+      return;
+    }
+    const options = new Stimulsoft.Viewer.StiViewerOptions();
+    options.appearance.fullScreenMode = true;
+    options.toolbar.showFullScreenButton = false;
+    const viewer = window.viewer = new Stimulsoft.Viewer.StiViewer(options, 'viewerDoc', false);
+    const report = new Stimulsoft.Report.StiReport();
+    if (typeof report.loadDocument === 'function') {
+      report.loadDocument(data.document);
+    } else if (typeof report.loadDocumentFromJsonString === 'function') {
+      report.loadDocumentFromJsonString(data.document);
+    } else {
+      report.load(data.document);
+    }
+    viewer.report = report;
+    viewer.renderHtml('viewerContent');
+    console.log('[document] opened', data.filename, data.chars);
+  }
+  </script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
@@ -271,7 +395,9 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer:  http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:    http://{HOST}:{PORT}/viewer", flush=True)
-    print(f"Snapshot:  POST/GET http://{HOST}:{PORT}/api/snapshot", flush=True)
+    print(f"Data JSON: POST/GET http://{HOST}:{PORT}/api/snapshot", flush=True)
+    print(f"Document:  POST/GET http://{HOST}:{PORT}/api/document  (кнопка mdc)", flush=True)
+    print(f"Open .mdc: http://{HOST}:{PORT}/document", flush=True)
     print(f"Clicks:    POST/GET http://{HOST}:{PORT}/api/interaction", flush=True)
     if OPEN_BROWSER:
         try:

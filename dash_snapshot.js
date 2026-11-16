@@ -85,10 +85,11 @@
 
   function getViewer() {
     try {
-      if (typeof viewer !== "undefined" && viewer) return viewer;
+      if (window.viewer) return window.viewer;
     } catch (e) {}
     try {
-      if (window.viewer) return window.viewer;
+      // fallback: если Stimulsoft оставил let viewer в общем scope
+      if (typeof viewer !== "undefined" && viewer) return viewer;
     } catch (e2) {}
     return null;
   }
@@ -101,7 +102,8 @@
         return v.report;
       }
     } catch (e) {}
-    return window.__dashReport || null;
+    if (window.__dashReport) return window.__dashReport;
+    return null;
   }
 
   function readVariables(report) {
@@ -300,11 +302,15 @@
     ].join(";");
     el.innerHTML =
       '<span style="color:#94a3b8">dashboard</span>' +
-      '<button type="button" id="dash-snapshot-btn" style="background:#14532d;color:#bbf7d0;border:1px solid #22c55e;border-radius:6px;padding:4px 10px;cursor:pointer">snapshot</button>' +
+      '<button type="button" id="dash-snapshot-btn" style="background:#14532d;color:#bbf7d0;border:1px solid #22c55e;border-radius:6px;padding:4px 10px;cursor:pointer">data</button>' +
+      '<button type="button" id="dash-mdc-btn" style="background:#1e3a5f;color:#bfdbfe;border:1px solid #3b82f6;border-radius:6px;padding:4px 10px;cursor:pointer">mdc</button>' +
       '<span id="dash-snapshot-status" style="color:#86efac;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>';
     document.body.appendChild(el);
     document.getElementById("dash-snapshot-btn").onclick = function () {
       window.dashCaptureSnapshot();
+    };
+    document.getElementById("dash-mdc-btn").onclick = function () {
+      window.dashSaveDocument();
     };
     return el;
   }
@@ -405,6 +411,124 @@
       });
     } catch (e4) {}
     return snapshot;
+  };
+
+  function downloadText(filename, text, mime) {
+    try {
+      if (
+        window.Stimulsoft &&
+        Stimulsoft.System &&
+        Stimulsoft.System.StiObject &&
+        typeof Stimulsoft.System.StiObject.saveAs === "function"
+      ) {
+        Stimulsoft.System.StiObject.saveAs(text, filename, mime || "application/json;charset=utf-8");
+        return;
+      }
+    } catch (e) {}
+    var blob = new Blob([text], { type: mime || "application/json;charset=utf-8" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 0);
+  }
+
+  window.dashSaveDocument = async function () {
+    ensurePanel();
+    setStatus("сохраняю .mdc…");
+    var report = getReport();
+    if (!report) {
+      var err = {
+        ok: false,
+        error: "report not ready — дождись загрузки дашборда",
+      };
+      setStatus(err.error);
+      return err;
+    }
+
+    var json = null;
+    var method = null;
+    try {
+      if (typeof report.saveDocumentToJsonString === "function") {
+        json = report.saveDocumentToJsonString();
+        method = "saveDocumentToJsonString";
+      }
+    } catch (e) {
+      if (window.console && console.warn) console.warn("saveDocumentToJsonString failed", e);
+    }
+
+    // fallback: export Document (snapshot)
+    if (!json) {
+      try {
+        if (typeof report.exportDocumentAsync === "function" && Stimulsoft.Report.StiExportFormat) {
+          json = await new Promise(function (resolve, reject) {
+            try {
+              report.exportDocumentAsync(function (data) {
+                resolve(data);
+              }, Stimulsoft.Report.StiExportFormat.Document);
+            } catch (e2) {
+              reject(e2);
+            }
+          });
+          method = "exportDocumentAsync.Document";
+          if (json && typeof json !== "string") {
+            try {
+              json = new TextDecoder("utf-8").decode(json);
+            } catch (e3) {
+              try {
+                json = String.fromCharCode.apply(null, json);
+              } catch (e4) {
+                json = String(json);
+              }
+            }
+          }
+        }
+      } catch (e5) {
+        if (window.console && console.warn) console.warn("export Document failed", e5);
+      }
+    }
+
+    if (!json || typeof json !== "string" || json.length < 2) {
+      var err2 = {
+        ok: false,
+        error: "не удалось сериализовать document (.mdc)",
+      };
+      setStatus(err2.error);
+      return err2;
+    }
+
+    var alias = "dashboard";
+    try {
+      alias = report.reportAlias || report.reportName || alias;
+    } catch (e6) {}
+    var safe = String(alias).replace(/[^\w\-]+/g, "_") || "dashboard";
+    var filename = safe + ".mdc";
+
+    downloadText(filename, json, "application/json;charset=utf-8");
+
+    try {
+      await fetch("/api/document", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: true,
+          filename: filename,
+          method: method,
+          captured_at: new Date().toISOString(),
+          document: json,
+        }),
+      });
+    } catch (e7) {}
+
+    setStatus("mdc saved (" + method + ", " + json.length + " chars)");
+    if (window.console && console.log) {
+      console.log("[dash mdc]", { filename: filename, method: method, chars: json.length });
+    }
+    return { ok: true, filename: filename, method: method, chars: json.length };
   };
 
   if (document.readyState === "loading") {
