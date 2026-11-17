@@ -50,22 +50,44 @@ def path_of(raw: str) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-def apply_license(component) -> None:
-    """В 2024.2.x лицензия вешается на instance: component.license.setKey/setFile."""
-    key = (
+def license_key() -> str:
+    return (
         os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
         or os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
         or os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
     )
-    file_raw = (
+
+
+def license_file() -> str:
+    raw = (
         os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip()
         or os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip()
         or os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
     )
+    if not raw:
+        return ""
+    return str(path_of(raw).resolve())
+
+
+def apply_license(component) -> bool:
+    """Docs (How to Activate): ключ → Stimulsoft.Base.StiLicense.Key в HTML.
+
+    В 2024.2.2: component.license.setKey/setFile; при viewer.report=report
+    лицензия копируется с viewer на report и попадает в page через report.getHtml().
+    .env в gitignore — ключ только локально, на git не уезжает.
+    """
+    key = license_key()
+    file_path = license_file()
     if key:
         component.license.setKey(key)
-    elif file_raw:
-        component.license.setFile(str(path_of(file_raw).resolve()))
+        return True
+    if file_path:
+        if not Path(file_path).is_file():
+            print(f"WARN: license file not found: {file_path}", flush=True)
+            return False
+        component.license.setFile(file_path)
+        return True
+    return False
 
 
 load_env()
@@ -177,7 +199,7 @@ _EXPORT_UI = """
       if (window.viewer && window.viewer.report) return window.viewer.report;
       return null;
     }
-    function exportDoc(fmt, ext, mime) {
+    function exportDoc(fmt, ext, mime, settings) {
       var r = report();
       if (!r) { alert("Дашборд ещё не загружен"); return; }
       var btns = bar.querySelectorAll("button");
@@ -186,16 +208,23 @@ _EXPORT_UI = """
         var name = (r.reportAlias || r.reportName || "dashboard") + ext;
         Stimulsoft.System.StiObject.saveAs(data, name, mime);
         btns.forEach(function (b) { b.disabled = false; });
-      }, fmt);
+      }, fmt, null, settings || null);
     }
     document.getElementById("sti-export-pdf").onclick = function () {
-      exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf");
+      var s = new Stimulsoft.Report.Dashboard.Export.StiPdfDashboardExportSettings();
+      if ("imageQuality" in s) s.imageQuality = 200;
+      exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf", s);
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
+      // Charts/Cards → картинки в xlsx; низкий imageQuality / trial часто даёт
+      // «Не удалось отобразить рисунок». Default imageQuality=200.
+      var s = new Stimulsoft.Report.Dashboard.Export.StiExcelDashboardExportSettings();
+      if ("imageQuality" in s) s.imageQuality = 200;
       exportDoc(
         Stimulsoft.Report.StiExportFormat.Excel2007,
         ".xlsx",
-        "application/vnd.ms-excel"
+        "application/vnd.ms-excel",
+        s
       );
     };
   }
@@ -281,7 +310,7 @@ def serve_mrt():
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
     designer = StiDesigner()
-    apply_license(designer)
+    licensed = apply_license(designer)
     designer.options.appearance.fullScreenMode = True
     designer.onBeginProcessData += begin_process_data
     designer.onSaveReport += save_report
@@ -291,8 +320,11 @@ def designer():
         return sti_response(designer)
 
     report = StiReport()
+    apply_license(report)
     report.loadFile("/mrt")
-    designer.report = report
+    designer.report = report  # копирует designer.license → report.license
+    if licensed:
+        apply_license(designer.report)
     return sti_response(designer)
 
 
@@ -320,7 +352,7 @@ def enable_full_exports(viewer: StiViewer) -> None:
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     viewer = StiViewer()
-    apply_license(viewer)
+    licensed = apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     enable_full_exports(viewer)
     viewer.onBeginProcessData += begin_process_data
@@ -329,12 +361,18 @@ def viewer():
         return sti_response(viewer)
 
     report = StiReport()
+    apply_license(report)
     report.loadFile("/mrt")
-    viewer.report = report
+    viewer.report = report  # копирует viewer.license → report.license → JS StiLicense.Key
+    if licensed:
+        apply_license(viewer.report)
     resp = sti_response(viewer)
     html = resp.get_data(as_text=True)
     if isinstance(html, str) and ("</body>" in html.lower() or "StiViewer" in html):
-        resp.set_data(inject_export_ui(html))
+        html = inject_export_ui(html)
+        if licensed and "StiLicense.Key" not in html and "StiLicense.loadFromFile" not in html:
+            print("WARN: license set in Python but missing in HTML", flush=True)
+        resp.set_data(html)
     return resp
 
 
@@ -343,18 +381,16 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
-    lic = (
-        os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
-        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
-        or os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
-        or os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip()
-        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip()
-        or os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
-    )
-    if not lic:
+    if license_key() or license_file():
+        print("License: OK (from .env — not committed to git)", flush=True)
+    else:
         print(
-            "WARN: нет Stimulsoft license — серый trial/DEMO watermark на элементах. "
-            "Задай STIMULSOFT_DASHBOARDS_LICENSE_KEY в .env",
+            "WARN: нет Stimulsoft license в .env — trial watermark в PDF/Excel "
+            "и «Не удалось отобразить рисунок» на чартах. "
+            "Preview в Designer ок, потому что там логин Stimulsoft. "
+            ".env в .gitignore — ключ не из git. "
+            "Нужен ключ именно для Dashboards.PYTHON / JS 2024.2.x "
+            "(STIMULSOFT_DASHBOARDS_LICENSE_KEY или _LICENSE_FILE).",
             flush=True,
         )
     if OPEN_BROWSER:
