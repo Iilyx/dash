@@ -663,6 +663,208 @@
     };
   }
 
+  function isFilterHost(el) {
+    return /ComboBox|ListBox|DatePicker|TreeViewBox|NumberBox/i.test(attrType(el));
+  }
+
+  function readFilterLabel(host) {
+    var label = "";
+    try {
+      var sel = host.querySelector("select");
+      if (sel && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+        label =
+          sel.options[sel.selectedIndex].textContent ||
+          sel.options[sel.selectedIndex].text ||
+          sel.value ||
+          "";
+      }
+    } catch (e) {}
+    if (!label) {
+      try {
+        var inp = host.querySelector(
+          "input:not([type=hidden]), textarea, [contenteditable='true']"
+        );
+        if (inp) {
+          label = (inp.value != null && String(inp.value)) || inp.textContent || "";
+        }
+      } catch (e) {}
+    }
+    // Stimulsoft DropDownList: .text / .key на контроле
+    if (!label) {
+      try {
+        var nodes = host.querySelectorAll("*");
+        for (var i = 0; i < nodes.length; i++) {
+          var n = nodes[i];
+          if (n.text != null && String(n.text).trim()) {
+            label = String(n.text).trim();
+            break;
+          }
+          if (n.key != null && n.textBox && n.textBox.value) {
+            label = String(n.textBox.value).trim();
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+    if (!label) {
+      try {
+        var ea = host.elementAttributes;
+        if (ea && ea.contentAttributes) {
+          var ca = ea.contentAttributes;
+          if (ca.selectedValues && ca.selectedValues.length)
+            label = String(ca.selectedValues[0]);
+          else if (ca.text) label = String(ca.text);
+          else if (ca.value) label = String(ca.value);
+        }
+      } catch (e) {}
+    }
+    return String(label || "").trim();
+  }
+
+  /**
+   * html2canvas часто не рисует value у ComboBox/select/input.
+   * Печём видимый текст выбранного фильтра поверх контрола.
+   */
+  function bakeFilterValues(root) {
+    var restorers = [];
+    var hosts = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      if (isFilterHost(nodes[i])) hosts.push(nodes[i]);
+    }
+    // нативные select вне hosts
+    var selects = root.querySelectorAll("select");
+    console.log("[dash-shot] filter hosts", hosts.length, "selects", selects.length);
+
+    function placeLabel(target, text, host) {
+      if (!text) return;
+      var ir = target.getBoundingClientRect();
+      var hr = host.getBoundingClientRect();
+      if (ir.width < 2 || ir.height < 2) return;
+      if (getComputedStyle(host).position === "static") {
+        restorers.push({ el: host, position: host.style.position });
+        host.style.position = "relative";
+      }
+      var div = document.createElement("div");
+      div.setAttribute("data-sti-filter-bake", "1");
+      div.textContent = text;
+      var cs = window.getComputedStyle(target);
+      div.style.cssText = [
+        "position:absolute",
+        "left:" + Math.round(ir.left - hr.left) + "px",
+        "top:" + Math.round(ir.top - hr.top) + "px",
+        "width:" + Math.round(ir.width) + "px",
+        "height:" + Math.round(ir.height) + "px",
+        "box-sizing:border-box",
+        "display:flex",
+        "align-items:center",
+        "padding:0 8px",
+        "overflow:hidden",
+        "white-space:nowrap",
+        "background:" + (cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)"
+          ? cs.backgroundColor
+          : "#ffffff"),
+        "color:" + (cs.color || "#111"),
+        "font:" + cs.font,
+        "border-radius:" + (cs.borderRadius || "0"),
+        "z-index:2",
+        "pointer-events:none",
+      ].join(";");
+      host.appendChild(div);
+      restorers.push({ div: div });
+      // прячем исходный контрол на время снимка (иначе пустой поверх/под)
+      restorers.push({ el: target, visibility: target.style.visibility });
+      target.style.visibility = "hidden";
+    }
+
+    for (var h = 0; h < hosts.length; h++) {
+      var host = hosts[h];
+      var label = readFilterLabel(host);
+      console.log(
+        "[dash-shot] filter",
+        attrName(host) || attrType(host),
+        JSON.stringify(label)
+      );
+      if (!label) continue;
+      var paintTarget =
+        host.querySelector("select, input:not([type=hidden]), textarea") ||
+        host.contentPanel ||
+        host;
+      // не затирать titlePanel
+      if (paintTarget === host && host.contentPanel) paintTarget = host.contentPanel;
+      placeLabel(paintTarget, label, host);
+    }
+
+    for (var s = 0; s < selects.length; s++) {
+      var sel = selects[s];
+      if (sel.closest && hosts.some(function (hh) { return hh.contains(sel); }))
+        continue;
+      var text = "";
+      if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+        text =
+          sel.options[sel.selectedIndex].textContent ||
+          sel.options[sel.selectedIndex].text ||
+          "";
+      }
+      if (!text) continue;
+      var parent = sel.parentElement || root;
+      placeLabel(sel, text, parent);
+    }
+
+    return function restore() {
+      restorers.forEach(function (x) {
+        try {
+          if (x.div && x.div.parentNode) x.div.parentNode.removeChild(x.div);
+        } catch (e) {}
+        try {
+          if (x.el && x.visibility != null) x.el.style.visibility = x.visibility;
+        } catch (e) {}
+        try {
+          if (x.el && x.position != null) x.el.style.position = x.position;
+        } catch (e) {}
+      });
+    };
+  }
+
+  function onCloneFixFormValues(doc) {
+    try {
+      var selects = doc.querySelectorAll("select");
+      for (var i = 0; i < selects.length; i++) {
+        var sel = selects[i];
+        if (sel.getAttribute("data-sti-filter-bake")) continue;
+        var text = "";
+        if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+          text =
+            sel.options[sel.selectedIndex].textContent ||
+            sel.options[sel.selectedIndex].text ||
+            "";
+        }
+        if (!text) continue;
+        var div = doc.createElement("div");
+        div.textContent = text;
+        div.setAttribute("style", sel.getAttribute("style") || "");
+        div.style.display = "flex";
+        div.style.alignItems = "center";
+        div.style.paddingLeft = "8px";
+        div.style.overflow = "hidden";
+        div.style.whiteSpace = "nowrap";
+        div.style.background = "#fff";
+        div.style.color = "#111";
+        if (sel.parentNode) sel.parentNode.replaceChild(div, sel);
+      }
+      var inputs = doc.querySelectorAll("input, textarea");
+      for (var j = 0; j < inputs.length; j++) {
+        var inp = inputs[j];
+        try {
+          inp.setAttribute("value", inp.value || "");
+          if (inp.tagName === "TEXTAREA") inp.textContent = inp.value || "";
+        } catch (e) {}
+      }
+    } catch (e) {
+      console.warn("[dash-shot] onclone filters", e);
+    }
+  }
+
   async function takeScreenshot() {
     var root = captureRoot();
     if (!root) {
@@ -671,14 +873,18 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restore = function () {};
+    var restoreMaps = function () {};
+    var restoreFilters = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
 
       setStatus("карты из iframe…");
-      restore = (await bakeMaps(root, report)) || function () {};
+      restoreMaps = (await bakeMaps(root, report)) || function () {};
+
+      setStatus("фильтры…");
+      restoreFilters = bakeFilterValues(root) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
@@ -697,10 +903,15 @@
         ignoreElements: function (el) {
           return !!(el && el.id === "dashShotBar");
         },
+        onclone: function (doc) {
+          onCloneFixFormValues(doc);
+        },
       });
 
-      restore();
-      restore = function () {};
+      restoreFilters();
+      restoreMaps();
+      restoreFilters = function () {};
+      restoreMaps = function () {};
 
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
@@ -731,7 +942,10 @@
       setStatus(String((err && err.message) || err));
     } finally {
       try {
-        restore();
+        restoreFilters();
+      } catch (e) {}
+      try {
+        restoreMaps();
       } catch (e) {}
       if (btn) btn.disabled = false;
     }
