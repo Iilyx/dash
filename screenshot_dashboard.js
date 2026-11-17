@@ -2,8 +2,7 @@
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
- * Фикс: SVG из iframe.contentDocument → offscreen canvas, после html2canvas
- * рисуем поверх PNG ровно в бокс iframe (DOM не трогаем — элемент над картой остаётся).
+ * Фикс: читаем SVG из iframe.contentDocument, печём в <canvas>, прячем iframe, снимаем страницу.
  */
 (function () {
   var HTML2CANVAS =
@@ -248,6 +247,28 @@
     });
   }
 
+  /** Bake-слой ровно в бокс iframe — не на весь host (иначе перекрывает title/кнопки сверху). */
+  function applyIframeBox(el, iframe) {
+    var cs = window.getComputedStyle(iframe);
+    el.style.position = "absolute";
+    el.style.left = iframe.style.left || cs.left || "0px";
+    el.style.top = iframe.style.top || cs.top || "0px";
+    el.style.width = iframe.offsetWidth
+      ? iframe.offsetWidth + "px"
+      : iframe.style.width || cs.width;
+    el.style.height = iframe.offsetHeight
+      ? iframe.offsetHeight + "px"
+      : iframe.style.height || cs.height;
+    // не выше соседних оверлеев host (title/buttons)
+    var z = cs.zIndex;
+    el.style.zIndex = z && z !== "auto" ? String(z) : "0";
+    el.style.margin = "0";
+    el.style.border = "none";
+    el.style.display = "block";
+    el.style.pointerEvents = "none";
+    el.style.objectFit = "fill";
+  }
+
   function typeName(c) {
     try {
       if (!c) return "";
@@ -306,125 +327,6 @@
       if (I && c.is && c.is(I)) return true;
     } catch (e) {}
     return /OnlineMap/i.test(typeName(c));
-  }
-
-  function isPivotTableElement(c) {
-    if (!c) return false;
-    try {
-      var I =
-        Stimulsoft.Report &&
-        Stimulsoft.Report.Dashboard &&
-        Stimulsoft.Report.Dashboard.IStiPivotTableElement;
-      if (I && c.is && c.is(I)) return true;
-    } catch (e) {}
-    return /PivotTable/i.test(typeName(c));
-  }
-
-  function exportElementAsync(element, format) {
-    return new Promise(function (resolve, reject) {
-      try {
-        var Tools =
-          Stimulsoft.Dashboard &&
-          Stimulsoft.Dashboard.Export &&
-          Stimulsoft.Dashboard.Export.StiDashboardExportTools;
-        if (!Tools || typeof Tools.exportAsync !== "function") {
-          reject(new Error("StiDashboardExportTools.exportAsync нет"));
-          return;
-        }
-        Tools.exportAsync(
-          function (data) {
-            if (data == null) reject(new Error("empty export"));
-            else resolve(data);
-          },
-          element,
-          format
-        );
-      } catch (e) {
-        reject(e);
-      }
-    });
-  }
-
-  function stiBytesToBase64(data) {
-    var bytes;
-    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
-    else if (data && data.buffer instanceof ArrayBuffer)
-      bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length);
-    else if (typeof data === "string") return btoa(data);
-    else if (Array.isArray(data)) bytes = new Uint8Array(data);
-    else throw new Error("unknown export payload");
-    var chunk = 0x8000;
-    var parts = [];
-    for (var i = 0; i < bytes.length; i += chunk) {
-      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
-    }
-    return btoa(parts.join(""));
-  }
-
-  /** Save на Pivot в viewer → Image/Excel/Data; PDF — через export API (все строки). */
-  async function exportPivotsToPdf() {
-    var report = findReport();
-    if (!report) {
-      setStatus("report не найден");
-      return;
-    }
-    var Pdf =
-      Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
-        ? Stimulsoft.Report.StiExportFormat.Pdf
-        : null;
-    if (Pdf == null) {
-      setStatus("StiExportFormat.Pdf нет");
-      return;
-    }
-    var pivots = collectAll(report).filter(isPivotTableElement);
-    console.log(
-      "[dash-shot] pivots",
-      pivots.map(function (p) {
-        return p.name || typeName(p);
-      })
-    );
-    if (!pivots.length) {
-      setStatus("PivotTable не найден");
-      return;
-    }
-    var btn = document.getElementById("dashPivotPdfBtn");
-    if (btn) btn.disabled = true;
-    var saved = 0;
-    try {
-      for (var i = 0; i < pivots.length; i++) {
-        var el = pivots[i];
-        var base =
-          String(el.name || "PivotTable" + (i + 1)).replace(/\s+/g, "_") +
-          "_" +
-          stamp();
-        setStatus("PDF " + (el.name || base) + "…");
-        var data = await exportElementAsync(el, Pdf);
-        var pdfName = base + ".pdf";
-        try {
-          Stimulsoft.System.StiObject.saveAs(
-            data,
-            pdfName,
-            "application/pdf"
-          );
-        } catch (e) {
-          console.warn("[dash-shot] saveAs pdf", e);
-        }
-        try {
-          var b64 = stiBytesToBase64(data);
-          await postExportFile(pdfName, b64, "pdf");
-          saved++;
-        } catch (e) {
-          console.warn("[dash-shot] pdf upload", e);
-          saved++;
-        }
-      }
-      setStatus("pivot pdf: " + saved + " → exports/");
-    } catch (err) {
-      console.error(err);
-      setStatus(String((err && err.message) || err));
-    } finally {
-      if (btn) btn.disabled = false;
-    }
   }
 
   function normalizeExportBytes(data) {
@@ -543,39 +445,12 @@
     return out;
   }
 
-  /** Бокс для карты: contentPanel / iframe, ниже titlePanel — title на скрине остаётся. */
-  function mapContentBox(host, iframe, root) {
-    var rootRect = root.getBoundingClientRect();
-    var target =
-      (host.contentPanel && host.contentPanel.getBoundingClientRect().height > 2
-        ? host.contentPanel
-        : null) || iframe;
-    var ir = target.getBoundingClientRect();
-    var box = {
-      x: ir.left - rootRect.left + (root.scrollLeft || 0),
-      y: ir.top - rootRect.top + (root.scrollTop || 0),
-      w: ir.width,
-      h: ir.height,
-    };
-    var titleEl = host.titlePanel;
-    if (titleEl && titleEl.offsetParent !== null) {
-      var tr = titleEl.getBoundingClientRect();
-      var titleBottom = tr.bottom - rootRect.top + (root.scrollTop || 0);
-      if (box.y < titleBottom - 1) {
-        var cut = titleBottom - box.y;
-        box.y = titleBottom;
-        box.h = Math.max(1, box.h - cut);
-      }
-    }
-    return box;
-  }
-
   /**
-   * Снимаем карту offscreen (DOM не меняем).
-   * paintMapOverlays кладёт её только в content-бокс — titlePanel не затираем.
+   * RegionMap: SVG живёт внутри iframe → canvas в host, iframe hide.
+   * OnlineMap без SVG: Stimulsoft Image export → <img>.
    */
-  async function captureMapOverlays(root, report) {
-    var overlays = [];
+  async function bakeMaps(root, report) {
+    var restorers = [];
     var hosts = collectMapHosts(root);
     setStatus("карты " + hosts.length);
 
@@ -588,9 +463,6 @@
         continue;
       }
 
-      var box = mapContentBox(host, iframe, root);
-      if (box.w < 2 || box.h < 2) continue;
-
       var doc = iframeDoc(iframe);
       var win = iframeWin(iframe);
       var svg = doc && doc.querySelector("svg");
@@ -599,28 +471,31 @@
         hasDoc: !!doc,
         svg: !!svg,
         type: attrType(host),
-        box: box,
-        titleH: host.titlePanel ? host.titlePanel.offsetHeight : 0,
       });
+
+      if (getComputedStyle(host).position === "static") {
+        restorers.push({ el: host, position: host.style.position });
+        host.style.position = "relative";
+      }
 
       if (svg) {
         try {
           var baked = await svgToCanvas(svg, win);
-          overlays.push({
-            name: name,
-            canvas: baked.canvas,
-            x: box.x,
-            y: box.y,
-            w: box.w,
-            h: box.h,
-          });
-          console.log("[dash-shot] overlay SVG ready", name, box.w, "x", box.h);
+          applyIframeBox(baked.canvas, iframe);
+          restorers.push({ iframe: iframe, display: iframe.style.display });
+          iframe.style.display = "none";
+          restorers.push({ canvas: baked.canvas, host: host });
+          // вставляем сразу после iframe, не на весь host
+          if (iframe.nextSibling) host.insertBefore(baked.canvas, iframe.nextSibling);
+          else host.appendChild(baked.canvas);
+          console.log("[dash-shot] baked iframe SVG", name, baked.canvas.style.cssText);
           continue;
         } catch (e) {
           console.warn("[dash-shot] iframe SVG bake failed", name, e);
         }
       }
 
+      // OnlineMap / нет SVG — пробуем Stimulsoft Image
       if (report && /OnlineMap/i.test(attrType(host))) {
         try {
           var maps = collectAll(report).filter(isOnlineMapElement);
@@ -633,362 +508,49 @@
           }
           mapEl = mapEl || maps[0];
           if (!mapEl) throw new Error("no online map el");
-          var data = await exportOnlineMapPng(mapEl, box.w, box.h);
+          var rect = iframe.getBoundingClientRect();
+          var data = await exportOnlineMapPng(mapEl, rect.width, rect.height);
           var url = bytesToPngDataUrl(data);
           if (!url || url.length < 200) throw new Error("empty sti png");
-          var img = await loadImage(url);
+          var imgEl = document.createElement("img");
+          imgEl.setAttribute("data-sti-map-bake", "1");
+          imgEl.src = url;
+          applyIframeBox(imgEl, iframe);
+          // ink check
+          var probeImg = await loadImage(url);
           var probe = document.createElement("canvas");
-          probe.width = Math.max(1, Math.round(box.w * SCALE));
-          probe.height = Math.max(1, Math.round(box.h * SCALE));
-          probe.getContext("2d").drawImage(img, 0, 0, probe.width, probe.height);
+          probe.width = Math.max(1, Math.round(rect.width));
+          probe.height = Math.max(1, Math.round(rect.height));
+          probe.getContext("2d").drawImage(probeImg, 0, 0, probe.width, probe.height);
           if (!canvasHasInk(probe)) throw new Error("sti blank");
-          overlays.push({
-            name: name,
-            canvas: probe,
-            x: box.x,
-            y: box.y,
-            w: box.w,
-            h: box.h,
-          });
-          console.log("[dash-shot] overlay OnlineMap ready", name);
+          restorers.push({ iframe: iframe, display: iframe.style.display });
+          iframe.style.display = "none";
+          restorers.push({ img: imgEl });
+          if (iframe.nextSibling) host.insertBefore(imgEl, iframe.nextSibling);
+          else host.appendChild(imgEl);
+          console.log("[dash-shot] baked OnlineMap img", name);
         } catch (e) {
           console.warn("[dash-shot] OnlineMap bake skipped", name, e);
         }
       }
     }
 
-    return overlays;
-  }
-
-  function paintMapOverlays(pageCanvas, overlays) {
-    if (!overlays || !overlays.length) return 0;
-    var ctx = pageCanvas.getContext("2d");
-    for (var i = 0; i < overlays.length; i++) {
-      var o = overlays[i];
-      ctx.drawImage(
-        o.canvas,
-        Math.round(o.x * SCALE),
-        Math.round(o.y * SCALE),
-        Math.round(o.w * SCALE),
-        Math.round(o.h * SCALE)
-      );
-      console.log("[dash-shot] painted overlay", o.name);
-    }
-    return overlays.length;
-  }
-
-  function isTableHost(el) {
-    var t = attrType(el);
-    return (
-      t === "StiTableElement" ||
-      t === "StiPivotTableElement" ||
-      /TableElement/i.test(t)
-    );
-  }
-
-  function collectTableHosts(root) {
-    var out = [];
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      if (isTableHost(nodes[i])) out.push(nodes[i]);
-    }
-    console.log(
-      "[dash-shot] tables",
-      out.length,
-      out.map(function (el) {
-        return { name: attrName(el), type: attrType(el) };
-      })
-    );
-    return out;
-  }
-
-  function pushStyleRestore(restorers, el, keys) {
-    var saved = { el: el, styles: {} };
-    for (var i = 0; i < keys.length; i++) {
-      saved.styles[keys[i]] = el.style[keys[i]];
-    }
-    restorers.push(saved);
-  }
-
-  /**
-   * Table/Pivot в viewer с overflow+фиксированной высотой → на скрине обрезано.
-   * Раскрываем scroll-контейнеры на scrollHeight перед html2canvas.
-   */
-  function expandTables(root) {
-    var restorers = [];
-    var tables = collectTableHosts(root);
-    setStatus("таблицы " + tables.length);
-
-    tables.forEach(function (host) {
-      var nodes = [host];
-      if (host.contentPanel) nodes.push(host.contentPanel);
-      if (host.dataGrid) nodes.push(host.dataGrid);
-      var all = host.querySelectorAll("*");
-      for (var i = 0; i < all.length; i++) nodes.push(all[i]);
-
-      // 1) все внутренние scroll/clip → visible + высота по контенту
-      nodes.forEach(function (el) {
-        if (!el || !el.style) return;
-        var cs = window.getComputedStyle(el);
-        var oy = cs.overflowY;
-        var ox = cs.overflowX;
-        var ov = cs.overflow;
-        var clips =
-          oy === "auto" ||
-          oy === "scroll" ||
-          oy === "hidden" ||
-          ox === "auto" ||
-          ox === "scroll" ||
-          ov === "auto" ||
-          ov === "scroll" ||
-          ov === "hidden";
-        if (!clips) return;
-        var sh = el.scrollHeight;
-        var ch = el.clientHeight;
-        if (!(sh > ch + 2) && !(el.scrollWidth > el.clientWidth + 2)) return;
-
-        pushStyleRestore(restorers, el, [
-          "height",
-          "maxHeight",
-          "overflow",
-          "overflowX",
-          "overflowY",
-        ]);
-        el.style.overflow = "visible";
-        el.style.overflowX = "visible";
-        el.style.overflowY = "visible";
-        el.style.maxHeight = "none";
-        if (sh > ch + 2) el.style.height = sh + "px";
-        console.log(
-          "[dash-shot] expand node",
-          el.className || el.tagName,
-          ch + "→" + sh
-        );
-      });
-
-      // 2) сам host (absolute dashboard cell) тоже вырастить
-      var needH = Math.max(
-        host.scrollHeight,
-        host.dataGrid ? host.dataGrid.scrollHeight : 0,
-        host.contentPanel ? host.contentPanel.scrollHeight : 0
-      );
-      // title + padding
-      if (host.titlePanel) needH += host.titlePanel.offsetHeight || 0;
-      var hostH = host.clientHeight;
-      if (needH > hostH + 2) {
-        pushStyleRestore(restorers, host, ["height", "maxHeight", "overflow"]);
-        host.style.overflow = "visible";
-        host.style.maxHeight = "none";
-        host.style.height = needH + "px";
-        console.log(
-          "[dash-shot] expand host",
-          attrName(host) || attrType(host),
-          hostH + "→" + needH
-        );
-      }
-    });
-
     return function restore() {
       restorers.forEach(function (x) {
         try {
-          Object.keys(x.styles).forEach(function (k) {
-            x.el.style[k] = x.styles[k];
-          });
+          if (x.canvas && x.canvas.parentNode) x.canvas.parentNode.removeChild(x.canvas);
+        } catch (e) {}
+        try {
+          if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
+        } catch (e) {}
+        try {
+          if (x.iframe) x.iframe.style.display = x.display || "";
+        } catch (e) {}
+        try {
+          if (x.el && x.position != null) x.el.style.position = x.position;
         } catch (e) {}
       });
     };
-  }
-
-  function cellText(cell) {
-    if (cell == null) return "";
-    if (typeof cell !== "object") return String(cell);
-    if (cell.text != null && String(cell.text) !== "") return String(cell.text);
-    if (cell.displayValue != null) return String(cell.displayValue);
-    if (cell.value != null) return String(cell.value);
-    if (cell.sortLabel != null) return String(cell.sortLabel);
-    if (cell.label != null) return String(cell.label);
-    return "";
-  }
-
-  function headerText(cell, idx) {
-    if (cell == null) return "c" + idx;
-    if (typeof cell !== "object") return String(cell);
-    return (
-      cell.sortLabel ||
-      cell.label ||
-      cell.headerText ||
-      cell.text ||
-      cell.key ||
-      cell.name ||
-      "c" + idx
-    );
-  }
-
-  /** Достаёт все строки таблицы из dataGrid / contentAttributes (не только видимый scroll). */
-  function extractTableMatrix(host) {
-    var rows = null;
-    var src = "";
-    try {
-      if (host.dataGrid && host.dataGrid.data && host.dataGrid.data.length) {
-        rows = host.dataGrid.data;
-        src = "dataGrid.data";
-      }
-    } catch (e) {}
-    try {
-      var ca =
-        host.elementAttributes && host.elementAttributes.contentAttributes;
-      if ((!rows || !rows.length) && ca && ca.data && ca.data.length) {
-        rows = ca.data;
-        src = "contentAttributes.data";
-      }
-    } catch (e) {}
-    if (!rows || !rows.length) {
-      console.warn("[dash-shot] extract empty", {
-        name: attrName(host),
-        type: attrType(host),
-        hasGrid: !!(host.dataGrid),
-        gridData: host.dataGrid && host.dataGrid.data,
-      });
-      return null;
-    }
-
-    // Stimulsoft: data = [[{key,text,sortLabel,...}, ...], ...] — row0 = header
-    var matrix = [];
-    var first = rows[0];
-    if (Array.isArray(first)) {
-      matrix.push(
-        first.map(function (cell, idx) {
-          return headerText(cell, idx);
-        })
-      );
-      for (var r = 1; r < rows.length; r++) {
-        matrix.push(
-          rows[r].map(function (cell) {
-            return cellText(cell);
-          })
-        );
-      }
-      // если в row0 тоже данные (нет отдельных header fields) — уже ок
-      if (matrix.length === 1 && rows.length === 1) {
-        // only header row present
-      }
-    } else if (typeof first === "object") {
-      var header = Object.keys(first);
-      matrix.push(header);
-      rows.forEach(function (row) {
-        matrix.push(
-          header.map(function (k) {
-            return cellText(row[k]);
-          })
-        );
-      });
-    } else {
-      return null;
-    }
-    console.log("[dash-shot] extract", src, "rows", matrix.length, "cols", matrix[0].length);
-    return matrix;
-  }
-
-  function toCsv(matrix) {
-    return matrix
-      .map(function (row) {
-        return row
-          .map(function (cell) {
-            var s = String(cell == null ? "" : cell);
-            if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-            return s;
-          })
-          .join(",");
-      })
-      .join("\n");
-  }
-
-  async function postExportFile(name, data_b64, ext) {
-    var res = await fetch("/api/screenshot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name, data_b64: data_b64, ext: ext || "" }),
-    });
-    var body = await res.json().catch(function () {
-      return {};
-    });
-    if (!res.ok) throw new Error(body.error || String(res.status));
-    console.log("[dash-shot] server file", body.name || name, body.path || "");
-    return body;
-  }
-
-  async function saveTableData(root) {
-    var tables = collectTableHosts(root);
-    var saved = 0;
-    var paths = [];
-    for (var i = 0; i < tables.length; i++) {
-      var host = tables[i];
-      var matrix = extractTableMatrix(host);
-      if (!matrix || matrix.length < 1) {
-        console.warn(
-          "[dash-shot] no table data",
-          attrName(host) || attrType(host)
-        );
-        continue;
-      }
-      var base =
-        (attrName(host) || attrType(host) || "table").replace(/\s+/g, "_") +
-        "_" +
-        stamp();
-      // BOM — Excel нормально открывает UTF-8
-      var csv = "\ufeff" + toCsv(matrix);
-      var csvName = base + ".csv";
-      try {
-        var b64 = btoa(unescape(encodeURIComponent(csv)));
-        var savedMeta = await postExportFile(csvName, b64, "csv");
-        paths.push(savedMeta.name || csvName);
-        // один браузерный download CSV (Chrome режет пачку download'ов)
-        if (saved === 0) {
-          downloadBlob(
-            new Blob([csv], { type: "text/csv;charset=utf-8" }),
-            csvName
-          );
-        }
-      } catch (e) {
-        console.warn("[dash-shot] csv upload failed", e);
-        downloadBlob(
-          new Blob([csv], { type: "text/csv;charset=utf-8" }),
-          csvName
-        );
-        paths.push(csvName + " (download)");
-      }
-      // PNG таблицы — только на сервер, без второго browser download
-      try {
-        var tableCanvas = await window.html2canvas(host, {
-          scale: SCALE,
-          useCORS: true,
-          allowTaint: true,
-          backgroundColor: "#ffffff",
-          logging: false,
-          foreignObjectRendering: false,
-        });
-        var blob = await new Promise(function (resolve, reject) {
-          tableCanvas.toBlob(function (b) {
-            if (b) resolve(b);
-            else reject(new Error("toBlob failed"));
-          }, "image/png");
-        });
-        var pngName = base + ".png";
-        var pb64 = await blobToBase64(blob);
-        var pngMeta = await postExportFile(pngName, pb64, "png");
-        paths.push(pngMeta.name || pngName);
-      } catch (e) {
-        console.warn("[dash-shot] table png failed", e);
-      }
-      saved++;
-      console.log(
-        "[dash-shot] table saved",
-        attrName(host),
-        "rows",
-        matrix.length
-      );
-    }
-    return { saved: saved, paths: paths };
   }
 
   async function takeScreenshot() {
@@ -999,28 +561,20 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restoreTables = function () {};
+    var restore = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
 
-      setStatus("раскрываем таблицы…");
-      restoreTables = expandTables(root) || function () {};
+      setStatus("карты из iframe…");
+      restore = (await bakeMaps(root, report)) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
           setTimeout(res, 80);
         });
       });
-
-      setStatus("данные таблиц…");
-      var tableResult = await saveTableData(root);
-      var nTables = tableResult.saved || 0;
-
-      // после expand — актуальные координаты; DOM карты не трогаем
-      setStatus("карты из iframe…");
-      var mapOverlays = await captureMapOverlays(root, report);
 
       setStatus("рендер…");
       var canvas = await window.html2canvas(root, {
@@ -1035,10 +589,8 @@
         },
       });
 
-      restoreTables();
-      restoreTables = function () {};
-
-      var nMaps = paintMapOverlays(canvas, mapOverlays);
+      restore();
+      restore = function () {};
 
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
@@ -1050,18 +602,18 @@
       downloadBlob(blob, name);
       try {
         var b64 = await blobToBase64(blob);
-        var body = await postExportFile(name, b64, "png");
-        var bits = [];
-        if (nMaps) bits.push(nMaps + " map");
-        if (nTables) bits.push("csv в exports/ (" + nTables + ")");
-        else bits.push("csv нет");
-        setStatus("saved " + (body.name || name) + " | " + bits.join(" | "));
+        var res = await fetch("/api/screenshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name, data_b64: b64 }),
+        });
+        var body = await res.json().catch(function () {
+          return {};
+        });
+        if (res.ok) setStatus("saved " + (body.name || name));
+        else setStatus("download ok; server: " + (body.error || res.status));
       } catch (err) {
-        setStatus(
-          "download ok" +
-            (nMaps ? " +" + nMaps + " map" : "") +
-            (nTables ? " | csv в exports/ (" + nTables + ")" : "")
-        );
+        setStatus("download ok");
         console.warn(err);
       }
     } catch (err) {
@@ -1069,7 +621,7 @@
       setStatus(String((err && err.message) || err));
     } finally {
       try {
-        restoreTables();
+        restore();
       } catch (e) {}
       if (btn) btn.disabled = false;
     }
@@ -1083,32 +635,20 @@
       "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
       "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
       "padding:6px 10px;border-radius:6px;";
-    var btnStyle =
-      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
     var btn = document.createElement("button");
     btn.id = "dashShotBtn";
     btn.type = "button";
     btn.textContent = "Скрин";
-    btn.style.cssText = btnStyle;
+    btn.style.cssText =
+      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
     btn.onclick = function () {
       takeScreenshot();
-    };
-    var pdfBtn = document.createElement("button");
-    pdfBtn.id = "dashPivotPdfBtn";
-    pdfBtn.type = "button";
-    pdfBtn.textContent = "Pivot PDF";
-    pdfBtn.title =
-      "Экспорт PivotTable в PDF (все строки). Кнопка Save на элементе — Image/Excel/Data, не PDF.";
-    pdfBtn.style.cssText = btnStyle;
-    pdfBtn.onclick = function () {
-      exportPivotsToPdf();
     };
     var status = document.createElement("span");
     status.id = "dashShotStatus";
     status.style.cssText =
       "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
     bar.appendChild(btn);
-    bar.appendChild(pdfBtn);
     bar.appendChild(status);
     document.body.appendChild(bar);
   }
@@ -1120,5 +660,4 @@
   }
 
   window.__dashTakeScreenshot = takeScreenshot;
-  window.__dashExportPivotsPdf = exportPivotsToPdf;
 })();
