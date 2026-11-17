@@ -664,66 +664,185 @@
   }
 
   function isFilterHost(el) {
-    return /ComboBox|ListBox|DatePicker|TreeViewBox|NumberBox/i.test(attrType(el));
+    if (!el) return false;
+    if (/ComboBox|ListBox|DatePicker|TreeViewBox|NumberBox/i.test(attrType(el)))
+      return true;
+    try {
+      var ca =
+        el.elementAttributes && el.elementAttributes.contentAttributes;
+      // Stimulsoft filter controls: selectionMode + contentPanel (CreateComboBoxElementContent)
+      if (ca && ca.selectionMode != null && el.contentPanel) return true;
+    } catch (e) {}
+    return false;
   }
 
+  function itemLabel(item) {
+    if (item == null) return "";
+    if (typeof item !== "object") return String(item);
+    return String(
+      item.label ||
+        item.text ||
+        item.displayString ||
+        item.display ||
+        item.caption ||
+        item.value ||
+        item.key ||
+        ""
+    );
+  }
+
+  function labelForFilterValue(ca, value) {
+    var items = (ca && ca.items) || [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!it) continue;
+      var key = it.value != null ? it.value : it.key;
+      if (String(key) === String(value)) {
+        var lab = itemLabel(it);
+        if (lab) return lab;
+      }
+    }
+    return value == null ? "" : String(value);
+  }
+
+  /**
+   * Stimulsoft ComboBox: значение в contentPanel → SmallButton.caption.innerText
+   * (не <select>). Также contentAttributes.filters / items / getFilters().
+   */
   function readFilterLabel(host) {
     var label = "";
+
+    // 0) обновить caption из выбранных items (p.update в CreateComboBoxElementContent)
     try {
-      var sel = host.querySelector("select");
-      if (sel && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
-        label =
-          sel.options[sel.selectedIndex].textContent ||
-          sel.options[sel.selectedIndex].text ||
-          sel.value ||
-          "";
+      var cp0 = host.contentPanel;
+      if (cp0) {
+        for (var u0 = 0; u0 < cp0.childNodes.length; u0++) {
+          var b0 = cp0.childNodes[u0];
+          if (b0 && typeof b0.update === "function") {
+            try {
+              b0.update();
+            } catch (e0) {}
+          }
+        }
       }
     } catch (e) {}
+
+    // 1) caption кнопки в contentPanel (CreateComboBoxElementContent / DatePicker)
+    try {
+      var cp = host.contentPanel;
+      if (cp) {
+        for (var i = 0; i < cp.childNodes.length; i++) {
+          var btn = cp.childNodes[i];
+          if (btn && btn.caption) {
+            var cap = (btn.caption.innerText || btn.caption.textContent || "").trim();
+            if (cap) return cap;
+          }
+        }
+        var raw = (cp.innerText || cp.textContent || "").trim();
+        if (raw && raw.length > 0) label = raw;
+      }
+    } catch (e) {}
+
+    // 2) getFilters() на DOM-элементе
+    if (!label) {
+      try {
+        if (typeof host.getFilters === "function") {
+          var gf = host.getFilters();
+          if (gf && gf.length) {
+            var ca0 =
+              host.elementAttributes && host.elementAttributes.contentAttributes;
+            var parts = [];
+            for (var g = 0; g < gf.length; g++) {
+              var fv = gf[g] && (gf[g].value != null ? gf[g].value : gf[g]);
+              var lab = labelForFilterValue(ca0, fv);
+              if (lab) parts.push(lab);
+            }
+            if (parts.length) label = parts.join(", ");
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 3) contentAttributes.filters + items
+    if (!label) {
+      try {
+        var ca =
+          host.elementAttributes && host.elementAttributes.contentAttributes;
+        if (ca) {
+          var filters = ca.filters || [];
+          if (filters.length) {
+            var labs = [];
+            for (var f = 0; f < filters.length; f++) {
+              var v = filters[f] && filters[f].value;
+              var l2 = labelForFilterValue(ca, v);
+              if (l2) labs.push(l2);
+            }
+            if (labs.length) label = labs.join(", ");
+          } else if (ca.showAllValue) {
+            label = "All";
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 4) report component.userFilters по имени
+    if (!label) {
+      try {
+        var report = findReport();
+        var name = attrName(host);
+        if (report && name) {
+          var comps = collectAll(report);
+          for (var c = 0; c < comps.length; c++) {
+            var el = comps[c];
+            if (!el || el.name !== name) continue;
+            var uf = el.userFilters;
+            if (uf && uf.length) {
+              var parts2 = [];
+              for (var u = 0; u < uf.length; u++) {
+                var uv = uf.get ? uf.get(u) : uf[u];
+                if (uv && uv.value != null && String(uv.value) !== "")
+                  parts2.push(String(uv.value));
+              }
+              if (parts2.length) label = parts2.join(", ");
+            }
+            if (!label && el.initialValue != null && String(el.initialValue) !== "")
+              label = String(el.initialValue);
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 5) select / input fallback
+    if (!label) {
+      try {
+        var sel = host.querySelector("select");
+        if (sel && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+          label =
+            sel.options[sel.selectedIndex].textContent ||
+            sel.options[sel.selectedIndex].text ||
+            sel.value ||
+            "";
+        }
+      } catch (e) {}
+    }
     if (!label) {
       try {
         var inp = host.querySelector(
           "input:not([type=hidden]), textarea, [contenteditable='true']"
         );
-        if (inp) {
-          label = (inp.value != null && String(inp.value)) || inp.textContent || "";
-        }
+        if (inp)
+          label =
+            (inp.value != null && String(inp.value)) || inp.textContent || "";
       } catch (e) {}
     }
-    // Stimulsoft DropDownList: .text / .key на контроле
-    if (!label) {
-      try {
-        var nodes = host.querySelectorAll("*");
-        for (var i = 0; i < nodes.length; i++) {
-          var n = nodes[i];
-          if (n.text != null && String(n.text).trim()) {
-            label = String(n.text).trim();
-            break;
-          }
-          if (n.key != null && n.textBox && n.textBox.value) {
-            label = String(n.textBox.value).trim();
-            break;
-          }
-        }
-      } catch (e) {}
-    }
-    if (!label) {
-      try {
-        var ea = host.elementAttributes;
-        if (ea && ea.contentAttributes) {
-          var ca = ea.contentAttributes;
-          if (ca.selectedValues && ca.selectedValues.length)
-            label = String(ca.selectedValues[0]);
-          else if (ca.text) label = String(ca.text);
-          else if (ca.value) label = String(ca.value);
-        }
-      } catch (e) {}
-    }
+
     return String(label || "").trim();
   }
 
   /**
-   * html2canvas часто не рисует value у ComboBox/select/input.
-   * Печём видимый текст выбранного фильтра поверх контрола.
+   * html2canvas плохо рисует Stimulsoft ComboBox caption.
+   * Печём текст фильтра поверх contentPanel.
    */
   function bakeFilterValues(root) {
     var restorers = [];
@@ -732,12 +851,11 @@
     for (var i = 0; i < nodes.length; i++) {
       if (isFilterHost(nodes[i])) hosts.push(nodes[i]);
     }
-    // нативные select вне hosts
     var selects = root.querySelectorAll("select");
     console.log("[dash-shot] filter hosts", hosts.length, "selects", selects.length);
 
     function placeLabel(target, text, host) {
-      if (!text) return;
+      if (!text || !target) return;
       var ir = target.getBoundingClientRect();
       var hr = host.getBoundingClientRect();
       if (ir.width < 2 || ir.height < 2) return;
@@ -749,6 +867,11 @@
       div.setAttribute("data-sti-filter-bake", "1");
       div.textContent = text;
       var cs = window.getComputedStyle(target);
+      var bg = cs.backgroundColor;
+      if (!bg || bg === "rgba(0, 0, 0, 0)" || bg === "transparent") bg = "#ffffff";
+      var color = cs.color || "#111111";
+      // если текст почти белый на белом — форсим тёмный
+      if (color === "rgb(255, 255, 255)" || color === "#ffffff") color = "#111111";
       div.style.cssText = [
         "position:absolute",
         "left:" + Math.round(ir.left - hr.left) + "px",
@@ -761,37 +884,59 @@
         "padding:0 8px",
         "overflow:hidden",
         "white-space:nowrap",
-        "background:" + (cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)"
-          ? cs.backgroundColor
-          : "#ffffff"),
-        "color:" + (cs.color || "#111"),
-        "font:" + cs.font,
+        "background:" + bg,
+        "color:" + color,
+        "font:" + (cs.font || "12px sans-serif"),
         "border-radius:" + (cs.borderRadius || "0"),
-        "z-index:2",
+        "z-index:5",
         "pointer-events:none",
       ].join(";");
       host.appendChild(div);
       restorers.push({ div: div });
-      // прячем исходный контрол на время снимка (иначе пустой поверх/под)
-      restorers.push({ el: target, visibility: target.style.visibility });
-      target.style.visibility = "hidden";
+      // не visibility:hidden на весь contentPanel — только прячем детей-кнопок
+      try {
+        for (var c = 0; c < target.childNodes.length; c++) {
+          var ch = target.childNodes[c];
+          if (ch && ch.nodeType === 1 && ch.getAttribute("data-sti-filter-bake") !== "1") {
+            restorers.push({ el: ch, visibility: ch.style.visibility });
+            ch.style.visibility = "hidden";
+          }
+        }
+      } catch (e) {}
     }
 
     for (var h = 0; h < hosts.length; h++) {
       var host = hosts[h];
       var label = readFilterLabel(host);
-      console.log(
-        "[dash-shot] filter",
-        attrName(host) || attrType(host),
-        JSON.stringify(label)
-      );
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      console.log("[dash-shot] filter", {
+        name: attrName(host),
+        type: attrType(host),
+        label: label,
+        selectionMode: ca && ca.selectionMode,
+        filters: ca && ca.filters,
+        items: ca && ca.items && ca.items.length,
+        hasContentPanel: !!host.contentPanel,
+        captionProbe: (function () {
+          try {
+            var cp = host.contentPanel;
+            if (!cp || !cp.childNodes.length) return null;
+            var b = cp.childNodes[0];
+            return b && b.caption
+              ? String(b.caption.innerText || "").slice(0, 80)
+              : String(cp.innerText || "").slice(0, 80);
+          } catch (e) {
+            return String(e);
+          }
+        })(),
+      });
       if (!label) continue;
-      var paintTarget =
-        host.querySelector("select, input:not([type=hidden]), textarea") ||
-        host.contentPanel ||
-        host;
-      // не затирать titlePanel
-      if (paintTarget === host && host.contentPanel) paintTarget = host.contentPanel;
+      var paintTarget = host.contentPanel || host;
+      // не красить поверх title
+      if (host.titlePanel && paintTarget === host) {
+        paintTarget = host.contentPanel || host;
+      }
       placeLabel(paintTarget, label, host);
     }
 
