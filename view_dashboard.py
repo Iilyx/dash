@@ -217,7 +217,7 @@ def sti_response(component):
     return component.getFrameworkResponse()
 
 
-# PDF = снимок fullscreen + карта (iframe → PNG через Stimulsoft).
+# PDF = снимок fullscreen + PNG карты поверх (jsPDF), iframe html2canvas не видит.
 # Excel = exportDocumentAsync. Fullscreen z-index до 1000000 — кнопки выше.
 _EXPORT_UI = """
 <script>
@@ -540,40 +540,95 @@ _EXPORT_UI = """
       } catch (e) {}
       return /OnlineMap/i.test(typeName(c));
     }
-    function findDomByElementName(name) {
+    function collectMapDomNodes() {
       var root = captureRoot();
-      var nodes = root.querySelectorAll("*");
+      var out = [];
+      if (!root) return out;
+      var nodes = root.getElementsByTagName("*");
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         var a = el.elementAttributes;
-        if (!a) continue;
-        if (name && a.name === name) return el;
-        if (!name && a.type === "StiOnlineMapElement") return el;
+        if (a && a.type === "StiOnlineMapElement") out.push(el);
       }
+      return out;
+    }
+    function findReportMap(r, name) {
+      var maps = collectAll(r).filter(isOnlineMapElement);
+      if (!maps.length) return null;
+      if (name) {
+        for (var i = 0; i < maps.length; i++) {
+          if (maps[i].name === name) return maps[i];
+        }
+      }
+      return maps[0];
+    }
+    function normalizeExportBytes(data) {
+      if (!data) return null;
+      if (data.data && (data.data.length || data.data.byteLength)) data = data.data;
+      if (typeof data === "string") return data;
+      if (typeof Buffer !== "undefined" && Buffer.isBuffer && Buffer.isBuffer(data)) {
+        try {
+          data = data.toJSON().data;
+        } catch (e) {}
+      }
+      if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+      if (data instanceof Uint8Array) return data;
+      if (Array.isArray(data)) return new Uint8Array(data);
       return null;
     }
     function bytesToPngDataUrl(data) {
+      data = normalizeExportBytes(data);
       if (!data) return null;
       if (typeof data === "string") {
         if (data.indexOf("data:") === 0) return data;
-        return "data:image/png;base64," + data;
+        // уже base64?
+        if (/^[A-Za-z0-9+/]+=*$/.test(data.slice(0, 80)))
+          return "data:image/png;base64," + data;
+        return null;
       }
-      var arr =
-        data instanceof Uint8Array
-          ? data
-          : new Uint8Array(data.buffer || data);
+      // PNG magic или JPEG
+      var isPng =
+        data.length > 4 &&
+        data[0] === 0x89 &&
+        data[1] === 0x50 &&
+        data[2] === 0x4e &&
+        data[3] === 0x47;
+      var isJpg = data.length > 2 && data[0] === 0xff && data[1] === 0xd8;
+      var mime = isJpg ? "image/jpeg" : "image/png";
+      if (!isPng && !isJpg) {
+        console.warn("[sti-export] map bytes not png/jpeg, len=", data.length);
+      }
       var bin = "";
       var step = 0x8000;
-      for (var i = 0; i < arr.length; i += step) {
+      for (var i = 0; i < data.length; i += step) {
         bin += String.fromCharCode.apply(
           null,
-          arr.subarray(i, Math.min(i + step, arr.length))
+          data.subarray(i, Math.min(i + step, data.length))
         );
       }
-      return "data:image/png;base64," + btoa(bin);
+      return "data:" + mime + ";base64," + btoa(bin);
     }
-    function exportMapPng(mapEl) {
+    function exportMapPng(mapEl, cssW, cssH) {
       return new Promise(function (resolve, reject) {
+        var settled = false;
+        var timer = setTimeout(function () {
+          if (!settled) {
+            settled = true;
+            reject(new Error("map export timeout"));
+          }
+        }, 90000);
+        function finish(data) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(data);
+        }
+        function fail(e) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(e);
+        }
         try {
           var Exp = Stimulsoft.Dashboard.Export;
           var Tools =
@@ -586,102 +641,127 @@ _EXPORT_UI = """
             Stimulsoft.Report.Export &&
             Stimulsoft.Report.Export.StiImageType;
           if (!Tools || !ImgSet) {
-            reject(new Error("нет Image export tools"));
+            fail(new Error("нет Image export tools"));
             return;
           }
           var s = new ImgSet();
           if (ImageType && ImageType.Png != null) s.imageType = ImageType.Png;
-          s.imageQuality = 400;
+          s.imageQuality = 500;
+          // размер страницы экспорта = размер элемента (единицы дашборда)
           var w = Number(mapEl.width) || 0;
           var h = Number(mapEl.height) || 0;
           if (w > 0 && h > 0) {
             s.width = w;
             s.height = h;
+          } else if (cssW > 0 && cssH > 0) {
+            // fallback: css px → hundredths of inch (~96dpi)
+            s.width = (cssW / 96) * 100;
+            s.height = (cssH / 96) * 100;
           }
-          var finish = function (data) {
-            resolve(data);
-          };
+          console.log("[sti-export] map export", mapEl.name, s.width, s.height);
           if (typeof Tools.exportAsync === "function") {
             Tools.exportAsync(finish, mapEl, s);
           } else {
-            Promise.resolve(Tools.export(mapEl, s)).then(finish).catch(reject);
+            Promise.resolve(Tools.export(mapEl, s)).then(finish).catch(fail);
           }
         } catch (e) {
-          reject(e);
+          fail(e);
         }
       });
     }
-    // iframe-карту html2canvas не видит → подменяем PNG из Stimulsoft
-    function bakeMapsIntoDom(r) {
-      var restorers = [];
-      var maps = collectAll(r).filter(isOnlineMapElement);
-      var chain = Promise.resolve();
-      maps.forEach(function (mapEl) {
-        chain = chain.then(function () {
-          var dom = findDomByElementName(mapEl.name);
-          if (!dom) {
-            console.warn("[sti-export] DOM map not found", mapEl.name);
-            return;
+    // iframe html2canvas не видит → PNG карты кладём поверх в jsPDF
+    function prepareMapOverlays(r, root, scale) {
+      var domMaps = collectMapDomNodes();
+      var reportMaps = collectAll(r).filter(isOnlineMapElement);
+      console.log(
+        "[sti-export] maps DOM=",
+        domMaps.length,
+        "report=",
+        reportMaps.length
+      );
+      var rootRect = root.getBoundingClientRect();
+      var chain = Promise.resolve([]);
+      var list = domMaps.length
+        ? domMaps
+        : reportMaps.map(function () {
+            return null;
+          });
+      if (!domMaps.length && reportMaps.length) {
+        // нет DOM type — всё равно пробуем report maps без позиции (центр)
+        list = reportMaps;
+      }
+      var items = [];
+      if (domMaps.length) {
+        domMaps.forEach(function (dom) {
+          var name = (dom.elementAttributes && dom.elementAttributes.name) || "";
+          var mapEl = findReportMap(r, name) || reportMaps[items.length] || null;
+          items.push({ dom: dom, mapEl: mapEl, name: name });
+        });
+      } else {
+        reportMaps.forEach(function (mapEl) {
+          items.push({
+            dom: null,
+            mapEl: mapEl,
+            name: mapEl.name || ""
+          });
+        });
+      }
+      items.forEach(function (it) {
+        chain = chain.then(function (acc) {
+          if (!it.mapEl) {
+            console.warn("[sti-export] no report map for", it.name);
+            return acc;
           }
-          return exportMapPng(mapEl)
+          var rect = it.dom ? it.dom.getBoundingClientRect() : null;
+          var cssW = rect ? rect.width : 0;
+          var cssH = rect ? rect.height : 0;
+          return exportMapPng(it.mapEl, cssW, cssH)
             .then(function (data) {
               var url = bytesToPngDataUrl(data);
-              if (!url) return;
-              var iframe = dom.frame || dom.querySelector("iframe");
-              var img = document.createElement("img");
-              img.setAttribute("data-sti-map-bake", "1");
-              img.src = url;
-              img.alt = "map";
-              img.style.cssText =
-                "position:absolute;left:0;top:0;width:100%;height:100%;" +
-                "object-fit:fill;border:none;z-index:2;pointer-events:none";
-              if (iframe) {
-                restorers.push({
-                  iframe: iframe,
-                  display: iframe.style.display
-                });
-                iframe.style.display = "none";
+              if (!url) {
+                console.warn("[sti-export] empty map image", it.name);
+                return acc;
               }
-              restorers.push({ img: img });
-              dom.appendChild(img);
-              console.log("[sti-export] baked map", mapEl.name);
+              var x = 0;
+              var y = 0;
+              var w = cssW * scale;
+              var h = cssH * scale;
+              if (rect) {
+                x = (rect.left - rootRect.left) * scale;
+                y = (rect.top - rootRect.top) * scale;
+              } else {
+                w = (Number(it.mapEl.width) || 400) * scale * 0.5;
+                h = (Number(it.mapEl.height) || 300) * scale * 0.5;
+              }
+              acc.push({ url: url, x: x, y: y, w: w, h: h, name: it.name });
+              console.log("[sti-export] map overlay ready", it.name, x, y, w, h);
+              return acc;
             })
             .catch(function (e) {
-              console.warn("[sti-export] map bake failed", mapEl.name, e);
+              console.warn("[sti-export] map overlay failed", it.name, e);
+              return acc;
             });
         });
       });
-      return chain.then(function () {
-        return function restoreMaps() {
-          restorers.forEach(function (x) {
-            try {
-              if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
-            } catch (e) {}
-            try {
-              if (x.iframe) x.iframe.style.display = x.display || "";
-            } catch (e) {}
-          });
-        };
-      });
+      return chain;
     }
     function exportPdfAsScreen() {
       var r = report();
-      if (!captureRoot()) {
+      var root = captureRoot();
+      if (!root) {
         alert("Дашборд ещё не загружен");
         return;
       }
       var state = lockBar("…");
       var done = false;
-      var restoreMaps = function () {};
+      var SCALE = 2;
       function unlock() {
         if (done) return;
         done = true;
-        try {
-          restoreMaps();
-        } catch (e) {}
         unlockBar(state);
       }
       setTimeout(unlock, 180000);
+      var overlays = [];
       Promise.resolve()
         .then(function () {
           return loadScript(
@@ -694,20 +774,16 @@ _EXPORT_UI = """
           );
         })
         .then(function () {
-          if (!r) return function () {};
-          return bakeMapsIntoDom(r);
+          if (!r) return [];
+          return prepareMapOverlays(r, root, SCALE);
         })
-        .then(function (restore) {
-          restoreMaps = restore || function () {};
-          return new Promise(function (res) {
-            requestAnimationFrame(function () {
-              setTimeout(res, 80);
-            });
-          });
-        })
-        .then(function () {
-          return window.html2canvas(captureRoot(), {
-            scale: 2,
+        .then(function (ovs) {
+          overlays = ovs || [];
+          if (!overlays.length) {
+            console.warn("[sti-export] no map overlays — PDF без карты");
+          }
+          return window.html2canvas(root, {
+            scale: SCALE,
             useCORS: true,
             allowTaint: true,
             backgroundColor: "#ffffff",
@@ -743,9 +819,22 @@ _EXPORT_UI = """
             undefined,
             "FAST"
           );
+          overlays.forEach(function (m) {
+            try {
+              var fmt = m.url.indexOf("image/jpeg") >= 0 ? "JPEG" : "PNG";
+              pdf.addImage(m.url, fmt, m.x, m.y, m.w, m.h, undefined, "FAST");
+            } catch (e) {
+              console.warn("[sti-export] addImage map failed", m.name, e);
+            }
+          });
           var name =
             ((r && (r.reportAlias || r.reportName)) || "dashboard") + ".pdf";
           pdf.save(name);
+          if (!overlays.length) {
+            console.warn(
+              "[sti-export] карта не попала: смотри логи maps DOM/report выше"
+            );
+          }
         })
         .catch(function (e) {
           console.error(e);
