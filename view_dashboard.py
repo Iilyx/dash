@@ -386,6 +386,10 @@ _EXPORT_UI = """
   }
   function report() {
     if (window.viewer && window.viewer.report) return window.viewer.report;
+    try {
+      if (window.viewer && window.viewer.jsObject && window.viewer.jsObject.report)
+        return window.viewer.jsObject.report;
+    } catch (e) {}
     return null;
   }
   function firstDashboardPage(r) {
@@ -513,47 +517,156 @@ _EXPORT_UI = """
       });
     }
     function captureRoot() {
-      return (
-        document.querySelector(".stiJsViewerDashboardBackPanel") ||
-        document.querySelector(".stiJsViewerReportPanel") ||
-        document.querySelector(".stiJsViewerMainPanel") ||
-        document.querySelector("#StiViewer") ||
+      var candidates = [
+        document.querySelector(".stiJsViewerDashboardBackPanel"),
+        document.querySelector(".stiJsViewerReportPanel"),
+        document.querySelector(".stiJsViewerMainPanel"),
+        document.querySelector("#StiViewer"),
         document.body
-      );
+      ];
+      var best = null;
+      var bestCount = -1;
+      candidates.forEach(function (root) {
+        if (!root) return;
+        var n = 0;
+        var nodes = root.getElementsByTagName("*");
+        for (var i = 0; i < nodes.length; i++) {
+          if (nodes[i].elementAttributes) n++;
+        }
+        if (n > bestCount) {
+          bestCount = n;
+          best = root;
+        }
+      });
+      return best || document.body;
     }
-    function isOnlineMapElement(c) {
+    function isMapElement(c) {
       if (!c) return false;
       try {
-        var I =
-          Stimulsoft.Report &&
-          Stimulsoft.Report.Dashboard &&
-          Stimulsoft.Report.Dashboard.IStiOnlineMapElement;
-        if (I && c.is && c.is(I)) return true;
+        var D = Stimulsoft.Report && Stimulsoft.Report.Dashboard;
+        if (D) {
+          if (D.IStiRegionMapElement && c.is && c.is(D.IStiRegionMapElement))
+            return true;
+          if (D.IStiOnlineMapElement && c.is && c.is(D.IStiOnlineMapElement))
+            return true;
+        }
       } catch (e) {}
       try {
-        var M =
-          Stimulsoft.Dashboard &&
-          Stimulsoft.Dashboard.Components &&
-          Stimulsoft.Dashboard.Components.OnlineMap &&
-          Stimulsoft.Dashboard.Components.OnlineMap.StiOnlineMapElement;
-        if (M && ((c.is && c.is(M)) || c instanceof M)) return true;
+        var Comp =
+          Stimulsoft.Dashboard && Stimulsoft.Dashboard.Components;
+        var Region =
+          Comp &&
+          Comp.RegionMap &&
+          Comp.RegionMap.StiRegionMapElement;
+        var Online =
+          Comp &&
+          Comp.OnlineMap &&
+          Comp.OnlineMap.StiOnlineMapElement;
+        if (Region && ((c.is && c.is(Region)) || c instanceof Region))
+          return true;
+        if (Online && ((c.is && c.is(Online)) || c instanceof Online))
+          return true;
       } catch (e) {}
-      return /OnlineMap/i.test(typeName(c));
+      var tn = typeName(c);
+      // точное имя из viewer: StiRegionMapElement
+      if (
+        tn === "StiRegionMapElement" ||
+        tn === "StiOnlineMapElement" ||
+        /RegionMap|OnlineMap/i.test(tn)
+      )
+        return true;
+      // RegionMap: mapIdent + meters; OnlineMap: lat/lon
+      try {
+        if (c.mapIdent != null || (c.mapType != null && c.keyMeter != null))
+          return true;
+        if (c.latitude != null || c.longitude != null) return true;
+      } catch (e) {}
+      return false;
     }
     function collectMapDomNodes() {
       var root = captureRoot();
       var out = [];
+      var seen = [];
       if (!root) return out;
+      function add(el) {
+        if (!el || seen.indexOf(el) >= 0) return;
+        seen.push(el);
+        out.push(el);
+      }
       var nodes = root.getElementsByTagName("*");
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         var a = el.elementAttributes;
-        if (a && a.type === "StiOnlineMapElement") out.push(el);
+        if (!a || !a.type) continue;
+        var t = String(a.type);
+        // viewer: StiRegionMapElement / StiOnlineMapElement
+        if (
+          t === "StiRegionMapElement" ||
+          t === "StiOnlineMapElement" ||
+          /Map/i.test(t)
+        )
+          add(el);
+      }
+      // OnlineMap = iframe внутри элемента
+      var iframes = root.querySelectorAll("iframe");
+      for (var j = 0; j < iframes.length; j++) {
+        var frame = iframes[j];
+        var host = frame.parentElement;
+        while (host && host !== root) {
+          if (host.elementAttributes) {
+            add(host);
+            break;
+          }
+          host = host.parentElement;
+        }
+        if (!host || host === root) add(frame.parentElement || frame);
       }
       return out;
     }
+    function diagnoseMaps(r, root) {
+      var all = collectAll(r);
+      console.log("[sti-export] collectAll count:", all.length);
+      var types = {};
+      all.forEach(function (c) {
+        var t = typeName(c) || "?";
+        types[t] = (types[t] || 0) + 1;
+        try {
+          if (
+            /map/i.test(t) ||
+            c.latitude != null ||
+            c.longitude != null ||
+            (c.location != null && c.visualStates == null)
+          ) {
+            console.log("[sti-export] map-ish component", t, c.name, {
+              lat: c.latitude != null,
+              lon: c.longitude != null,
+              location: c.location != null,
+              mapType: c.mapType
+            });
+          }
+        } catch (e) {}
+      });
+      console.log("[sti-export] report component types:", types);
+      var domTypes = {};
+      if (root) {
+        var nodes = root.getElementsByTagName("*");
+        for (var i = 0; i < nodes.length; i++) {
+          var a = nodes[i].elementAttributes;
+          if (a && a.type) {
+            domTypes[a.type] = (domTypes[a.type] || 0) + 1;
+          }
+        }
+        console.log("[sti-export] DOM element types:", domTypes);
+        console.log(
+          "[sti-export] iframes in root:",
+          root.querySelectorAll("iframe").length,
+          "captureRoot:",
+          root.className || root.id || root.tagName
+        );
+      }
+    }
     function findReportMap(r, name) {
-      var maps = collectAll(r).filter(isOnlineMapElement);
+      var maps = collectAll(r).filter(isMapElement);
       if (!maps.length) return null;
       if (name) {
         for (var i = 0; i < maps.length; i++) {
@@ -669,16 +782,19 @@ _EXPORT_UI = """
         }
       });
     }
-    // iframe html2canvas не видит → PNG карты кладём поверх в jsPDF
+    // iframe/RegionMap: html2canvas часто пустой → PNG карты кладём поверх в jsPDF
     function prepareMapOverlays(r, root, scale) {
       var domMaps = collectMapDomNodes();
-      var reportMaps = collectAll(r).filter(isOnlineMapElement);
+      var reportMaps = collectAll(r).filter(isMapElement);
       console.log(
         "[sti-export] maps DOM=",
         domMaps.length,
         "report=",
         reportMaps.length
       );
+      if (!domMaps.length && !reportMaps.length) {
+        diagnoseMaps(r, root);
+      }
       var rootRect = root.getBoundingClientRect();
       var chain = Promise.resolve([]);
       var list = domMaps.length
