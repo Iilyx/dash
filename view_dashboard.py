@@ -147,7 +147,16 @@ def sti_process(component) -> bool:
 
 
 def inject_screenshot_ui(html: str) -> str:
-    """Кнопка «Скрин» на странице viewer."""
+    """Кнопка «Скрин» на странице viewer + window.__dashReport для bake карт."""
+    needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
+    repl = (
+        "viewer.report = report;\n"
+        "window.__dashViewer = viewer;\n"
+        "window.__dashReport = report;\n"
+        "viewer.renderHtml('viewerContent');"
+    )
+    if needle in html:
+        html = html.replace(needle, repl, 1)
     try:
         ver = int((ROOT / "screenshot_dashboard.js").stat().st_mtime)
     except OSError:
