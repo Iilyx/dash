@@ -217,9 +217,8 @@ def sti_response(component):
     return component.getFrameworkResponse()
 
 
-# PDF/Excel = Stimulsoft exportDocumentAsync (карта + userFilters с Button/Map).
-# Снимок экрана не умеет iframe-карту и отбрасывает фильтры кликов.
-# Stimulsoft fullscreen z-index до 1000000 — наши кнопки выше.
+# PDF = снимок fullscreen + карта (iframe → PNG через Stimulsoft).
+# Excel = exportDocumentAsync. Fullscreen z-index до 1000000 — кнопки выше.
 _EXPORT_UI = """
 <script>
 (function () {
@@ -491,6 +490,269 @@ _EXPORT_UI = """
         if (state.labels[i]) b.textContent = state.labels[i];
       });
     }
+    function loadScript(src) {
+      return new Promise(function (resolve, reject) {
+        var existing = document.querySelector('script[data-sti-cdn="' + src + '"]');
+        if (existing) {
+          if (existing.getAttribute("data-loaded") === "1") resolve();
+          else existing.addEventListener("load", function () { resolve(); });
+          return;
+        }
+        var s = document.createElement("script");
+        s.src = src;
+        s.async = true;
+        s.setAttribute("data-sti-cdn", src);
+        s.onload = function () {
+          s.setAttribute("data-loaded", "1");
+          resolve();
+        };
+        s.onerror = function () {
+          reject(new Error("Не загрузился " + src));
+        };
+        document.head.appendChild(s);
+      });
+    }
+    function captureRoot() {
+      return (
+        document.querySelector(".stiJsViewerDashboardBackPanel") ||
+        document.querySelector(".stiJsViewerReportPanel") ||
+        document.querySelector(".stiJsViewerMainPanel") ||
+        document.querySelector("#StiViewer") ||
+        document.body
+      );
+    }
+    function isOnlineMapElement(c) {
+      if (!c) return false;
+      try {
+        var I =
+          Stimulsoft.Report &&
+          Stimulsoft.Report.Dashboard &&
+          Stimulsoft.Report.Dashboard.IStiOnlineMapElement;
+        if (I && c.is && c.is(I)) return true;
+      } catch (e) {}
+      try {
+        var M =
+          Stimulsoft.Dashboard &&
+          Stimulsoft.Dashboard.Components &&
+          Stimulsoft.Dashboard.Components.OnlineMap &&
+          Stimulsoft.Dashboard.Components.OnlineMap.StiOnlineMapElement;
+        if (M && ((c.is && c.is(M)) || c instanceof M)) return true;
+      } catch (e) {}
+      return /OnlineMap/i.test(typeName(c));
+    }
+    function findDomByElementName(name) {
+      var root = captureRoot();
+      var nodes = root.querySelectorAll("*");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var a = el.elementAttributes;
+        if (!a) continue;
+        if (name && a.name === name) return el;
+        if (!name && a.type === "StiOnlineMapElement") return el;
+      }
+      return null;
+    }
+    function bytesToPngDataUrl(data) {
+      if (!data) return null;
+      if (typeof data === "string") {
+        if (data.indexOf("data:") === 0) return data;
+        return "data:image/png;base64," + data;
+      }
+      var arr =
+        data instanceof Uint8Array
+          ? data
+          : new Uint8Array(data.buffer || data);
+      var bin = "";
+      var step = 0x8000;
+      for (var i = 0; i < arr.length; i += step) {
+        bin += String.fromCharCode.apply(
+          null,
+          arr.subarray(i, Math.min(i + step, arr.length))
+        );
+      }
+      return "data:image/png;base64," + btoa(bin);
+    }
+    function exportMapPng(mapEl) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var Exp = Stimulsoft.Dashboard.Export;
+          var Tools =
+            (Exp && Exp.StiDashboardExportTools) ||
+            (Exp && Exp.Tools && Exp.Tools.StiDashboardExportTools);
+          var ImgSet =
+            Exp && Exp.Settings && Exp.Settings.StiImageDashboardExportSettings;
+          var ImageType =
+            Stimulsoft.Report &&
+            Stimulsoft.Report.Export &&
+            Stimulsoft.Report.Export.StiImageType;
+          if (!Tools || !ImgSet) {
+            reject(new Error("нет Image export tools"));
+            return;
+          }
+          var s = new ImgSet();
+          if (ImageType && ImageType.Png != null) s.imageType = ImageType.Png;
+          s.imageQuality = 400;
+          var w = Number(mapEl.width) || 0;
+          var h = Number(mapEl.height) || 0;
+          if (w > 0 && h > 0) {
+            s.width = w;
+            s.height = h;
+          }
+          var finish = function (data) {
+            resolve(data);
+          };
+          if (typeof Tools.exportAsync === "function") {
+            Tools.exportAsync(finish, mapEl, s);
+          } else {
+            Promise.resolve(Tools.export(mapEl, s)).then(finish).catch(reject);
+          }
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }
+    // iframe-карту html2canvas не видит → подменяем PNG из Stimulsoft
+    function bakeMapsIntoDom(r) {
+      var restorers = [];
+      var maps = collectAll(r).filter(isOnlineMapElement);
+      var chain = Promise.resolve();
+      maps.forEach(function (mapEl) {
+        chain = chain.then(function () {
+          var dom = findDomByElementName(mapEl.name);
+          if (!dom) {
+            console.warn("[sti-export] DOM map not found", mapEl.name);
+            return;
+          }
+          return exportMapPng(mapEl)
+            .then(function (data) {
+              var url = bytesToPngDataUrl(data);
+              if (!url) return;
+              var iframe = dom.frame || dom.querySelector("iframe");
+              var img = document.createElement("img");
+              img.setAttribute("data-sti-map-bake", "1");
+              img.src = url;
+              img.alt = "map";
+              img.style.cssText =
+                "position:absolute;left:0;top:0;width:100%;height:100%;" +
+                "object-fit:fill;border:none;z-index:2;pointer-events:none";
+              if (iframe) {
+                restorers.push({
+                  iframe: iframe,
+                  display: iframe.style.display
+                });
+                iframe.style.display = "none";
+              }
+              restorers.push({ img: img });
+              dom.appendChild(img);
+              console.log("[sti-export] baked map", mapEl.name);
+            })
+            .catch(function (e) {
+              console.warn("[sti-export] map bake failed", mapEl.name, e);
+            });
+        });
+      });
+      return chain.then(function () {
+        return function restoreMaps() {
+          restorers.forEach(function (x) {
+            try {
+              if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
+            } catch (e) {}
+            try {
+              if (x.iframe) x.iframe.style.display = x.display || "";
+            } catch (e) {}
+          });
+        };
+      });
+    }
+    function exportPdfAsScreen() {
+      var r = report();
+      if (!captureRoot()) {
+        alert("Дашборд ещё не загружен");
+        return;
+      }
+      var state = lockBar("…");
+      var done = false;
+      var restoreMaps = function () {};
+      function unlock() {
+        if (done) return;
+        done = true;
+        try {
+          restoreMaps();
+        } catch (e) {}
+        unlockBar(state);
+      }
+      setTimeout(unlock, 180000);
+      Promise.resolve()
+        .then(function () {
+          return loadScript(
+            "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"
+          );
+        })
+        .then(function () {
+          return loadScript(
+            "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+          );
+        })
+        .then(function () {
+          if (!r) return function () {};
+          return bakeMapsIntoDom(r);
+        })
+        .then(function (restore) {
+          restoreMaps = restore || function () {};
+          return new Promise(function (res) {
+            requestAnimationFrame(function () {
+              setTimeout(res, 80);
+            });
+          });
+        })
+        .then(function () {
+          return window.html2canvas(captureRoot(), {
+            scale: 2,
+            useCORS: true,
+            allowTaint: true,
+            backgroundColor: "#ffffff",
+            logging: false,
+            ignoreElements: function (el) {
+              return (
+                el &&
+                (el.id === "sti-export-bar" ||
+                  el.id === "sti-lic-banner" ||
+                  (el.className &&
+                    String(el.className).indexOf("stiJsViewerToolBar") >= 0))
+              );
+            }
+          });
+        })
+        .then(function (canvas) {
+          var JsPDF =
+            (window.jspdf && window.jspdf.jsPDF) || window.jsPDF || null;
+          if (!JsPDF) throw new Error("jsPDF не найден");
+          var pdf = new JsPDF({
+            orientation: canvas.width >= canvas.height ? "landscape" : "portrait",
+            unit: "pt",
+            format: [canvas.width, canvas.height],
+            compress: true
+          });
+          pdf.addImage(
+            canvas.toDataURL("image/png"),
+            "PNG",
+            0,
+            0,
+            canvas.width,
+            canvas.height,
+            undefined,
+            "FAST"
+          );
+          var name =
+            ((r && (r.reportAlias || r.reportName)) || "dashboard") + ".pdf";
+          pdf.save(name);
+        })
+        .catch(function (e) {
+          console.error(e);
+          alert("Ошибка PDF: " + (e && e.message ? e.message : e));
+        })
+        .then(unlock);
+    }
     function exportDoc(fmt, ext, mime, settings) {
       var r = report();
       if (!r) { alert("Дашборд ещё не загружен"); return; }
@@ -542,13 +804,7 @@ _EXPORT_UI = """
       }
     }
     document.getElementById("sti-export-pdf").onclick = function () {
-      var r = report();
-      exportDoc(
-        Stimulsoft.Report.StiExportFormat.Pdf,
-        ".pdf",
-        "application/pdf",
-        makeSettings("pdf", r)
-      );
+      exportPdfAsScreen();
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
       var r = report();
