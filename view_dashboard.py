@@ -222,9 +222,19 @@ def sti_response(component):
 _EXPORT_UI = """
 <script>
 (function () {
-  // Button поверх Text/Cards/Indicator: в PDF 2024.2.2 Button = серая заливка
-  // без текста и перекрывает низ. На время export — enabled=false.
+  // Button в PDF 2024.2.2 = серая заливка поверх Text/Cards/Indicator.
+  // enabled=false игнорируется при enabled-expression → снимаем с parent.components.
   var __stiHiddenButtons = [];
+  function typeName(c) {
+    try {
+      return (
+        (c.constructor && (c.constructor.ssTypeName || c.constructor.name)) ||
+        ""
+      );
+    } catch (e) {
+      return "";
+    }
+  }
   function isButtonElement(c) {
     if (!c) return false;
     try {
@@ -235,34 +245,141 @@ _EXPORT_UI = """
       if (I && c.is && c.is(I)) return true;
     } catch (e) {}
     try {
-      var B =
+      var Btn =
         Stimulsoft.Dashboard &&
         Stimulsoft.Dashboard.Components &&
         Stimulsoft.Dashboard.Components.Button &&
         Stimulsoft.Dashboard.Components.Button.StiButtonElement;
-      if (B && c.is && c.is(B)) return true;
+      if (Btn && (c.is && c.is(Btn) || c instanceof Btn)) return true;
     } catch (e) {}
-    var tn =
-      (c.constructor && (c.constructor.ssTypeName || c.constructor.name)) || "";
-    return tn === "StiButtonElement";
+    var tn = typeName(c);
+    if (tn === "StiButtonElement" || /ButtonElement/i.test(tn)) return true;
+    try {
+      if (
+        c.iconSet != null &&
+        c.visualStates != null &&
+        "text" in c &&
+        c.cards == null &&
+        c.columns == null
+      )
+        return true;
+    } catch (e) {}
+    return false;
+  }
+  function clearEnabledExpression(c) {
+    try {
+      if (!c || !c.expressions) return;
+      var ex = c.expressions;
+      if (typeof ex.removeByName === "function") ex.removeByName("enabled");
+      else if (typeof ex.getByName === "function") {
+        var item = ex.getByName("enabled");
+        if (item && typeof ex.remove === "function") ex.remove(item);
+        else if (item) item.expression = "";
+      }
+    } catch (e) {}
+  }
+  function walkComponents(root, fn) {
+    if (!root) return;
+    fn(root);
+    var kids = root.components;
+    if (!kids || kids.count == null) return;
+    // копируем список — при detach индексы не ломают обход
+    var arr = [];
+    for (var i = 0; i < kids.count; i++) arr.push(kids.getByIndex(i));
+    for (var j = 0; j < arr.length; j++) walkComponents(arr[j], fn);
+  }
+  function collectAll(report) {
+    var list = [];
+    var seen = [];
+    function add(c) {
+      if (!c || seen.indexOf(c) >= 0) return;
+      seen.push(c);
+      list.push(c);
+    }
+    try {
+      if (typeof report.getComponents === "function") {
+        var comps = report.getComponents();
+        for (var i = 0; i < comps.count; i++) add(comps.getByIndex(i));
+      }
+    } catch (e) {}
+    try {
+      if (report.pages) {
+        for (var p = 0; p < report.pages.count; p++)
+          walkComponents(report.pages.getByIndex(p), add);
+      }
+    } catch (e) {}
+    return list;
+  }
+  function detachFromParent(c) {
+    var parent = c.parent || c.parentComponent || null;
+    var list = parent && parent.components;
+    if (!list) return { parent: parent, index: -1 };
+    var index = -1;
+    for (var i = 0; i < list.count; i++) {
+      if (list.getByIndex(i) === c) {
+        index = i;
+        break;
+      }
+    }
+    if (index < 0) return { parent: parent, index: -1 };
+    try {
+      if (typeof list.removeAt === "function") list.removeAt(index);
+      else if (typeof list.remove === "function") list.remove(c);
+      else if (typeof list.removeByIndex === "function") list.removeByIndex(index);
+    } catch (e) {
+      console.warn("[sti-export] detach failed", e);
+    }
+    return { parent: parent, index: index };
   }
   function hideButtonsForExport(report) {
     var saved = [];
-    if (!report || typeof report.getComponents !== "function") return saved;
-    var comps = report.getComponents();
-    for (var i = 0; i < comps.count; i++) {
-      var c = comps.getByIndex(i);
-      if (!isButtonElement(c)) continue;
-      saved.push({ el: c, enabled: c.enabled });
-      c.enabled = false;
-    }
+    if (!report) return saved;
+    var all = collectAll(report);
+    var types = {};
+    all.forEach(function (c) {
+      var tn = typeName(c) || "?";
+      types[tn] = (types[tn] || 0) + 1;
+    });
+    console.log("[sti-export] component types:", types);
+    all.forEach(function (c) {
+      if (!isButtonElement(c)) return;
+      var wasEnabled = true;
+      try {
+        wasEnabled = c.enabled !== false;
+      } catch (e) {}
+      var det = detachFromParent(c);
+      clearEnabledExpression(c);
+      try {
+        c.enabled = false;
+      } catch (e) {}
+      saved.push({
+        el: c,
+        parent: det.parent,
+        index: det.index,
+        enabled: wasEnabled
+      });
+    });
     __stiHiddenButtons = saved;
+    console.log("[sti-export] detached buttons:", saved.length);
     return saved;
   }
   function restoreButtons(saved) {
-    (saved || __stiHiddenButtons || []).forEach(function (x) {
+    var items = (saved || __stiHiddenButtons || []).slice();
+    items.sort(function (a, b) {
+      return (a.index || 0) - (b.index || 0);
+    });
+    items.forEach(function (x) {
       try {
-        x.el.enabled = x.enabled;
+        if (x.parent && x.parent.components && x.index >= 0) {
+          var list = x.parent.components;
+          if (typeof list.insert === "function") list.insert(x.index, x.el);
+          else if (typeof list.add === "function") list.add(x.el);
+        }
+      } catch (e) {
+        console.warn("[sti-export] restore insert failed", e);
+      }
+      try {
+        x.el.enabled = x.enabled !== false;
       } catch (e) {}
     });
     __stiHiddenButtons = [];
@@ -329,6 +446,8 @@ _EXPORT_UI = """
       });
       btns[0] && (btns[0].textContent = "…");
       var hiddenButtons = hideButtonsForExport(r);
+      if (btns[0])
+        btns[0].textContent = "…" + (hiddenButtons.length ? "(" + hiddenButtons.length + ")" : "(0)");
       var done = false;
       function unlock() {
         if (done) return;
