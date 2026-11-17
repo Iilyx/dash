@@ -689,17 +689,25 @@ _EXPORT_UI = """
       if (Array.isArray(data)) return new Uint8Array(data);
       return null;
     }
+    function isValidPngDataUrl(url) {
+      if (!url || typeof url !== "string") return false;
+      if (url.indexOf("data:image/png;base64,") !== 0) return false;
+      // минимальный PNG base64 длиннее ~100 символов
+      return url.length > 200;
+    }
     function bytesToPngDataUrl(data) {
       data = normalizeExportBytes(data);
       if (!data) return null;
       if (typeof data === "string") {
         if (data.indexOf("data:") === 0) return data;
-        // уже base64?
-        if (/^[A-Za-z0-9+/]+=*$/.test(data.slice(0, 80)))
+        if (/^[A-Za-z0-9+/]+=*$/.test(data.slice(0, 80)) && data.length > 100)
           return "data:image/png;base64," + data;
         return null;
       }
-      // PNG magic или JPEG
+      if (!data.length) {
+        console.warn("[sti-export] map bytes empty");
+        return null;
+      }
       var isPng =
         data.length > 4 &&
         data[0] === 0x89 &&
@@ -707,10 +715,11 @@ _EXPORT_UI = """
         data[2] === 0x4e &&
         data[3] === 0x47;
       var isJpg = data.length > 2 && data[0] === 0xff && data[1] === 0xd8;
-      var mime = isJpg ? "image/jpeg" : "image/png";
       if (!isPng && !isJpg) {
         console.warn("[sti-export] map bytes not png/jpeg, len=", data.length);
+        return null;
       }
+      var mime = isJpg ? "image/jpeg" : "image/png";
       var bin = "";
       var step = 0x8000;
       for (var i = 0; i < data.length; i += step) {
@@ -721,7 +730,41 @@ _EXPORT_UI = """
       }
       return "data:" + mime + ";base64," + btoa(bin);
     }
-    function exportMapPng(mapEl, cssW, cssH) {
+    // RegionMap = SVG в DOM → снимаем сам узел (Stimulsoft Image часто даёт 0 байт)
+    function captureDomMapPng(dom) {
+      if (!dom || typeof window.html2canvas !== "function") {
+        return Promise.reject(new Error("нет DOM/html2canvas"));
+      }
+      var target = dom;
+      var svg = dom.querySelector && dom.querySelector("svg");
+      // если есть большой svg — целимся в contentPanel/svg-хост
+      if (dom.contentPanel) target = dom.contentPanel;
+      else if (svg && svg.parentElement) target = svg.parentElement;
+      console.log(
+        "[sti-export] captureDomMap",
+        (dom.elementAttributes && dom.elementAttributes.name) || "",
+        "svg=",
+        !!svg,
+        target.offsetWidth,
+        target.offsetHeight
+      );
+      return window
+        .html2canvas(target, {
+          scale: 2,
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: "#ffffff",
+          logging: false,
+          foreignObjectRendering: false
+        })
+        .then(function (canvas) {
+          if (!canvas || canvas.width < 2 || canvas.height < 2) {
+            throw new Error("пустой canvas карты");
+          }
+          return canvas.toDataURL("image/png");
+        });
+    }
+    function exportMapPngStimulsoft(mapEl, cssW, cssH) {
       return new Promise(function (resolve, reject) {
         var settled = false;
         var timer = setTimeout(function () {
@@ -760,18 +803,16 @@ _EXPORT_UI = """
           var s = new ImgSet();
           if (ImageType && ImageType.Png != null) s.imageType = ImageType.Png;
           s.imageQuality = 500;
-          // размер страницы экспорта = размер элемента (единицы дашборда)
           var w = Number(mapEl.width) || 0;
           var h = Number(mapEl.height) || 0;
           if (w > 0 && h > 0) {
             s.width = w;
             s.height = h;
           } else if (cssW > 0 && cssH > 0) {
-            // fallback: css px → hundredths of inch (~96dpi)
             s.width = (cssW / 96) * 100;
             s.height = (cssH / 96) * 100;
           }
-          console.log("[sti-export] map export", mapEl.name, s.width, s.height);
+          console.log("[sti-export] map export sti", mapEl.name, s.width, s.height);
           if (typeof Tools.exportAsync === "function") {
             Tools.exportAsync(finish, mapEl, s);
           } else {
@@ -782,7 +823,24 @@ _EXPORT_UI = """
         }
       });
     }
-    // iframe/RegionMap: html2canvas часто пустой → PNG карты кладём поверх в jsPDF
+    function resolveMapPng(it, cssW, cssH) {
+      // 1) DOM RegionMap (SVG)  2) Stimulsoft Image fallback
+      var tryDom = it.dom
+        ? captureDomMapPng(it.dom).catch(function (e) {
+            console.warn("[sti-export] DOM map capture failed", it.name, e);
+            return null;
+          })
+        : Promise.resolve(null);
+      return tryDom.then(function (url) {
+        if (isValidPngDataUrl(url)) return url;
+        if (!it.mapEl) return null;
+        return exportMapPngStimulsoft(it.mapEl, cssW, cssH).then(function (data) {
+          var u = bytesToPngDataUrl(data);
+          return isValidPngDataUrl(u) ? u : null;
+        });
+      });
+    }
+    // RegionMap SVG плохо попадает в общий html2canvas → отдельный снимок + overlay
     function prepareMapOverlays(r, root, scale) {
       var domMaps = collectMapDomNodes();
       var reportMaps = collectAll(r).filter(isMapElement);
@@ -797,20 +855,11 @@ _EXPORT_UI = """
       }
       var rootRect = root.getBoundingClientRect();
       var chain = Promise.resolve([]);
-      var list = domMaps.length
-        ? domMaps
-        : reportMaps.map(function () {
-            return null;
-          });
-      if (!domMaps.length && reportMaps.length) {
-        // нет DOM type — всё равно пробуем report maps без позиции (центр)
-        list = reportMaps;
-      }
       var items = [];
       if (domMaps.length) {
-        domMaps.forEach(function (dom) {
+        domMaps.forEach(function (dom, idx) {
           var name = (dom.elementAttributes && dom.elementAttributes.name) || "";
-          var mapEl = findReportMap(r, name) || reportMaps[items.length] || null;
+          var mapEl = findReportMap(r, name) || reportMaps[idx] || null;
           items.push({ dom: dom, mapEl: mapEl, name: name });
         });
       } else {
@@ -824,18 +873,13 @@ _EXPORT_UI = """
       }
       items.forEach(function (it) {
         chain = chain.then(function (acc) {
-          if (!it.mapEl) {
-            console.warn("[sti-export] no report map for", it.name);
-            return acc;
-          }
           var rect = it.dom ? it.dom.getBoundingClientRect() : null;
           var cssW = rect ? rect.width : 0;
           var cssH = rect ? rect.height : 0;
-          return exportMapPng(it.mapEl, cssW, cssH)
-            .then(function (data) {
-              var url = bytesToPngDataUrl(data);
-              if (!url) {
-                console.warn("[sti-export] empty map image", it.name);
+          return resolveMapPng(it, cssW, cssH)
+            .then(function (url) {
+              if (!isValidPngDataUrl(url)) {
+                console.warn("[sti-export] skip empty map overlay", it.name);
                 return acc;
               }
               var x = 0;
@@ -845,9 +889,13 @@ _EXPORT_UI = """
               if (rect) {
                 x = (rect.left - rootRect.left) * scale;
                 y = (rect.top - rootRect.top) * scale;
-              } else {
+              } else if (it.mapEl) {
                 w = (Number(it.mapEl.width) || 400) * scale * 0.5;
                 h = (Number(it.mapEl.height) || 300) * scale * 0.5;
+              }
+              if (!(w > 1 && h > 1)) {
+                console.warn("[sti-export] bad map rect", it.name, w, h);
+                return acc;
               }
               acc.push({ url: url, x: x, y: y, w: w, h: h, name: it.name });
               console.log("[sti-export] map overlay ready", it.name, x, y, w, h);
@@ -937,6 +985,10 @@ _EXPORT_UI = """
           );
           overlays.forEach(function (m) {
             try {
+              if (!isValidPngDataUrl(m.url) && m.url.indexOf("image/jpeg") < 0) {
+                console.warn("[sti-export] skip bad map png", m.name);
+                return;
+              }
               var fmt = m.url.indexOf("image/jpeg") >= 0 ? "JPEG" : "PNG";
               pdf.addImage(m.url, fmt, m.x, m.y, m.w, m.h, undefined, "FAST");
             } catch (e) {
