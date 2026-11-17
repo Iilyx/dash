@@ -136,6 +136,7 @@ def begin_process_data(args: StiDataEventArgs) -> None:
 
 
 def save_report(args: StiReportEventArgs):
+    """Save / Save As из designer → перезапись MRT_PATH на сервере."""
     if args.report is None:
         return StiResult.getError("empty report")
     try:
@@ -145,7 +146,8 @@ def save_report(args: StiReportEventArgs):
         )
     except OSError as exc:
         return StiResult.getError(str(exc))
-    return None
+    name = getattr(args, "fileName", None) or MRT_PATH.name
+    return f"Saved to {name}"
 
 
 def sti_process(component) -> bool:
@@ -377,6 +379,12 @@ def designer():
     designer = StiDesigner()
     licensed = apply_license(designer)
     designer.options.appearance.fullScreenMode = True
+    # По умолчанию showSaveButton=False — только File→Save. Включаем кнопку на тулбаре.
+    designer.options.toolbar.showSaveButton = True
+    designer.options.toolbar.showFileMenu = True
+    designer.options.toolbar.showFileMenuSave = True
+    designer.options.toolbar.showFileMenuSaveAs = True
+    designer.options.appearance.showSaveDialog = True
     designer.onBeginProcessData += begin_process_data
     designer.onSaveReport += save_report
     designer.onSaveAsReport += save_report
