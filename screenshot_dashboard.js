@@ -237,9 +237,6 @@
       var canvas = document.createElement("canvas");
       canvas.width = Math.max(1, prepared.w * SCALE);
       canvas.height = Math.max(1, prepared.h * SCALE);
-      canvas.style.cssText =
-        "position:absolute;left:0;top:0;width:100%;height:100%;" +
-        "display:block;z-index:3;pointer-events:none;border:none";
       canvas.setAttribute("data-sti-map-bake", "1");
       var ctx = canvas.getContext("2d");
       ctx.fillStyle = "#ffffff";
@@ -248,6 +245,28 @@
       if (!canvasHasInk(canvas)) throw new Error("svg canvas blank");
       return { canvas: canvas, w: prepared.w, h: prepared.h };
     });
+  }
+
+  /** Bake-слой ровно в бокс iframe — не на весь host (иначе перекрывает title/кнопки сверху). */
+  function applyIframeBox(el, iframe) {
+    var cs = window.getComputedStyle(iframe);
+    el.style.position = "absolute";
+    el.style.left = iframe.style.left || cs.left || "0px";
+    el.style.top = iframe.style.top || cs.top || "0px";
+    el.style.width = iframe.offsetWidth
+      ? iframe.offsetWidth + "px"
+      : iframe.style.width || cs.width;
+    el.style.height = iframe.offsetHeight
+      ? iframe.offsetHeight + "px"
+      : iframe.style.height || cs.height;
+    // не выше соседних оверлеев host (title/buttons)
+    var z = cs.zIndex;
+    el.style.zIndex = z && z !== "auto" ? String(z) : "0";
+    el.style.margin = "0";
+    el.style.border = "none";
+    el.style.display = "block";
+    el.style.pointerEvents = "none";
+    el.style.objectFit = "fill";
   }
 
   function typeName(c) {
@@ -462,11 +481,14 @@
       if (svg) {
         try {
           var baked = await svgToCanvas(svg, win);
+          applyIframeBox(baked.canvas, iframe);
           restorers.push({ iframe: iframe, display: iframe.style.display });
           iframe.style.display = "none";
           restorers.push({ canvas: baked.canvas, host: host });
-          host.appendChild(baked.canvas);
-          console.log("[dash-shot] baked iframe SVG", name);
+          // вставляем сразу после iframe, не на весь host
+          if (iframe.nextSibling) host.insertBefore(baked.canvas, iframe.nextSibling);
+          else host.appendChild(baked.canvas);
+          console.log("[dash-shot] baked iframe SVG", name, baked.canvas.style.cssText);
           continue;
         } catch (e) {
           console.warn("[dash-shot] iframe SVG bake failed", name, e);
@@ -486,16 +508,14 @@
           }
           mapEl = mapEl || maps[0];
           if (!mapEl) throw new Error("no online map el");
-          var rect = host.getBoundingClientRect();
+          var rect = iframe.getBoundingClientRect();
           var data = await exportOnlineMapPng(mapEl, rect.width, rect.height);
           var url = bytesToPngDataUrl(data);
           if (!url || url.length < 200) throw new Error("empty sti png");
           var imgEl = document.createElement("img");
           imgEl.setAttribute("data-sti-map-bake", "1");
           imgEl.src = url;
-          imgEl.style.cssText =
-            "position:absolute;left:0;top:0;width:100%;height:100%;" +
-            "object-fit:fill;border:none;z-index:3;pointer-events:none";
+          applyIframeBox(imgEl, iframe);
           // ink check
           var probeImg = await loadImage(url);
           var probe = document.createElement("canvas");
@@ -506,7 +526,8 @@
           restorers.push({ iframe: iframe, display: iframe.style.display });
           iframe.style.display = "none";
           restorers.push({ img: imgEl });
-          host.appendChild(imgEl);
+          if (iframe.nextSibling) host.insertBefore(imgEl, iframe.nextSibling);
+          else host.appendChild(imgEl);
           console.log("[dash-shot] baked OnlineMap img", name);
         } catch (e) {
           console.warn("[dash-shot] OnlineMap bake skipped", name, e);
