@@ -1,8 +1,11 @@
-/* Кнопка «Скрин» — WYSIWYG снимок. Online Map в iframe html2canvas не видит:
- * перед снимком экспортируем карту в PNG через Stimulsoft и временно кладём <img>. */
+/* Кнопка «Скрин».
+ * RegionMap = SVG (общий html2canvas часто «съедает»).
+ * OnlineMap = iframe (html2canvas не видит).
+ * Делаем общий снимок + отдельные оверлеи карт поверх. */
 (function () {
   var HTML2CANVAS =
     "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+  var SCALE = 2;
 
   function loadScript(src) {
     return new Promise(function (resolve, reject) {
@@ -149,85 +152,79 @@
     return null;
   }
 
-  function isOnlineMapElement(c) {
+  function isMapReportElement(c) {
     if (!c) return false;
     try {
-      var I =
-        Stimulsoft.Report &&
-        Stimulsoft.Report.Dashboard &&
-        Stimulsoft.Report.Dashboard.IStiOnlineMapElement;
-      if (I && c.is && c.is(I)) return true;
+      var D = Stimulsoft.Report && Stimulsoft.Report.Dashboard;
+      if (D) {
+        if (D.IStiRegionMapElement && c.is && c.is(D.IStiRegionMapElement))
+          return true;
+        if (D.IStiOnlineMapElement && c.is && c.is(D.IStiOnlineMapElement))
+          return true;
+      }
     } catch (e) {}
     try {
-      var M =
-        Stimulsoft.Dashboard &&
-        Stimulsoft.Dashboard.Components &&
-        Stimulsoft.Dashboard.Components.OnlineMap &&
-        Stimulsoft.Dashboard.Components.OnlineMap.StiOnlineMapElement;
-      if (M && ((c.is && c.is(M)) || c instanceof M)) return true;
-    } catch (e) {}
-    return /OnlineMap/i.test(typeName(c));
-  }
-
-  function isRegionMapElement(c) {
-    if (!c) return false;
-    try {
-      var I =
-        Stimulsoft.Report &&
-        Stimulsoft.Report.Dashboard &&
-        Stimulsoft.Report.Dashboard.IStiRegionMapElement;
-      if (I && c.is && c.is(I)) return true;
-    } catch (e) {}
-    try {
-      var M =
-        Stimulsoft.Dashboard &&
-        Stimulsoft.Dashboard.Components &&
-        Stimulsoft.Dashboard.Components.RegionMap &&
-        Stimulsoft.Dashboard.Components.RegionMap.StiRegionMapElement;
-      if (M && ((c.is && c.is(M)) || c instanceof M)) return true;
+      var Comp = Stimulsoft.Dashboard && Stimulsoft.Dashboard.Components;
+      var Region =
+        Comp && Comp.RegionMap && Comp.RegionMap.StiRegionMapElement;
+      var Online =
+        Comp && Comp.OnlineMap && Comp.OnlineMap.StiOnlineMapElement;
+      if (Region && ((c.is && c.is(Region)) || c instanceof Region)) return true;
+      if (Online && ((c.is && c.is(Online)) || c instanceof Online)) return true;
     } catch (e) {}
     var tn = typeName(c);
-    if (tn === "StiRegionMapElement" || /RegionMap/i.test(tn)) return true;
+    if (/RegionMap|OnlineMap|MapElement/i.test(tn)) return true;
     try {
-      if (c.mapIdent != null || (c.mapType != null && c.keyMeter != null))
-        return true;
+      // RegionMap в .mrt часто с MapIdent (даже пустым) + meters
+      if ("mapIdent" in c || "MapIdent" in c) return true;
+      if (c.keyMeter != null || c.nameMeter != null || c.valueMeter != null) {
+        if (c.mapType != null || c.labels != null) return true;
+      }
+      if (c.latitude != null || c.longitude != null) return true;
     } catch (e) {}
     return false;
   }
 
-  function findDomByElementName(name) {
-    var root = captureRoot();
-    if (!root) return null;
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      var a = el.elementAttributes;
-      if (!a) continue;
-      if (name && a.name === name) return el;
-      if (
-        !name &&
-        (a.type === "StiOnlineMapElement" || a.type === "StiRegionMapElement")
-      )
-        return el;
-    }
-    return null;
+  function attrType(el) {
+    var a = el && el.elementAttributes;
+    return a && a.type ? String(a.type) : "";
   }
 
-  function findOnlineMapDomHosts() {
-    var root = captureRoot();
+  function attrName(el) {
+    var a = el && el.elementAttributes;
+    return a && a.name ? String(a.name) : "";
+  }
+
+  function isMapAttrType(t) {
+    return (
+      t === "StiRegionMapElement" ||
+      t === "StiOnlineMapElement" ||
+      /Map/i.test(t)
+    );
+  }
+
+  /** Находит DOM-хосты карт без опоры на пустые Name в .mrt */
+  function collectMapDomNodes(root) {
     var out = [];
     var seen = [];
     if (!root) return out;
     function add(el) {
       if (!el || seen.indexOf(el) >= 0) return;
+      // не берём крошечные узлы
+      var r = el.getBoundingClientRect();
+      if (r.width < 40 || r.height < 40) return;
       seen.push(el);
       out.push(el);
     }
-    var nodes = root.querySelectorAll("*");
+
+    var nodes = root.getElementsByTagName("*");
     for (var i = 0; i < nodes.length; i++) {
-      var a = nodes[i].elementAttributes;
-      if (a && a.type === "StiOnlineMapElement") add(nodes[i]);
+      var el = nodes[i];
+      var t = attrType(el);
+      if (t && isMapAttrType(t)) add(el);
     }
+
+    // iframe = OnlineMap
     var iframes = root.querySelectorAll("iframe");
     for (var j = 0; j < iframes.length; j++) {
       var host = iframes[j].parentElement;
@@ -240,6 +237,41 @@
       }
       if (!host || host === root) add(iframes[j].parentElement || iframes[j]);
     }
+
+    // RegionMap часто большой SVG без type в parent — ищем «тяжёлые» svg
+    if (!out.length) {
+      var svgs = root.querySelectorAll("svg");
+      for (var s = 0; s < svgs.length; s++) {
+        var svg = svgs[s];
+        var paths = svg.querySelectorAll("path, polygon, polyline").length;
+        var box = svg.getBoundingClientRect();
+        if (paths >= 8 && box.width >= 80 && box.height >= 80) {
+          var host2 = svg.parentElement;
+          // поднимаемся к elementAttributes если есть
+          var climb = host2;
+          while (climb && climb !== root) {
+            if (climb.elementAttributes) {
+              host2 = climb;
+              break;
+            }
+            climb = climb.parentElement;
+          }
+          add(host2 || svg);
+        }
+      }
+    }
+
+    console.log("[dash-shot] map DOM hosts", out.length, out.map(function (el) {
+      return {
+        type: attrType(el),
+        name: attrName(el),
+        tag: el.tagName,
+        w: Math.round(el.getBoundingClientRect().width),
+        h: Math.round(el.getBoundingClientRect().height),
+        svg: !!(el.querySelector && el.querySelector("svg")),
+        iframe: !!(el.querySelector && el.querySelector("iframe")),
+      };
+    }));
     return out;
   }
 
@@ -262,18 +294,6 @@
       return null;
     }
     if (!data.length) return null;
-    var isPng =
-      data.length > 4 &&
-      data[0] === 0x89 &&
-      data[1] === 0x50 &&
-      data[2] === 0x4e &&
-      data[3] === 0x47;
-    var isJpg = data.length > 2 && data[0] === 0xff && data[1] === 0xd8;
-    var mime = isJpg ? "image/jpeg" : "image/png";
-    if (!isPng && !isJpg) {
-      // Stimulsoft иногда отдаёт уже base64-like / сырой PNG без проверки — всё равно пробуем
-      mime = "image/png";
-    }
     var bin = "";
     var step = 0x8000;
     for (var i = 0; i < data.length; i += step) {
@@ -282,10 +302,14 @@
         data.subarray(i, Math.min(i + step, data.length))
       );
     }
-    return "data:" + mime + ";base64," + btoa(bin);
+    return "data:image/png;base64," + btoa(bin);
   }
 
-  function exportMapPng(mapEl) {
+  function isValidPngDataUrl(url) {
+    return !!(url && typeof url === "string" && url.indexOf("data:image/") === 0 && url.length > 200);
+  }
+
+  function exportMapPngStimulsoft(mapEl, cssW, cssH) {
     return new Promise(function (resolve, reject) {
       try {
         var Exp = Stimulsoft.Dashboard.Export;
@@ -304,12 +328,15 @@
         }
         var s = new ImgSet();
         if (ImageType && ImageType.Png != null) s.imageType = ImageType.Png;
-        s.imageQuality = 400;
+        s.imageQuality = 500;
         var w = Number(mapEl.width) || 0;
         var h = Number(mapEl.height) || 0;
         if (w > 0 && h > 0) {
           s.width = w;
           s.height = h;
+        } else if (cssW > 0 && cssH > 0) {
+          s.width = (cssW / 96) * 100;
+          s.height = (cssH / 96) * 100;
         }
         var finish = function (data) {
           resolve(data);
@@ -325,129 +352,135 @@
     });
   }
 
-  function placeBakeImg(dom, url) {
-    var iframe = dom.frame || dom.querySelector("iframe");
-    var img = document.createElement("img");
-    img.setAttribute("data-sti-map-bake", "1");
-    img.src = url;
-    img.alt = "map";
-    img.style.cssText =
-      "position:absolute;left:0;top:0;width:100%;height:100%;" +
-      "object-fit:fill;border:none;z-index:2;pointer-events:none";
-    var restorers = [];
-    if (iframe) {
-      restorers.push({ iframe: iframe, display: iframe.style.display });
-      iframe.style.display = "none";
+  function captureDomMapPng(dom) {
+    var target = dom;
+    if (dom.contentPanel) target = dom.contentPanel;
+    else {
+      var svg = dom.querySelector && dom.querySelector("svg");
+      if (svg && svg.parentElement) target = svg.parentElement;
     }
-    // на всякий случай прячем leaflet/canvas-host если есть
-    var canvases = dom.querySelectorAll("canvas");
-    for (var i = 0; i < canvases.length; i++) {
-      restorers.push({ el: canvases[i], display: canvases[i].style.display });
-      canvases[i].style.display = "none";
-    }
-    if (getComputedStyle(dom).position === "static") {
-      restorers.push({ el: dom, position: dom.style.position });
-      dom.style.position = "relative";
-    }
-    restorers.push({ img: img });
-    dom.appendChild(img);
-    return restorers;
+    return window
+      .html2canvas(target, {
+        scale: SCALE,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: "#ffffff",
+        logging: false,
+        foreignObjectRendering: false,
+      })
+      .then(function (canvas) {
+        if (!canvas || canvas.width < 2 || canvas.height < 2) {
+          throw new Error("пустой canvas карты");
+        }
+        return canvas.toDataURL("image/png");
+      });
   }
 
-  function bakeMapsIntoDom(report) {
-    var restorers = [];
-    var maps = collectAll(report).filter(function (c) {
-      return isOnlineMapElement(c) || isRegionMapElement(c);
-    });
-    setStatus("карты " + maps.length + "…");
-    var chain = Promise.resolve();
+  function findReportMap(report, name) {
+    var maps = collectAll(report).filter(isMapReportElement);
+    if (!maps.length) return null;
+    if (name) {
+      for (var i = 0; i < maps.length; i++) {
+        if (maps[i].name === name) return maps[i];
+      }
+    }
+    return maps.length === 1 ? maps[0] : maps[0];
+  }
 
-    // Online/Region из report API
-    maps.forEach(function (mapEl) {
-      chain = chain.then(function () {
-        var dom = findDomByElementName(mapEl.name);
-        if (!dom) {
-          console.warn("[dash-shot] DOM map not found", mapEl.name);
-          return;
-        }
-        // RegionMap часто уже SVG в DOM — html2canvas его видит; печём только если есть iframe
-        var hasIframe = !!(dom.frame || dom.querySelector("iframe"));
-        if (isRegionMapElement(mapEl) && !hasIframe && !isOnlineMapElement(mapEl)) {
-          return;
-        }
-        return exportMapPng(mapEl)
+  function resolveMapPng(dom, report) {
+    var name = attrName(dom);
+    var t = attrType(dom);
+    var rect = dom.getBoundingClientRect();
+    var hasIframe = !!(dom.frame || (dom.querySelector && dom.querySelector("iframe")));
+    var mapEl = report ? findReportMap(report, name) : null;
+
+    // Online / iframe → сначала Stimulsoft Image
+    if (hasIframe || /OnlineMap/i.test(t)) {
+      if (mapEl) {
+        return exportMapPngStimulsoft(mapEl, rect.width, rect.height)
           .then(function (data) {
             var url = bytesToPngDataUrl(data);
-            if (!url) {
-              console.warn("[dash-shot] empty map png", mapEl.name);
-              return;
-            }
-            restorers = restorers.concat(placeBakeImg(dom, url));
-            console.log("[dash-shot] baked map", mapEl.name);
+            if (isValidPngDataUrl(url)) return url;
+            throw new Error("empty sti map png");
           })
           .catch(function (e) {
-            console.warn("[dash-shot] map bake failed", mapEl.name, e);
+            console.warn("[dash-shot] sti map failed, try DOM", name, e);
+            return captureDomMapPng(dom);
           });
-      });
-    });
+      }
+      return captureDomMapPng(dom);
+    }
 
-    // fallback: iframe-хосты без найденного component
-    chain = chain.then(function () {
-      var hosts = findOnlineMapDomHosts();
-      var next = Promise.resolve();
-      hosts.forEach(function (dom) {
-        next = next.then(function () {
-          if (dom.querySelector('img[data-sti-map-bake="1"]')) return;
-          var name =
-            (dom.elementAttributes && dom.elementAttributes.name) || null;
-          var mapEl = null;
-          if (name) {
-            var all = collectAll(report);
-            for (var i = 0; i < all.length; i++) {
-              if (all[i].name === name) {
-                mapEl = all[i];
-                break;
-              }
-            }
+    // RegionMap SVG → DOM snapshot надёжнее, чем Stimulsoft Image (часто 0 байт)
+    return captureDomMapPng(dom)
+      .then(function (url) {
+        if (isValidPngDataUrl(url)) return url;
+        throw new Error("bad dom map png");
+      })
+      .catch(function (e) {
+        console.warn("[dash-shot] DOM map failed", name || t, e);
+        if (!mapEl) return null;
+        return exportMapPngStimulsoft(mapEl, rect.width, rect.height).then(
+          function (data) {
+            return bytesToPngDataUrl(data);
           }
-          if (!mapEl) {
-            var online = collectAll(report).filter(isOnlineMapElement);
-            if (online.length === 1) mapEl = online[0];
-          }
-          if (!mapEl) return;
-          return exportMapPng(mapEl)
-            .then(function (data) {
-              var url = bytesToPngDataUrl(data);
-              if (!url) return;
-              restorers = restorers.concat(placeBakeImg(dom, url));
-              console.log("[dash-shot] baked iframe host", name || mapEl.name);
-            })
-            .catch(function (e) {
-              console.warn("[dash-shot] iframe bake failed", e);
-            });
-        });
+        );
       });
-      return next;
-    });
+  }
 
-    return chain.then(function () {
-      return function restoreMaps() {
-        restorers.forEach(function (x) {
-          try {
-            if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
-          } catch (e) {}
-          try {
-            if (x.iframe) x.iframe.style.display = x.display || "";
-          } catch (e) {}
-          try {
-            if (x.el) {
-              if (x.display != null) x.el.style.display = x.display;
-              if (x.position != null) x.el.style.position = x.position;
-            }
-          } catch (e) {}
-        });
+  function loadImage(url) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () {
+        resolve(img);
       };
+      img.onerror = function () {
+        reject(new Error("img load failed"));
+      };
+      img.src = url;
     });
+  }
+
+  async function buildMapOverlays(root, report) {
+    var hosts = collectMapDomNodes(root);
+    var reportMaps = report ? collectAll(report).filter(isMapReportElement) : [];
+    setStatus("карты DOM " + hosts.length + "/" + reportMaps.length);
+    console.log(
+      "[dash-shot] report maps",
+      reportMaps.length,
+      reportMaps.map(function (c) {
+        return { name: c.name, type: typeName(c), mapIdent: c.mapIdent };
+      })
+    );
+
+    var rootRect = root.getBoundingClientRect();
+    var overlays = [];
+    for (var i = 0; i < hosts.length; i++) {
+      var dom = hosts[i];
+      var rect = dom.getBoundingClientRect();
+      if (!(rect.width > 20 && rect.height > 20)) continue;
+      setStatus("карта " + (i + 1) + "/" + hosts.length);
+      var url = await resolveMapPng(dom, report);
+      if (!isValidPngDataUrl(url)) {
+        console.warn("[dash-shot] skip empty overlay", attrName(dom), attrType(dom));
+        continue;
+      }
+      overlays.push({
+        url: url,
+        x: (rect.left - rootRect.left) * SCALE,
+        y: (rect.top - rootRect.top) * SCALE,
+        w: rect.width * SCALE,
+        h: rect.height * SCALE,
+        name: attrName(dom) || attrType(dom) || "map",
+      });
+      console.log("[dash-shot] overlay ready", overlays[overlays.length - 1].name);
+    }
+
+    // если DOM пуст, но report знает карты — пробуем Stimulsoft-only (без позиции ≈ skip)
+    if (!overlays.length && reportMaps.length) {
+      console.warn("[dash-shot] DOM maps empty, report has", reportMaps.length);
+    }
+    return overlays;
   }
 
   async function takeScreenshot() {
@@ -458,35 +491,44 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restoreMaps = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
-      if (report) {
-        restoreMaps = (await bakeMapsIntoDom(report)) || function () {};
-        await new Promise(function (res) {
-          requestAnimationFrame(function () {
-            setTimeout(res, 100);
-          });
-        });
-      } else {
-        console.warn("[dash-shot] report not found — карта может пропасть");
-        setStatus("без report, карта?");
-      }
+      if (!report) console.warn("[dash-shot] report not found");
+
+      setStatus("оверлеи карт…");
+      var overlays = await buildMapOverlays(root, report);
+
       setStatus("рендер…");
       var canvas = await window.html2canvas(root, {
-        scale: 2,
+        scale: SCALE,
         useCORS: true,
         allowTaint: true,
         backgroundColor: "#ffffff",
         logging: false,
+        foreignObjectRendering: false,
         ignoreElements: function (el) {
           return !!(el && el.id === "dashShotBar");
         },
       });
-      restoreMaps();
-      restoreMaps = function () {};
+
+      if (overlays.length) {
+        setStatus("наложение " + overlays.length);
+        var ctx = canvas.getContext("2d");
+        for (var i = 0; i < overlays.length; i++) {
+          var o = overlays[i];
+          try {
+            var img = await loadImage(o.url);
+            ctx.drawImage(img, o.x, o.y, o.w, o.h);
+          } catch (e) {
+            console.warn("[dash-shot] draw overlay failed", o.name, e);
+          }
+        }
+      } else {
+        console.warn("[dash-shot] no map overlays");
+      }
+
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
           if (b) resolve(b);
@@ -505,19 +547,23 @@
         var body = await res.json().catch(function () {
           return {};
         });
-        if (res.ok) setStatus("saved " + (body.name || name));
+        if (res.ok)
+          setStatus(
+            "saved " +
+              (body.name || name) +
+              (overlays.length ? " +" + overlays.length + " map" : " (no map)")
+          );
         else setStatus("download ok; server: " + (body.error || res.status));
       } catch (err) {
-        setStatus("download ok");
+        setStatus(
+          "download ok" + (overlays.length ? " +" + overlays.length + " map" : "")
+        );
         console.warn(err);
       }
     } catch (err) {
       console.error(err);
       setStatus(String((err && err.message) || err));
     } finally {
-      try {
-        restoreMaps();
-      } catch (e) {}
       if (btn) btn.disabled = false;
     }
   }
@@ -542,7 +588,7 @@
     var status = document.createElement("span");
     status.id = "dashShotStatus";
     status.style.cssText =
-      "max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
+      "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
     bar.appendChild(btn);
     bar.appendChild(status);
     document.body.appendChild(bar);
