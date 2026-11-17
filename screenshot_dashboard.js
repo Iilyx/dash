@@ -2,7 +2,8 @@
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
- * Фикс: читаем SVG из iframe.contentDocument, печём в <canvas>, прячем iframe, снимаем страницу.
+ * Фикс: html2canvas всего iframe (карта + labels), размер = CSS-бокс iframe;
+ * fallback — SVG с inline fill у text; прячем iframe, снимаем страницу.
  */
 (function () {
   var HTML2CANVAS =
@@ -164,9 +165,21 @@
     }
   }
 
-  /** SVG из iframe: стили через contentWindow.getComputedStyle */
+  function isTransparentPaint(val) {
+    if (!val || val === "none") return true;
+    var v = String(val).replace(/\s+/g, "").toLowerCase();
+    return (
+      v === "transparent" ||
+      v === "rgba(0,0,0,0)" ||
+      v === "hsla(0,0%,0%,0)"
+    );
+  }
+
+  /** SVG из iframe: стили + fill у text/label (иначе подписи пропадают). */
   function cloneSvgInlined(svg, win) {
-    var getStyle = (win && win.getComputedStyle.bind(win)) || window.getComputedStyle.bind(window);
+    var getStyle =
+      (win && win.getComputedStyle.bind(win)) ||
+      window.getComputedStyle.bind(window);
     var clone = svg.cloneNode(true);
     var srcNodes = svg.querySelectorAll("*");
     var dstNodes = clone.querySelectorAll("*");
@@ -181,13 +194,50 @@
       "font-size",
       "font-family",
       "font-weight",
+      "font-style",
+      "color",
+      "visibility",
+      "display",
+      "text-anchor",
+      "dominant-baseline",
+      "letter-spacing",
     ];
     for (var i = 0; i < srcNodes.length && i < dstNodes.length; i++) {
       try {
-        var cs = getStyle(srcNodes[i]);
+        var src = srcNodes[i];
+        var dst = dstNodes[i];
+        var cs = getStyle(src);
+        var tag = (src.tagName || "").toLowerCase();
+        var isText = tag === "text" || tag === "tspan";
         for (var p = 0; p < props.length; p++) {
           var val = cs.getPropertyValue(props[p]);
-          if (val && val !== "none") dstNodes[i].setAttribute(props[p], val);
+          if (!val || val === "none") continue;
+          if (props[p] === "fill" && isTransparentPaint(val) && !isText) continue;
+          dst.setAttribute(props[p], val);
+        }
+        if (isText) {
+          var fill = cs.getPropertyValue("fill");
+          var color = cs.getPropertyValue("color") || cs.color;
+          if (isTransparentPaint(fill)) {
+            dst.setAttribute(
+              "fill",
+              color && !isTransparentPaint(color) ? color : "#000000"
+            );
+          }
+          if (!dst.getAttribute("font-size")) {
+            dst.setAttribute(
+              "font-size",
+              cs.fontSize || cs.getPropertyValue("font-size") || "10px"
+            );
+          }
+          if (!dst.getAttribute("font-family")) {
+            dst.setAttribute(
+              "font-family",
+              cs.fontFamily ||
+                cs.getPropertyValue("font-family") ||
+                "Arial, sans-serif"
+            );
+          }
         }
       } catch (e) {}
     }
@@ -207,6 +257,9 @@
     h = Math.max(1, h);
     clone.setAttribute("width", String(w));
     clone.setAttribute("height", String(h));
+    if (!clone.getAttribute("xmlns")) {
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    }
     if (!clone.getAttribute("viewBox")) {
       try {
         var vb2 = svg.viewBox && svg.viewBox.baseVal;
@@ -222,12 +275,13 @@
         clone.setAttribute("viewBox", "0 0 " + w + " " + h);
       }
     }
-    clone.removeAttribute("style");
     return { clone: clone, w: w, h: h };
   }
 
   function svgToCanvas(svg, win) {
     var prepared = cloneSvgInlined(svg, win);
+    var texts = prepared.clone.querySelectorAll("text, tspan");
+    console.log("[dash-shot] svg texts", texts.length);
     var xml = new XMLSerializer().serializeToString(prepared.clone);
     if (xml.indexOf("xmlns") < 0) {
       xml = xml.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
@@ -247,21 +301,59 @@
     });
   }
 
-  /** Bake-слой ровно в бокс iframe — не на весь host (иначе перекрывает title/кнопки сверху). */
-  function applyIframeBox(el, iframe) {
-    var cs = window.getComputedStyle(iframe);
+  /**
+   * Весь iframe (SVG + HTML-label’ы) → canvas.
+   * Размер = CSS-бокс iframe.
+   */
+  async function iframeDocToCanvas(iframe) {
+    var doc = iframeDoc(iframe);
+    if (!doc || !doc.body) throw new Error("no iframe doc");
+    var ir = iframe.getBoundingClientRect();
+    var w = Math.max(1, Math.round(ir.width || iframe.clientWidth || 0));
+    var h = Math.max(1, Math.round(ir.height || iframe.clientHeight || 0));
+    var labelNodes = doc.querySelectorAll(
+      "text, tspan, [class*='abel'], [class*='Label'], [class*='label']"
+    );
+    console.log(
+      "[dash-shot] iframe labels",
+      labelNodes.length,
+      "box",
+      w + "x" + h
+    );
+    var target = doc.documentElement || doc.body;
+    var canvas = await window.html2canvas(target, {
+      scale: SCALE,
+      useCORS: true,
+      allowTaint: true,
+      backgroundColor: "#ffffff",
+      logging: false,
+      foreignObjectRendering: false,
+      width: w,
+      height: h,
+      windowWidth: Math.max(w, target.scrollWidth || 0),
+      windowHeight: Math.max(h, target.scrollHeight || 0),
+      x: 0,
+      y: 0,
+    });
+    canvas.setAttribute("data-sti-map-bake", "1");
+    if (!canvasHasInk(canvas)) throw new Error("iframe html2canvas blank");
+    return { canvas: canvas, w: w, h: h };
+  }
+
+  /**
+   * Bake ровно в CSS-бокс iframe относительно host.
+   * z-index 0 — titlePanel/кнопки поверх остаются видимыми.
+   */
+  function applyIframeBox(el, iframe, host) {
+    var hostEl = host || iframe.parentElement;
+    var ir = iframe.getBoundingClientRect();
+    var hr = hostEl.getBoundingClientRect();
     el.style.position = "absolute";
-    el.style.left = iframe.style.left || cs.left || "0px";
-    el.style.top = iframe.style.top || cs.top || "0px";
-    el.style.width = iframe.offsetWidth
-      ? iframe.offsetWidth + "px"
-      : iframe.style.width || cs.width;
-    el.style.height = iframe.offsetHeight
-      ? iframe.offsetHeight + "px"
-      : iframe.style.height || cs.height;
-    // не выше соседних оверлеев host (title/buttons)
-    var z = cs.zIndex;
-    el.style.zIndex = z && z !== "auto" ? String(z) : "0";
+    el.style.left = Math.round(ir.left - hr.left) + "px";
+    el.style.top = Math.round(ir.top - hr.top) + "px";
+    el.style.width = Math.round(ir.width) + "px";
+    el.style.height = Math.round(ir.height) + "px";
+    el.style.zIndex = "0";
     el.style.margin = "0";
     el.style.border = "none";
     el.style.display = "block";
@@ -446,8 +538,8 @@
   }
 
   /**
-   * RegionMap: SVG живёт внутри iframe → canvas в host, iframe hide.
-   * OnlineMap без SVG: Stimulsoft Image export → <img>.
+   * RegionMap: весь iframe (карта + labels) → canvas в host, iframe hide.
+   * Fallback: SVG с inline fill у text. OnlineMap → Stimulsoft Image.
    */
   async function bakeMaps(root, report) {
     var restorers = [];
@@ -471,6 +563,11 @@
         hasDoc: !!doc,
         svg: !!svg,
         type: attrType(host),
+        titleH: host.titlePanel ? host.titlePanel.offsetHeight : 0,
+        iframeBox: {
+          w: iframe.offsetWidth,
+          h: iframe.offsetHeight,
+        },
       });
 
       if (getComputedStyle(host).position === "static") {
@@ -478,21 +575,35 @@
         host.style.position = "relative";
       }
 
-      if (svg) {
+      var baked = null;
+
+      // 1) весь iframe — подписи (SVG text / HTML labels) сохраняются
+      try {
+        baked = await iframeDocToCanvas(iframe);
+        console.log("[dash-shot] baked iframe doc", name, baked.w, "x", baked.h);
+      } catch (e) {
+        console.warn("[dash-shot] iframe html2canvas failed", name, e);
+      }
+
+      // 2) fallback SVG с явным fill у text
+      if (!baked && svg) {
         try {
-          var baked = await svgToCanvas(svg, win);
-          applyIframeBox(baked.canvas, iframe);
-          restorers.push({ iframe: iframe, display: iframe.style.display });
-          iframe.style.display = "none";
-          restorers.push({ canvas: baked.canvas, host: host });
-          // вставляем сразу после iframe, не на весь host
-          if (iframe.nextSibling) host.insertBefore(baked.canvas, iframe.nextSibling);
-          else host.appendChild(baked.canvas);
-          console.log("[dash-shot] baked iframe SVG", name, baked.canvas.style.cssText);
-          continue;
+          baked = await svgToCanvas(svg, win);
+          console.log("[dash-shot] baked iframe SVG", name, baked.w, "x", baked.h);
         } catch (e) {
           console.warn("[dash-shot] iframe SVG bake failed", name, e);
         }
+      }
+
+      if (baked) {
+        applyIframeBox(baked.canvas, iframe, host);
+        restorers.push({ iframe: iframe, display: iframe.style.display });
+        iframe.style.display = "none";
+        restorers.push({ canvas: baked.canvas, host: host });
+        if (iframe.nextSibling) host.insertBefore(baked.canvas, iframe.nextSibling);
+        else host.appendChild(baked.canvas);
+        console.log("[dash-shot] placed bake", name, baked.canvas.style.cssText);
+        continue;
       }
 
       // OnlineMap / нет SVG — пробуем Stimulsoft Image
@@ -515,8 +626,7 @@
           var imgEl = document.createElement("img");
           imgEl.setAttribute("data-sti-map-bake", "1");
           imgEl.src = url;
-          applyIframeBox(imgEl, iframe);
-          // ink check
+          applyIframeBox(imgEl, iframe, host);
           var probeImg = await loadImage(url);
           var probe = document.createElement("canvas");
           probe.width = Math.max(1, Math.round(rect.width));
