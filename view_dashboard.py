@@ -247,21 +247,25 @@ _EXPORT_UI = """
       return null;
     }
     function makeSettings(kind) {
-      // Official sample exports without settings. Settings are optional;
-      // wrong namespace throws and click does nothing.
+      // 2024.2.2: Stimulsoft.Dashboard.Export.Settings.* (не Report.Dashboard.Export)
+      // imageQuality → imageResolution при PDF/Excel (default 200).
       try {
-        var ns = Stimulsoft.Report.Dashboard.Export;
+        var ns =
+          (Stimulsoft.Dashboard &&
+            Stimulsoft.Dashboard.Export &&
+            Stimulsoft.Dashboard.Export.Settings) ||
+          null;
         if (!ns) return null;
-        if (kind === "pdf" && ns.StiPdfDashboardExportSettings) {
-          var ps = new ns.StiPdfDashboardExportSettings();
-          if ("imageQuality" in ps) ps.imageQuality = 200;
-          return ps;
-        }
-        if (kind === "xlsx" && ns.StiExcelDashboardExportSettings) {
-          var xs = new ns.StiExcelDashboardExportSettings();
-          if ("imageQuality" in xs) xs.imageQuality = 200;
-          return xs;
-        }
+        var C =
+          kind === "pdf"
+            ? ns.StiPdfDashboardExportSettings
+            : kind === "xlsx"
+              ? ns.StiExcelDashboardExportSettings
+              : null;
+        if (!C) return null;
+        var s = new C();
+        s.imageQuality = 400;
+        return s;
       } catch (e) {
         console.warn("export settings skipped", e);
       }
