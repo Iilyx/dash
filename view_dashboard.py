@@ -199,32 +199,97 @@ _EXPORT_UI = """
       if (window.viewer && window.viewer.report) return window.viewer.report;
       return null;
     }
+    function makeSettings(kind) {
+      // Official sample exports without settings. Settings are optional;
+      // wrong namespace throws and click does nothing.
+      try {
+        var ns = Stimulsoft.Report.Dashboard.Export;
+        if (!ns) return null;
+        if (kind === "pdf" && ns.StiPdfDashboardExportSettings) {
+          var ps = new ns.StiPdfDashboardExportSettings();
+          if ("imageQuality" in ps) ps.imageQuality = 200;
+          return ps;
+        }
+        if (kind === "xlsx" && ns.StiExcelDashboardExportSettings) {
+          var xs = new ns.StiExcelDashboardExportSettings();
+          if ("imageQuality" in xs) xs.imageQuality = 200;
+          return xs;
+        }
+      } catch (e) {
+        console.warn("export settings skipped", e);
+      }
+      return null;
+    }
     function exportDoc(fmt, ext, mime, settings) {
       var r = report();
       if (!r) { alert("Дашборд ещё не загружен"); return; }
+      if (typeof r.exportDocumentAsync !== "function") {
+        alert("exportDocumentAsync недоступен");
+        return;
+      }
       var btns = bar.querySelectorAll("button");
-      btns.forEach(function (b) { b.disabled = true; });
-      r.exportDocumentAsync(function (data) {
-        var name = (r.reportAlias || r.reportName || "dashboard") + ext;
-        Stimulsoft.System.StiObject.saveAs(data, name, mime);
-        btns.forEach(function (b) { b.disabled = false; });
-      }, fmt, null, settings || null);
+      var labels = [];
+      btns.forEach(function (b) {
+        labels.push(b.textContent);
+        b.disabled = true;
+      });
+      btns[0] && (btns[0].textContent = "…");
+      var done = false;
+      function unlock() {
+        if (done) return;
+        done = true;
+        btns.forEach(function (b, i) {
+          b.disabled = false;
+          if (labels[i]) b.textContent = labels[i];
+        });
+      }
+      // safety: не зависать disabled, если callback не пришёл
+      setTimeout(unlock, 120000);
+      try {
+        var args = [
+          function (data) {
+            try {
+              if (!data) {
+                alert("Экспорт вернул пустой файл");
+                return;
+              }
+              var name = (r.reportAlias || r.reportName || "dashboard") + ext;
+              Stimulsoft.System.StiObject.saveAs(data, name, mime);
+            } catch (e) {
+              console.error(e);
+              alert("Ошибка сохранения: " + (e && e.message ? e.message : e));
+            } finally {
+              unlock();
+            }
+          },
+          fmt
+        ];
+        // signature: exportDocumentAsync(callback, format, file?, settings?)
+        if (settings) {
+          args.push(null);
+          args.push(settings);
+        }
+        r.exportDocumentAsync.apply(r, args);
+      } catch (e) {
+        console.error(e);
+        unlock();
+        alert("Ошибка экспорта: " + (e && e.message ? e.message : e));
+      }
     }
     document.getElementById("sti-export-pdf").onclick = function () {
-      var s = new Stimulsoft.Report.Dashboard.Export.StiPdfDashboardExportSettings();
-      if ("imageQuality" in s) s.imageQuality = 200;
-      exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf", s);
+      exportDoc(
+        Stimulsoft.Report.StiExportFormat.Pdf,
+        ".pdf",
+        "application/pdf",
+        makeSettings("pdf")
+      );
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
-      // Charts/Cards → картинки в xlsx; низкий imageQuality / trial часто даёт
-      // «Не удалось отобразить рисунок». Default imageQuality=200.
-      var s = new Stimulsoft.Report.Dashboard.Export.StiExcelDashboardExportSettings();
-      if ("imageQuality" in s) s.imageQuality = 200;
       exportDoc(
         Stimulsoft.Report.StiExportFormat.Excel2007,
         ".xlsx",
         "application/vnd.ms-excel",
-        s
+        makeSettings("xlsx")
       );
     };
   }
