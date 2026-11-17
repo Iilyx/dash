@@ -1,9 +1,8 @@
 /* Кнопка «Скрин».
  *
- * RegionMap = SVG. html2canvas SVG часто глотает / даёт белое.
- * Перед снимком: SVG → canvas (serialize + drawImage) прямо в DOM, потом restore.
- * OnlineMap iframe: Stimulsoft Image export → <img> вместо iframe.
- * Пустые/белые оверлеи НЕ кладём (из‑за них «стало хуже»).
+ * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
+ * html2canvas iframe не видит → карта пустая.
+ * Фикс: читаем SVG из iframe.contentDocument, печём в <canvas>, прячем iframe, снимаем страницу.
  */
 (function () {
   var HTML2CANVAS =
@@ -111,6 +110,146 @@
     });
   }
 
+  function attrType(el) {
+    var a = el && el.elementAttributes;
+    return a && a.type ? String(a.type) : "";
+  }
+
+  function attrName(el) {
+    var a = el && el.elementAttributes;
+    return a && a.name ? String(a.name) : "";
+  }
+
+  function iframeDoc(iframe) {
+    try {
+      return iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function iframeWin(iframe) {
+    try {
+      return iframe.contentWindow || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function canvasHasInk(canvas) {
+    try {
+      var ctx = canvas.getContext("2d");
+      var w = canvas.width;
+      var h = canvas.height;
+      if (w < 2 || h < 2) return false;
+      var stepX = Math.max(1, Math.floor(w / 40));
+      var stepY = Math.max(1, Math.floor(h / 40));
+      var data = ctx.getImageData(0, 0, w, h).data;
+      var colored = 0;
+      var samples = 0;
+      for (var y = 0; y < h; y += stepY) {
+        for (var x = 0; x < w; x += stepX) {
+          var i = (y * w + x) * 4;
+          samples++;
+          if (data[i + 3] > 8 && (data[i] < 250 || data[i + 1] < 250 || data[i + 2] < 250))
+            colored++;
+        }
+      }
+      var ok = colored >= Math.max(3, samples * 0.008);
+      console.log("[dash-shot] ink", colored + "/" + samples, ok ? "ok" : "blank");
+      return ok;
+    } catch (e) {
+      console.warn("[dash-shot] ink failed", e);
+      return true;
+    }
+  }
+
+  /** SVG из iframe: стили через contentWindow.getComputedStyle */
+  function cloneSvgInlined(svg, win) {
+    var getStyle = (win && win.getComputedStyle.bind(win)) || window.getComputedStyle.bind(window);
+    var clone = svg.cloneNode(true);
+    var srcNodes = svg.querySelectorAll("*");
+    var dstNodes = clone.querySelectorAll("*");
+    var props = [
+      "fill",
+      "stroke",
+      "stroke-width",
+      "stroke-opacity",
+      "fill-opacity",
+      "opacity",
+      "font",
+      "font-size",
+      "font-family",
+      "font-weight",
+    ];
+    for (var i = 0; i < srcNodes.length && i < dstNodes.length; i++) {
+      try {
+        var cs = getStyle(srcNodes[i]);
+        for (var p = 0; p < props.length; p++) {
+          var val = cs.getPropertyValue(props[p]);
+          if (val && val !== "none") dstNodes[i].setAttribute(props[p], val);
+        }
+      } catch (e) {}
+    }
+    var box = svg.getBoundingClientRect();
+    var w = Math.max(1, Math.round(box.width || svg.clientWidth || 0));
+    var h = Math.max(1, Math.round(box.height || svg.clientHeight || 0));
+    if (w < 2 || h < 2) {
+      try {
+        var vb = svg.viewBox && svg.viewBox.baseVal;
+        if (vb && vb.width > 0) {
+          w = Math.round(vb.width);
+          h = Math.round(vb.height);
+        }
+      } catch (e) {}
+    }
+    w = Math.max(1, w);
+    h = Math.max(1, h);
+    clone.setAttribute("width", String(w));
+    clone.setAttribute("height", String(h));
+    if (!clone.getAttribute("viewBox")) {
+      try {
+        var vb2 = svg.viewBox && svg.viewBox.baseVal;
+        if (vb2 && vb2.width > 0) {
+          clone.setAttribute(
+            "viewBox",
+            vb2.x + " " + vb2.y + " " + vb2.width + " " + vb2.height
+          );
+        } else {
+          clone.setAttribute("viewBox", "0 0 " + w + " " + h);
+        }
+      } catch (e) {
+        clone.setAttribute("viewBox", "0 0 " + w + " " + h);
+      }
+    }
+    clone.removeAttribute("style");
+    return { clone: clone, w: w, h: h };
+  }
+
+  function svgToCanvas(svg, win) {
+    var prepared = cloneSvgInlined(svg, win);
+    var xml = new XMLSerializer().serializeToString(prepared.clone);
+    if (xml.indexOf("xmlns") < 0) {
+      xml = xml.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+    var url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
+    return loadImage(url).then(function (img) {
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, prepared.w * SCALE);
+      canvas.height = Math.max(1, prepared.h * SCALE);
+      canvas.style.cssText =
+        "position:absolute;left:0;top:0;width:100%;height:100%;" +
+        "display:block;z-index:3;pointer-events:none;border:none";
+      canvas.setAttribute("data-sti-map-bake", "1");
+      var ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      if (!canvasHasInk(canvas)) throw new Error("svg canvas blank");
+      return { canvas: canvas, w: prepared.w, h: prepared.h };
+    });
+  }
+
   function typeName(c) {
     try {
       if (!c) return "";
@@ -125,9 +264,7 @@
     fn(root);
     var kids = root.components;
     if (!kids || kids.count == null) return;
-    var arr = [];
-    for (var i = 0; i < kids.count; i++) arr.push(kids.getByIndex(i));
-    for (var j = 0; j < arr.length; j++) walkComponents(arr[j], fn);
+    for (var i = 0; i < kids.count; i++) walkComponents(kids.getByIndex(i), fn);
   }
 
   function collectAll(report) {
@@ -158,13 +295,6 @@
     if (window.__dashViewer && window.__dashViewer.report)
       return window.__dashViewer.report;
     if (window.viewer && window.viewer.report) return window.viewer.report;
-    try {
-      var keys = Object.keys(window);
-      for (var i = 0; i < keys.length; i++) {
-        var v = window[keys[i]];
-        if (v && v.report && v.jsObject && v.options) return v.report;
-      }
-    } catch (e) {}
     return null;
   }
 
@@ -177,146 +307,7 @@
         Stimulsoft.Report.Dashboard.IStiOnlineMapElement;
       if (I && c.is && c.is(I)) return true;
     } catch (e) {}
-    try {
-      var M =
-        Stimulsoft.Dashboard &&
-        Stimulsoft.Dashboard.Components &&
-        Stimulsoft.Dashboard.Components.OnlineMap &&
-        Stimulsoft.Dashboard.Components.OnlineMap.StiOnlineMapElement;
-      if (M && ((c.is && c.is(M)) || c instanceof M)) return true;
-    } catch (e) {}
     return /OnlineMap/i.test(typeName(c));
-  }
-
-  function attrType(el) {
-    var a = el && el.elementAttributes;
-    return a && a.type ? String(a.type) : "";
-  }
-
-  function attrName(el) {
-    var a = el && el.elementAttributes;
-    return a && a.name ? String(a.name) : "";
-  }
-
-  /** SVG с инлайном fill/stroke из computed style — иначе serialize теряет цвета. */
-  function cloneSvgInlined(svg) {
-    var clone = svg.cloneNode(true);
-    var srcNodes = svg.querySelectorAll("*");
-    var dstNodes = clone.querySelectorAll("*");
-    var props = [
-      "fill",
-      "stroke",
-      "stroke-width",
-      "stroke-opacity",
-      "fill-opacity",
-      "opacity",
-      "font",
-      "font-size",
-      "font-family",
-      "font-weight",
-    ];
-    for (var i = 0; i < srcNodes.length && i < dstNodes.length; i++) {
-      var cs = window.getComputedStyle(srcNodes[i]);
-      for (var p = 0; p < props.length; p++) {
-        var val = cs.getPropertyValue(props[p]);
-        if (val && val !== "none") {
-          try {
-            dstNodes[i].setAttribute(props[p], val);
-          } catch (e) {}
-        }
-      }
-    }
-    var box = svg.getBoundingClientRect();
-    var w = Math.max(1, Math.round(box.width));
-    var h = Math.max(1, Math.round(box.height));
-    clone.setAttribute("width", String(w));
-    clone.setAttribute("height", String(h));
-    if (!clone.getAttribute("viewBox")) {
-      try {
-        var vb = svg.viewBox && svg.viewBox.baseVal;
-        if (vb && vb.width > 0) {
-          clone.setAttribute(
-            "viewBox",
-            vb.x + " " + vb.y + " " + vb.width + " " + vb.height
-          );
-        } else {
-          clone.setAttribute("viewBox", "0 0 " + w + " " + h);
-        }
-      } catch (e) {
-        clone.setAttribute("viewBox", "0 0 " + w + " " + h);
-      }
-    }
-    clone.style.position = "";
-    clone.style.left = "";
-    clone.style.top = "";
-    clone.style.transform = "";
-    return { clone: clone, w: w, h: h };
-  }
-
-  function svgToCanvas(svg) {
-    var prepared = cloneSvgInlined(svg);
-    var xml = new XMLSerializer().serializeToString(prepared.clone);
-    if (xml.indexOf("xmlns") < 0) {
-      xml = xml.replace(
-        "<svg",
-        '<svg xmlns="http://www.w3.org/2000/svg"'
-      );
-    }
-    var url =
-      "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
-    return loadImage(url).then(function (img) {
-      var canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, prepared.w * SCALE);
-      canvas.height = Math.max(1, prepared.h * SCALE);
-      canvas.style.width = prepared.w + "px";
-      canvas.style.height = prepared.h + "px";
-      canvas.style.display = "block";
-      canvas.setAttribute("data-sti-map-bake", "1");
-      var ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      if (!canvasHasInk(canvas)) {
-        throw new Error("svg canvas blank");
-      }
-      return canvas;
-    });
-  }
-
-  /** Есть ли не-белые пиксели (иначе оверлей только портит). */
-  function canvasHasInk(canvas) {
-    try {
-      var ctx = canvas.getContext("2d");
-      var w = canvas.width;
-      var h = canvas.height;
-      if (w < 2 || h < 2) return false;
-      var stepX = Math.max(1, Math.floor(w / 40));
-      var stepY = Math.max(1, Math.floor(h / 40));
-      var data = ctx.getImageData(0, 0, w, h).data;
-      var colored = 0;
-      var samples = 0;
-      for (var y = 0; y < h; y += stepY) {
-        for (var x = 0; x < w; x += stepX) {
-          var i = (y * w + x) * 4;
-          var r = data[i];
-          var g = data[i + 1];
-          var b = data[i + 2];
-          var a = data[i + 3];
-          samples++;
-          if (a > 8 && (r < 250 || g < 250 || b < 250)) colored++;
-        }
-      }
-      var ok = colored >= Math.max(3, samples * 0.01);
-      console.log(
-        "[dash-shot] ink check",
-        colored + "/" + samples,
-        ok ? "ok" : "blank"
-      );
-      return ok;
-    } catch (e) {
-      console.warn("[dash-shot] ink check failed", e);
-      return true;
-    }
   }
 
   function normalizeExportBytes(data) {
@@ -378,13 +369,10 @@
           s.width = (cssW / 96) * 100;
           s.height = (cssH / 96) * 100;
         }
-        var finish = function (data) {
-          resolve(data);
-        };
         if (typeof Tools.exportAsync === "function") {
-          Tools.exportAsync(finish, mapEl, s);
+          Tools.exportAsync(resolve, mapEl, s);
         } else {
-          Promise.resolve(Tools.export(mapEl, s)).then(finish).catch(reject);
+          Promise.resolve(Tools.export(mapEl, s)).then(resolve).catch(reject);
         }
       } catch (e) {
         reject(e);
@@ -392,158 +380,145 @@
     });
   }
 
-  function findOnlineMapReport(report, name) {
-    var maps = collectAll(report).filter(isOnlineMapElement);
-    if (!maps.length) return null;
-    if (name) {
-      for (var i = 0; i < maps.length; i++) {
-        if (maps[i].name === name) return maps[i];
+  /** Все хосты карт: RegionMap / OnlineMap / любой element с .frame iframe */
+  function collectMapHosts(root) {
+    var out = [];
+    var seen = [];
+    function add(el) {
+      if (!el || seen.indexOf(el) >= 0) return;
+      seen.push(el);
+      out.push(el);
+    }
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = attrType(el);
+      if (/RegionMap|OnlineMap/i.test(t)) add(el);
+      if (el.frame) add(el);
+    }
+    // fallback: iframe внутри dashboard
+    var iframes = root.querySelectorAll("iframe");
+    for (var j = 0; j < iframes.length; j++) {
+      var host = iframes[j].parentElement;
+      while (host && host !== root) {
+        if (host.elementAttributes || host.frame) {
+          add(host);
+          break;
+        }
+        host = host.parentElement;
       }
     }
-    return maps[0];
+    console.log(
+      "[dash-shot] map hosts",
+      out.length,
+      out.map(function (el) {
+        var iframe = el.frame || el.querySelector("iframe");
+        var doc = iframe ? iframeDoc(iframe) : null;
+        var svgCount = doc ? doc.querySelectorAll("svg").length : 0;
+        return {
+          name: attrName(el),
+          type: attrType(el),
+          iframe: !!iframe,
+          svgInIframe: svgCount,
+        };
+      })
+    );
+    return out;
   }
 
   /**
-   * Подменяет SVG карт на canvas в DOM (html2canvas canvas видит).
-   * Возвращает restore().
+   * RegionMap: SVG живёт внутри iframe → canvas в host, iframe hide.
+   * OnlineMap без SVG: Stimulsoft Image export → <img>.
    */
-  async function bakeRegionMapSvgs(root) {
+  async function bakeMaps(root, report) {
     var restorers = [];
-    var svgs = root.querySelectorAll("svg");
-    var candidates = [];
-    for (var i = 0; i < svgs.length; i++) {
-      var svg = svgs[i];
-      var box = svg.getBoundingClientRect();
-      var paths = svg.querySelectorAll("path, polygon, polyline, circle").length;
-      if (paths >= 5 && box.width >= 60 && box.height >= 60) {
-        candidates.push(svg);
-      }
-    }
-    // также SVG внутри RegionMap host
-    var nodes = root.querySelectorAll("*");
-    for (var n = 0; n < nodes.length; n++) {
-      var t = attrType(nodes[n]);
-      if (/RegionMap/i.test(t)) {
-        var s2 = nodes[n].querySelector("svg");
-        if (s2 && candidates.indexOf(s2) < 0) candidates.push(s2);
-      }
-    }
-    console.log("[dash-shot] region svg candidates", candidates.length);
-    setStatus("SVG карт " + candidates.length);
+    var hosts = collectMapHosts(root);
+    setStatus("карты " + hosts.length);
 
-    for (var c = 0; c < candidates.length; c++) {
-      var svgEl = candidates[c];
-      var parent = svgEl.parentNode;
-      if (!parent) continue;
-      try {
-        var canvas = await svgToCanvas(svgEl);
-        // сохранить layout
-        var cs = window.getComputedStyle(svgEl);
-        canvas.style.position = cs.position === "static" ? "relative" : cs.position;
-        if (cs.position === "absolute" || cs.position === "fixed") {
-          canvas.style.left = svgEl.style.left || cs.left;
-          canvas.style.top = svgEl.style.top || cs.top;
+    for (var i = 0; i < hosts.length; i++) {
+      var host = hosts[i];
+      var name = attrName(host) || attrType(host) || "map" + i;
+      var iframe = host.frame || host.querySelector("iframe");
+      if (!iframe) {
+        console.warn("[dash-shot] no iframe", name);
+        continue;
+      }
+
+      var doc = iframeDoc(iframe);
+      var win = iframeWin(iframe);
+      var svg = doc && doc.querySelector("svg");
+
+      console.log("[dash-shot] host", name, {
+        hasDoc: !!doc,
+        svg: !!svg,
+        type: attrType(host),
+      });
+
+      if (getComputedStyle(host).position === "static") {
+        restorers.push({ el: host, position: host.style.position });
+        host.style.position = "relative";
+      }
+
+      if (svg) {
+        try {
+          var baked = await svgToCanvas(svg, win);
+          restorers.push({ iframe: iframe, display: iframe.style.display });
+          iframe.style.display = "none";
+          restorers.push({ canvas: baked.canvas, host: host });
+          host.appendChild(baked.canvas);
+          console.log("[dash-shot] baked iframe SVG", name);
+          continue;
+        } catch (e) {
+          console.warn("[dash-shot] iframe SVG bake failed", name, e);
         }
-        parent.replaceChild(canvas, svgEl);
-        restorers.push({ parent: parent, svg: svgEl, canvas: canvas });
-        console.log("[dash-shot] baked SVG→canvas", c + 1);
-      } catch (e) {
-        console.warn("[dash-shot] SVG bake failed", e);
+      }
+
+      // OnlineMap / нет SVG — пробуем Stimulsoft Image
+      if (report && /OnlineMap/i.test(attrType(host))) {
+        try {
+          var maps = collectAll(report).filter(isOnlineMapElement);
+          var mapEl = null;
+          for (var m = 0; m < maps.length; m++) {
+            if (maps[m].name === attrName(host)) {
+              mapEl = maps[m];
+              break;
+            }
+          }
+          mapEl = mapEl || maps[0];
+          if (!mapEl) throw new Error("no online map el");
+          var rect = host.getBoundingClientRect();
+          var data = await exportOnlineMapPng(mapEl, rect.width, rect.height);
+          var url = bytesToPngDataUrl(data);
+          if (!url || url.length < 200) throw new Error("empty sti png");
+          var imgEl = document.createElement("img");
+          imgEl.setAttribute("data-sti-map-bake", "1");
+          imgEl.src = url;
+          imgEl.style.cssText =
+            "position:absolute;left:0;top:0;width:100%;height:100%;" +
+            "object-fit:fill;border:none;z-index:3;pointer-events:none";
+          // ink check
+          var probeImg = await loadImage(url);
+          var probe = document.createElement("canvas");
+          probe.width = Math.max(1, Math.round(rect.width));
+          probe.height = Math.max(1, Math.round(rect.height));
+          probe.getContext("2d").drawImage(probeImg, 0, 0, probe.width, probe.height);
+          if (!canvasHasInk(probe)) throw new Error("sti blank");
+          restorers.push({ iframe: iframe, display: iframe.style.display });
+          iframe.style.display = "none";
+          restorers.push({ img: imgEl });
+          host.appendChild(imgEl);
+          console.log("[dash-shot] baked OnlineMap img", name);
+        } catch (e) {
+          console.warn("[dash-shot] OnlineMap bake skipped", name, e);
+        }
       }
     }
 
     return function restore() {
       restorers.forEach(function (x) {
         try {
-          if (x.canvas && x.canvas.parentNode === x.parent) {
-            x.parent.replaceChild(x.svg, x.canvas);
-          } else if (x.canvas && x.canvas.parentNode) {
-            x.canvas.parentNode.removeChild(x.canvas);
-            if (x.svg && !x.svg.parentNode) x.parent.appendChild(x.svg);
-          }
+          if (x.canvas && x.canvas.parentNode) x.canvas.parentNode.removeChild(x.canvas);
         } catch (e) {}
-      });
-    };
-  }
-
-  /**
-   * OnlineMap iframe → PNG img поверх.
-   */
-  async function bakeOnlineMaps(root, report) {
-    var restorers = [];
-    if (!report) return function () {};
-
-    var hosts = [];
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      var t = attrType(nodes[i]);
-      if (/OnlineMap/i.test(t)) hosts.push(nodes[i]);
-    }
-    var iframes = root.querySelectorAll("iframe");
-    for (var j = 0; j < iframes.length; j++) {
-      var host = iframes[j].parentElement;
-      while (host && host !== root) {
-        if (host.elementAttributes) {
-          if (hosts.indexOf(host) < 0) hosts.push(host);
-          break;
-        }
-        host = host.parentElement;
-      }
-    }
-    console.log("[dash-shot] online hosts", hosts.length);
-    if (!hosts.length) return function () {};
-
-    setStatus("OnlineMap " + hosts.length);
-    for (var h = 0; h < hosts.length; h++) {
-      var dom = hosts[h];
-      // если уже есть SVG-bake — не трогаем
-      if (dom.querySelector('canvas[data-sti-map-bake="1"]')) continue;
-      var name = attrName(dom);
-      var mapEl = findOnlineMapReport(report, name);
-      if (!mapEl) {
-        var all = collectAll(report).filter(isOnlineMapElement);
-        mapEl = all[h] || all[0];
-      }
-      if (!mapEl) continue;
-      var rect = dom.getBoundingClientRect();
-      try {
-        var data = await exportOnlineMapPng(mapEl, rect.width, rect.height);
-        var url = bytesToPngDataUrl(data);
-        if (!url || url.length < 200) throw new Error("empty sti map png");
-        var img = await loadImage(url);
-        // проверка ink через временный canvas
-        var probe = document.createElement("canvas");
-        probe.width = Math.max(1, Math.round(rect.width));
-        probe.height = Math.max(1, Math.round(rect.height));
-        probe.getContext("2d").drawImage(img, 0, 0, probe.width, probe.height);
-        if (!canvasHasInk(probe)) throw new Error("sti map blank");
-
-        var iframe = dom.frame || dom.querySelector("iframe");
-        var bakeImg = document.createElement("img");
-        bakeImg.setAttribute("data-sti-map-bake", "1");
-        bakeImg.src = url;
-        bakeImg.alt = "map";
-        bakeImg.style.cssText =
-          "position:absolute;left:0;top:0;width:100%;height:100%;" +
-          "object-fit:fill;border:none;z-index:2;pointer-events:none";
-        if (getComputedStyle(dom).position === "static") {
-          restorers.push({ el: dom, position: dom.style.position });
-          dom.style.position = "relative";
-        }
-        if (iframe) {
-          restorers.push({ iframe: iframe, display: iframe.style.display });
-          iframe.style.display = "none";
-        }
-        restorers.push({ img: bakeImg });
-        dom.appendChild(bakeImg);
-        console.log("[dash-shot] baked OnlineMap", name || mapEl.name);
-      } catch (e) {
-        console.warn("[dash-shot] OnlineMap bake skipped", name, e);
-      }
-    }
-
-    return function restore() {
-      restorers.forEach(function (x) {
         try {
           if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
         } catch (e) {}
@@ -565,23 +540,18 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restoreSvg = function () {};
-    var restoreOnline = function () {};
+    var restore = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
-      if (!report) console.warn("[dash-shot] report not found");
 
-      setStatus("печём SVG…");
-      restoreSvg = (await bakeRegionMapSvgs(root)) || function () {};
-
-      setStatus("печём OnlineMap…");
-      restoreOnline = (await bakeOnlineMaps(root, report)) || function () {};
+      setStatus("карты из iframe…");
+      restore = (await bakeMaps(root, report)) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
-          setTimeout(res, 60);
+          setTimeout(res, 80);
         });
       });
 
@@ -598,10 +568,8 @@
         },
       });
 
-      restoreSvg();
-      restoreOnline();
-      restoreSvg = function () {};
-      restoreOnline = function () {};
+      restore();
+      restore = function () {};
 
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
@@ -632,10 +600,7 @@
       setStatus(String((err && err.message) || err));
     } finally {
       try {
-        restoreSvg();
-      } catch (e) {}
-      try {
-        restoreOnline();
+        restore();
       } catch (e) {}
       if (btn) btn.disabled = false;
     }
