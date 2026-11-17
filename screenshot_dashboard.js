@@ -247,26 +247,61 @@
     });
   }
 
-  /** Bake-слой ровно в бокс iframe — не на весь host (иначе перекрывает title/кнопки сверху). */
-  function applyIframeBox(el, iframe) {
+  /**
+   * Bake в том же parent, что iframe; координаты через getBoundingClientRect.
+   * Если перекрывает titlePanel — сдвигаем вниз и уменьшаем высоту.
+   * Чуть уменьшаем карту (MAP_BAKE_SHRINK), чтобы title/текст не пропадал.
+   */
+  var MAP_BAKE_SHRINK = 0.88;
+
+  function applyIframeBox(el, iframe, host) {
+    var parent = iframe.parentElement || host;
+    var ir = iframe.getBoundingClientRect();
+    var pr = parent.getBoundingClientRect();
+    var left = ir.left - pr.left + (parent.scrollLeft || 0);
+    var top = ir.top - pr.top + (parent.scrollTop || 0);
+    var w = ir.width;
+    var h = ir.height;
+
+    // titlePanel часто поверх iframe — вычитаем перекрытие сверху
+    var titleEl = host && host.titlePanel;
+    if (titleEl && titleEl.offsetParent !== null) {
+      var tr = titleEl.getBoundingClientRect();
+      var overlap = tr.bottom - ir.top;
+      if (overlap > 2 && overlap < h) {
+        top += overlap;
+        h -= overlap;
+      }
+    }
+
+    // чуть меньше iframe — место под title/подписи
+    var padX = w * (1 - MAP_BAKE_SHRINK) * 0.5;
+    var padY = h * (1 - MAP_BAKE_SHRINK) * 0.5;
+    left += padX;
+    top += padY;
+    w = Math.max(1, w - padX * 2);
+    h = Math.max(1, h - padY * 2);
+
     var cs = window.getComputedStyle(iframe);
     el.style.position = "absolute";
-    el.style.left = iframe.style.left || cs.left || "0px";
-    el.style.top = iframe.style.top || cs.top || "0px";
-    el.style.width = iframe.offsetWidth
-      ? iframe.offsetWidth + "px"
-      : iframe.style.width || cs.width;
-    el.style.height = iframe.offsetHeight
-      ? iframe.offsetHeight + "px"
-      : iframe.style.height || cs.height;
-    // не выше соседних оверлеев host (title/buttons)
+    el.style.left = Math.round(left) + "px";
+    el.style.top = Math.round(top) + "px";
+    el.style.width = Math.round(w) + "px";
+    el.style.height = Math.round(h) + "px";
     var z = cs.zIndex;
     el.style.zIndex = z && z !== "auto" ? String(z) : "0";
     el.style.margin = "0";
     el.style.border = "none";
     el.style.display = "block";
     el.style.pointerEvents = "none";
-    el.style.objectFit = "fill";
+    el.style.objectFit = "contain";
+    el.style.background = "#fff";
+  }
+
+  function insertBakeNearIframe(bakeEl, iframe, host) {
+    var parent = iframe.parentElement || host;
+    if (iframe.nextSibling) parent.insertBefore(bakeEl, iframe.nextSibling);
+    else parent.appendChild(bakeEl);
   }
 
   function typeName(c) {
@@ -481,13 +516,11 @@
       if (svg) {
         try {
           var baked = await svgToCanvas(svg, win);
-          applyIframeBox(baked.canvas, iframe);
+          applyIframeBox(baked.canvas, iframe, host);
           restorers.push({ iframe: iframe, display: iframe.style.display });
           iframe.style.display = "none";
           restorers.push({ canvas: baked.canvas, host: host });
-          // вставляем сразу после iframe, не на весь host
-          if (iframe.nextSibling) host.insertBefore(baked.canvas, iframe.nextSibling);
-          else host.appendChild(baked.canvas);
+          insertBakeNearIframe(baked.canvas, iframe, host);
           console.log("[dash-shot] baked iframe SVG", name, baked.canvas.style.cssText);
           continue;
         } catch (e) {
@@ -515,7 +548,7 @@
           var imgEl = document.createElement("img");
           imgEl.setAttribute("data-sti-map-bake", "1");
           imgEl.src = url;
-          applyIframeBox(imgEl, iframe);
+          applyIframeBox(imgEl, iframe, host);
           // ink check
           var probeImg = await loadImage(url);
           var probe = document.createElement("canvas");
@@ -526,8 +559,7 @@
           restorers.push({ iframe: iframe, display: iframe.style.display });
           iframe.style.display = "none";
           restorers.push({ img: imgEl });
-          if (iframe.nextSibling) host.insertBefore(imgEl, iframe.nextSibling);
-          else host.appendChild(imgEl);
+          insertBakeNearIframe(imgEl, iframe, host);
           console.log("[dash-shot] baked OnlineMap img", name);
         } catch (e) {
           console.warn("[dash-shot] OnlineMap bake skipped", name, e);
@@ -675,67 +707,93 @@
     };
   }
 
+  function cellText(cell) {
+    if (cell == null) return "";
+    if (typeof cell !== "object") return String(cell);
+    if (cell.text != null && String(cell.text) !== "") return String(cell.text);
+    if (cell.displayValue != null) return String(cell.displayValue);
+    if (cell.value != null) return String(cell.value);
+    if (cell.sortLabel != null) return String(cell.sortLabel);
+    if (cell.label != null) return String(cell.label);
+    return "";
+  }
+
+  function headerText(cell, idx) {
+    if (cell == null) return "c" + idx;
+    if (typeof cell !== "object") return String(cell);
+    return (
+      cell.sortLabel ||
+      cell.label ||
+      cell.headerText ||
+      cell.text ||
+      cell.key ||
+      cell.name ||
+      "c" + idx
+    );
+  }
+
   /** Достаёт все строки таблицы из dataGrid / contentAttributes (не только видимый scroll). */
   function extractTableMatrix(host) {
     var rows = null;
+    var src = "";
     try {
-      if (host.dataGrid && host.dataGrid.data) rows = host.dataGrid.data;
-    } catch (e) {}
-    try {
-      if (
-        (!rows || !rows.length) &&
-        host.elementAttributes &&
-        host.elementAttributes.contentAttributes &&
-        host.elementAttributes.contentAttributes.data
-      ) {
-        rows = host.elementAttributes.contentAttributes.data;
+      if (host.dataGrid && host.dataGrid.data && host.dataGrid.data.length) {
+        rows = host.dataGrid.data;
+        src = "dataGrid.data";
       }
     } catch (e) {}
-    if (!rows || !rows.length) return null;
+    try {
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      if ((!rows || !rows.length) && ca && ca.data && ca.data.length) {
+        rows = ca.data;
+        src = "contentAttributes.data";
+      }
+    } catch (e) {}
+    if (!rows || !rows.length) {
+      console.warn("[dash-shot] extract empty", {
+        name: attrName(host),
+        type: attrType(host),
+        hasGrid: !!(host.dataGrid),
+        gridData: host.dataGrid && host.dataGrid.data,
+      });
+      return null;
+    }
 
-    // Stimulsoft: data = [[{key,value,text,...}, ...], ...] или уже строки
+    // Stimulsoft: data = [[{key,text,sortLabel,...}, ...], ...] — row0 = header
     var matrix = [];
-    var header = [];
     var first = rows[0];
     if (Array.isArray(first)) {
-      header = first.map(function (cell, idx) {
-        if (cell && typeof cell === "object") {
-          return (
-            cell.label ||
-            cell.headerText ||
-            cell.key ||
-            cell.name ||
-            "c" + idx
-          );
-        }
-        return "c" + idx;
-      });
-      matrix.push(header);
-      for (var r = 0; r < rows.length; r++) {
-        var line = rows[r].map(function (cell) {
-          if (cell == null) return "";
-          if (typeof cell !== "object") return String(cell);
-          if (cell.text != null) return String(cell.text);
-          if (cell.value != null) return String(cell.value);
-          if (cell.displayValue != null) return String(cell.displayValue);
-          return "";
-        });
-        matrix.push(line);
+      matrix.push(
+        first.map(function (cell, idx) {
+          return headerText(cell, idx);
+        })
+      );
+      for (var r = 1; r < rows.length; r++) {
+        matrix.push(
+          rows[r].map(function (cell) {
+            return cellText(cell);
+          })
+        );
+      }
+      // если в row0 тоже данные (нет отдельных header fields) — уже ок
+      if (matrix.length === 1 && rows.length === 1) {
+        // only header row present
       }
     } else if (typeof first === "object") {
-      header = Object.keys(first);
+      var header = Object.keys(first);
       matrix.push(header);
       rows.forEach(function (row) {
         matrix.push(
           header.map(function (k) {
-            var v = row[k];
-            return v == null ? "" : String(v);
+            return cellText(row[k]);
           })
         );
       });
     } else {
       return null;
     }
+    console.log("[dash-shot] extract", src, "rows", matrix.length, "cols", matrix[0].length);
     return matrix;
   }
 
@@ -753,9 +811,24 @@
       .join("\n");
   }
 
+  async function postExportFile(name, data_b64, ext) {
+    var res = await fetch("/api/screenshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, data_b64: data_b64, ext: ext || "" }),
+    });
+    var body = await res.json().catch(function () {
+      return {};
+    });
+    if (!res.ok) throw new Error(body.error || String(res.status));
+    console.log("[dash-shot] server file", body.name || name, body.path || "");
+    return body;
+  }
+
   async function saveTableData(root) {
     var tables = collectTableHosts(root);
     var saved = 0;
+    var paths = [];
     for (var i = 0; i < tables.length; i++) {
       var host = tables[i];
       var matrix = extractTableMatrix(host);
@@ -767,30 +840,32 @@
         continue;
       }
       var base =
-        (attrName(host) || attrType(host) || "table") +
+        (attrName(host) || attrType(host) || "table").replace(/\s+/g, "_") +
         "_" +
         stamp();
-      var csv = toCsv(matrix);
+      // BOM — Excel нормально открывает UTF-8
+      var csv = "\ufeff" + toCsv(matrix);
       var csvName = base + ".csv";
-      downloadBlob(
-        new Blob([csv], { type: "text/csv;charset=utf-8" }),
-        csvName
-      );
       try {
         var b64 = btoa(unescape(encodeURIComponent(csv)));
-        await fetch("/api/screenshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: csvName,
-            data_b64: b64,
-            ext: "csv",
-          }),
-        });
+        var savedMeta = await postExportFile(csvName, b64, "csv");
+        paths.push(savedMeta.name || csvName);
+        // один браузерный download CSV (Chrome режет пачку download'ов)
+        if (saved === 0) {
+          downloadBlob(
+            new Blob([csv], { type: "text/csv;charset=utf-8" }),
+            csvName
+          );
+        }
       } catch (e) {
-        console.warn(e);
+        console.warn("[dash-shot] csv upload failed", e);
+        downloadBlob(
+          new Blob([csv], { type: "text/csv;charset=utf-8" }),
+          csvName
+        );
+        paths.push(csvName + " (download)");
       }
-      // отдельный PNG только этой таблицы (уже expanded снаружи)
+      // PNG таблицы — только на сервер, без второго browser download
       try {
         var tableCanvas = await window.html2canvas(host, {
           scale: SCALE,
@@ -807,13 +882,9 @@
           }, "image/png");
         });
         var pngName = base + ".png";
-        downloadBlob(blob, pngName);
         var pb64 = await blobToBase64(blob);
-        await fetch("/api/screenshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: pngName, data_b64: pb64 }),
-        });
+        var pngMeta = await postExportFile(pngName, pb64, "png");
+        paths.push(pngMeta.name || pngName);
       } catch (e) {
         console.warn("[dash-shot] table png failed", e);
       }
@@ -825,7 +896,7 @@
         matrix.length
       );
     }
-    return saved;
+    return { saved: saved, paths: paths };
   }
 
   async function takeScreenshot() {
@@ -856,7 +927,8 @@
       });
 
       setStatus("данные таблиц…");
-      var nTables = await saveTableData(root);
+      var tableResult = await saveTableData(root);
+      var nTables = tableResult.saved || 0;
 
       setStatus("рендер…");
       var canvas = await window.html2canvas(root, {
@@ -883,26 +955,21 @@
         }, "image/png");
       });
       var name = "dashboard_" + stamp() + ".png";
+      // основной PNG — в браузер + exports/
       downloadBlob(blob, name);
       try {
         var b64 = await blobToBase64(blob);
-        var res = await fetch("/api/screenshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: name, data_b64: b64 }),
-        });
-        var body = await res.json().catch(function () {
-          return {};
-        });
-        if (res.ok)
-          setStatus(
-            "saved " +
-              (body.name || name) +
-              (nTables ? " +" + nTables + " tbl" : "")
-          );
-        else setStatus("download ok; server: " + (body.error || res.status));
+        var body = await postExportFile(name, b64, "png");
+        var extra =
+          nTables > 0
+            ? " | csv в exports/ (" + nTables + ")"
+            : " | csv нет (см. console)";
+        setStatus("saved " + (body.name || name) + extra);
       } catch (err) {
-        setStatus("download ok" + (nTables ? " +" + nTables + " tbl" : ""));
+        setStatus(
+          "download ok" +
+            (nTables ? " | csv в exports/ (" + nTables + ")" : "")
+        );
         console.warn(err);
       }
     } catch (err) {
