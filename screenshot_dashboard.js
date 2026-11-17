@@ -553,6 +553,281 @@
     };
   }
 
+  function isTableHost(el) {
+    var t = attrType(el);
+    return (
+      t === "StiTableElement" ||
+      t === "StiPivotTableElement" ||
+      /TableElement/i.test(t)
+    );
+  }
+
+  function collectTableHosts(root) {
+    var out = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      if (isTableHost(nodes[i])) out.push(nodes[i]);
+    }
+    console.log(
+      "[dash-shot] tables",
+      out.length,
+      out.map(function (el) {
+        return { name: attrName(el), type: attrType(el) };
+      })
+    );
+    return out;
+  }
+
+  function pushStyleRestore(restorers, el, keys) {
+    var saved = { el: el, styles: {} };
+    for (var i = 0; i < keys.length; i++) {
+      saved.styles[keys[i]] = el.style[keys[i]];
+    }
+    restorers.push(saved);
+  }
+
+  /**
+   * Table/Pivot в viewer с overflow+фиксированной высотой → на скрине обрезано.
+   * Раскрываем scroll-контейнеры на scrollHeight перед html2canvas.
+   */
+  function expandTables(root) {
+    var restorers = [];
+    var tables = collectTableHosts(root);
+    setStatus("таблицы " + tables.length);
+
+    tables.forEach(function (host) {
+      var nodes = [host];
+      if (host.contentPanel) nodes.push(host.contentPanel);
+      if (host.dataGrid) nodes.push(host.dataGrid);
+      var all = host.querySelectorAll("*");
+      for (var i = 0; i < all.length; i++) nodes.push(all[i]);
+
+      // 1) все внутренние scroll/clip → visible + высота по контенту
+      nodes.forEach(function (el) {
+        if (!el || !el.style) return;
+        var cs = window.getComputedStyle(el);
+        var oy = cs.overflowY;
+        var ox = cs.overflowX;
+        var ov = cs.overflow;
+        var clips =
+          oy === "auto" ||
+          oy === "scroll" ||
+          oy === "hidden" ||
+          ox === "auto" ||
+          ox === "scroll" ||
+          ov === "auto" ||
+          ov === "scroll" ||
+          ov === "hidden";
+        if (!clips) return;
+        var sh = el.scrollHeight;
+        var ch = el.clientHeight;
+        if (!(sh > ch + 2) && !(el.scrollWidth > el.clientWidth + 2)) return;
+
+        pushStyleRestore(restorers, el, [
+          "height",
+          "maxHeight",
+          "overflow",
+          "overflowX",
+          "overflowY",
+        ]);
+        el.style.overflow = "visible";
+        el.style.overflowX = "visible";
+        el.style.overflowY = "visible";
+        el.style.maxHeight = "none";
+        if (sh > ch + 2) el.style.height = sh + "px";
+        console.log(
+          "[dash-shot] expand node",
+          el.className || el.tagName,
+          ch + "→" + sh
+        );
+      });
+
+      // 2) сам host (absolute dashboard cell) тоже вырастить
+      var needH = Math.max(
+        host.scrollHeight,
+        host.dataGrid ? host.dataGrid.scrollHeight : 0,
+        host.contentPanel ? host.contentPanel.scrollHeight : 0
+      );
+      // title + padding
+      if (host.titlePanel) needH += host.titlePanel.offsetHeight || 0;
+      var hostH = host.clientHeight;
+      if (needH > hostH + 2) {
+        pushStyleRestore(restorers, host, ["height", "maxHeight", "overflow"]);
+        host.style.overflow = "visible";
+        host.style.maxHeight = "none";
+        host.style.height = needH + "px";
+        console.log(
+          "[dash-shot] expand host",
+          attrName(host) || attrType(host),
+          hostH + "→" + needH
+        );
+      }
+    });
+
+    return function restore() {
+      restorers.forEach(function (x) {
+        try {
+          Object.keys(x.styles).forEach(function (k) {
+            x.el.style[k] = x.styles[k];
+          });
+        } catch (e) {}
+      });
+    };
+  }
+
+  /** Достаёт все строки таблицы из dataGrid / contentAttributes (не только видимый scroll). */
+  function extractTableMatrix(host) {
+    var rows = null;
+    try {
+      if (host.dataGrid && host.dataGrid.data) rows = host.dataGrid.data;
+    } catch (e) {}
+    try {
+      if (
+        (!rows || !rows.length) &&
+        host.elementAttributes &&
+        host.elementAttributes.contentAttributes &&
+        host.elementAttributes.contentAttributes.data
+      ) {
+        rows = host.elementAttributes.contentAttributes.data;
+      }
+    } catch (e) {}
+    if (!rows || !rows.length) return null;
+
+    // Stimulsoft: data = [[{key,value,text,...}, ...], ...] или уже строки
+    var matrix = [];
+    var header = [];
+    var first = rows[0];
+    if (Array.isArray(first)) {
+      header = first.map(function (cell, idx) {
+        if (cell && typeof cell === "object") {
+          return (
+            cell.label ||
+            cell.headerText ||
+            cell.key ||
+            cell.name ||
+            "c" + idx
+          );
+        }
+        return "c" + idx;
+      });
+      matrix.push(header);
+      for (var r = 0; r < rows.length; r++) {
+        var line = rows[r].map(function (cell) {
+          if (cell == null) return "";
+          if (typeof cell !== "object") return String(cell);
+          if (cell.text != null) return String(cell.text);
+          if (cell.value != null) return String(cell.value);
+          if (cell.displayValue != null) return String(cell.displayValue);
+          return "";
+        });
+        matrix.push(line);
+      }
+    } else if (typeof first === "object") {
+      header = Object.keys(first);
+      matrix.push(header);
+      rows.forEach(function (row) {
+        matrix.push(
+          header.map(function (k) {
+            var v = row[k];
+            return v == null ? "" : String(v);
+          })
+        );
+      });
+    } else {
+      return null;
+    }
+    return matrix;
+  }
+
+  function toCsv(matrix) {
+    return matrix
+      .map(function (row) {
+        return row
+          .map(function (cell) {
+            var s = String(cell == null ? "" : cell);
+            if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+            return s;
+          })
+          .join(",");
+      })
+      .join("\n");
+  }
+
+  async function saveTableData(root) {
+    var tables = collectTableHosts(root);
+    var saved = 0;
+    for (var i = 0; i < tables.length; i++) {
+      var host = tables[i];
+      var matrix = extractTableMatrix(host);
+      if (!matrix || matrix.length < 1) {
+        console.warn(
+          "[dash-shot] no table data",
+          attrName(host) || attrType(host)
+        );
+        continue;
+      }
+      var base =
+        (attrName(host) || attrType(host) || "table") +
+        "_" +
+        stamp();
+      var csv = toCsv(matrix);
+      var csvName = base + ".csv";
+      downloadBlob(
+        new Blob([csv], { type: "text/csv;charset=utf-8" }),
+        csvName
+      );
+      try {
+        var b64 = btoa(unescape(encodeURIComponent(csv)));
+        await fetch("/api/screenshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: csvName,
+            data_b64: b64,
+            ext: "csv",
+          }),
+        });
+      } catch (e) {
+        console.warn(e);
+      }
+      // отдельный PNG только этой таблицы (уже expanded снаружи)
+      try {
+        var tableCanvas = await window.html2canvas(host, {
+          scale: SCALE,
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: "#ffffff",
+          logging: false,
+          foreignObjectRendering: false,
+        });
+        var blob = await new Promise(function (resolve, reject) {
+          tableCanvas.toBlob(function (b) {
+            if (b) resolve(b);
+            else reject(new Error("toBlob failed"));
+          }, "image/png");
+        });
+        var pngName = base + ".png";
+        downloadBlob(blob, pngName);
+        var pb64 = await blobToBase64(blob);
+        await fetch("/api/screenshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: pngName, data_b64: pb64 }),
+        });
+      } catch (e) {
+        console.warn("[dash-shot] table png failed", e);
+      }
+      saved++;
+      console.log(
+        "[dash-shot] table saved",
+        attrName(host),
+        "rows",
+        matrix.length
+      );
+    }
+    return saved;
+  }
+
   async function takeScreenshot() {
     var root = captureRoot();
     if (!root) {
@@ -561,20 +836,27 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restore = function () {};
+    var restoreMaps = function () {};
+    var restoreTables = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
 
       setStatus("карты из iframe…");
-      restore = (await bakeMaps(root, report)) || function () {};
+      restoreMaps = (await bakeMaps(root, report)) || function () {};
+
+      setStatus("раскрываем таблицы…");
+      restoreTables = expandTables(root) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
           setTimeout(res, 80);
         });
       });
+
+      setStatus("данные таблиц…");
+      var nTables = await saveTableData(root);
 
       setStatus("рендер…");
       var canvas = await window.html2canvas(root, {
@@ -589,8 +871,10 @@
         },
       });
 
-      restore();
-      restore = function () {};
+      restoreTables();
+      restoreMaps();
+      restoreTables = function () {};
+      restoreMaps = function () {};
 
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
@@ -610,10 +894,15 @@
         var body = await res.json().catch(function () {
           return {};
         });
-        if (res.ok) setStatus("saved " + (body.name || name));
+        if (res.ok)
+          setStatus(
+            "saved " +
+              (body.name || name) +
+              (nTables ? " +" + nTables + " tbl" : "")
+          );
         else setStatus("download ok; server: " + (body.error || res.status));
       } catch (err) {
-        setStatus("download ok");
+        setStatus("download ok" + (nTables ? " +" + nTables + " tbl" : ""));
         console.warn(err);
       }
     } catch (err) {
@@ -621,7 +910,10 @@
       setStatus(String((err && err.message) || err));
     } finally {
       try {
-        restore();
+        restoreTables();
+      } catch (e) {}
+      try {
+        restoreMaps();
       } catch (e) {}
       if (btn) btn.disabled = false;
     }

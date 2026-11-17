@@ -183,12 +183,17 @@ def sti_response(component, inject_screenshot: bool = False):
     return resp
 
 
-def _safe_name(name: str, fallback: str = "dashboard.png") -> str:
+def _safe_name(name: str, fallback: str = "dashboard.png", ext: str | None = None) -> str:
     raw = (name or "").strip() or fallback
     base = Path(raw).name
     cleaned = _SAFE_NAME.sub("_", base).strip("._") or fallback
-    if not cleaned.lower().endswith(".png"):
-        cleaned += ".png"
+    allowed = {".png", ".csv", ".json", ".txt", ".html"}
+    suffix = Path(cleaned).suffix.lower()
+    want = ("." + ext.lstrip(".")).lower() if ext else ""
+    if want in allowed and not cleaned.lower().endswith(want):
+        cleaned = Path(cleaned).stem + want
+    elif suffix not in allowed:
+        cleaned += want if want in allowed else ".png"
     return cleaned[:160]
 
 
@@ -207,7 +212,7 @@ def screenshot_dashboard_js():
 
 @app.post("/api/screenshot")
 def api_screenshot():
-    """Сохраняет PNG-скрин viewer в EXPORT_DIR."""
+    """Сохраняет PNG/CSV (и др.) из viewer в EXPORT_DIR."""
     body = request.get_json(silent=True) or {}
     b64 = body.get("data_b64")
     if not isinstance(b64, str) or not b64.strip():
@@ -219,7 +224,12 @@ def api_screenshot():
     if not data:
         return jsonify({"ok": False, "error": "empty payload"}), 400
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    name = _safe_name(str(body.get("name") or ""), f"{MRT_PATH.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = _safe_name(
+        str(body.get("name") or ""),
+        f"{MRT_PATH.stem}_{stamp}.png",
+        str(body.get("ext") or "") or None,
+    )
     out = EXPORT_DIR / name
     try:
         out.write_bytes(data)
