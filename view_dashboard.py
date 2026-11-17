@@ -149,48 +149,62 @@ def sti_response(component):
 
 
 # Кнопки поверх viewer: весь дашборд → PDF / Excel (exportDocumentAsync).
+# Stimulsoft fullscreen держит z-index до 1000000 — наши кнопки выше.
 _EXPORT_UI = """
-<style>
-#sti-export-bar{position:fixed;z-index:99999;top:10px;right:10px;display:flex;gap:6px;
-font:13px/1.2 system-ui,sans-serif}
-#sti-export-bar button{cursor:pointer;padding:7px 12px;border:1px solid #333;background:#111;color:#fff;
-border-radius:4px}
-#sti-export-bar button:hover{background:#333}
-#sti-export-bar button:disabled{opacity:.5;cursor:wait}
-</style>
-<div id="sti-export-bar">
-  <button type="button" id="sti-export-pdf">PDF</button>
-  <button type="button" id="sti-export-xlsx">Excel</button>
-</div>
 <script>
 (function () {
-  function report() {
-    if (window.viewer && window.viewer.report) return window.viewer.report;
-    var vs = Stimulsoft.Viewer && Stimulsoft.Viewer.StiViewer && Stimulsoft.Viewer.StiViewer.viewers;
-    if (vs && vs.length && vs[0].report) return vs[0].report;
-    return null;
+  function mount() {
+    if (document.getElementById("sti-export-bar")) return;
+    var style = document.createElement("style");
+    style.textContent =
+      "#sti-export-bar{position:fixed!important;z-index:2000001!important;top:12px!important;" +
+      "right:12px!important;display:flex!important;gap:6px!important;" +
+      "font:13px/1.2 system-ui,sans-serif!important;pointer-events:auto!important}" +
+      "#sti-export-bar button{cursor:pointer;padding:8px 14px;border:1px solid #222;" +
+      "background:#111;color:#fff;border-radius:4px;font:inherit}" +
+      "#sti-export-bar button:hover{background:#333}" +
+      "#sti-export-bar button:disabled{opacity:.5;cursor:wait}";
+    document.head.appendChild(style);
+
+    var bar = document.createElement("div");
+    bar.id = "sti-export-bar";
+    bar.innerHTML =
+      '<button type="button" id="sti-export-pdf">PDF</button>' +
+      '<button type="button" id="sti-export-xlsx">Excel</button>';
+    document.body.appendChild(bar);
+
+    function report() {
+      if (window.viewer && window.viewer.report) return window.viewer.report;
+      return null;
+    }
+    function exportDoc(fmt, ext, mime) {
+      var r = report();
+      if (!r) { alert("Дашборд ещё не загружен"); return; }
+      var btns = bar.querySelectorAll("button");
+      btns.forEach(function (b) { b.disabled = true; });
+      r.exportDocumentAsync(function (data) {
+        var name = (r.reportAlias || r.reportName || "dashboard") + ext;
+        Stimulsoft.System.StiObject.saveAs(data, name, mime);
+        btns.forEach(function (b) { b.disabled = false; });
+      }, fmt);
+    }
+    document.getElementById("sti-export-pdf").onclick = function () {
+      exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf");
+    };
+    document.getElementById("sti-export-xlsx").onclick = function () {
+      exportDoc(
+        Stimulsoft.Report.StiExportFormat.Excel2007,
+        ".xlsx",
+        "application/vnd.ms-excel"
+      );
+    };
   }
-  function exportDoc(fmt, ext, mime) {
-    var r = report();
-    if (!r) { alert("Дашборд ещё не загружен"); return; }
-    var btns = document.querySelectorAll("#sti-export-bar button");
-    btns.forEach(function (b) { b.disabled = true; });
-    r.exportDocumentAsync(function (data) {
-      var name = (r.reportAlias || r.reportName || "dashboard") + ext;
-      Stimulsoft.System.StiObject.saveAs(data, name, mime);
-      btns.forEach(function (b) { b.disabled = false; });
-    }, fmt);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(mount, 0); });
+  } else {
+    setTimeout(mount, 0);
   }
-  document.getElementById("sti-export-pdf").onclick = function () {
-    exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf");
-  };
-  document.getElementById("sti-export-xlsx").onclick = function () {
-    exportDoc(
-      Stimulsoft.Report.StiExportFormat.Excel2007,
-      ".xlsx",
-      "application/vnd.ms-excel"
-    );
-  };
+  window.addEventListener("load", function () { setTimeout(mount, 50); });
 })();
 </script>
 """
