@@ -16,8 +16,6 @@ sql_trace*.json
 sql_trace*.txt
 page.txt
 data/
-snapshots/
-*.mdc
 init/
 *.error.txt
 *.ipynb
