@@ -304,29 +304,52 @@ _EXPORT_UI = """
       if (!isButtonElement(c)) return;
       var item = {
         el: c,
-        width: c.width,
-        height: c.height,
         left: c.left,
-        top: c.top
+        top: c.top,
+        text: c.text,
+        icon: null,
+        checkedIcon: null,
+        uncheckedIcon: null
       };
       try {
-        // 0×0 = unplaced: не рисуется, но userFilters остаются в getComponents
-        c.width = 0;
-        c.height = 0;
+        // Не 0×0 — icon font в PDF даёт «звёзды». Уводим за край, фильтры остаются.
+        c.left = -10000;
+      } catch (e) {}
+      try {
+        item.text = c.text;
+        c.text = "";
+      } catch (e) {}
+      try {
+        if (c.iconSet) {
+          item.icon = c.iconSet.icon;
+          item.checkedIcon = c.iconSet.checkedIcon;
+          item.uncheckedIcon = c.iconSet.uncheckedIcon;
+          c.iconSet.icon = null;
+          c.iconSet.checkedIcon = null;
+          c.iconSet.uncheckedIcon = null;
+        }
       } catch (e) {}
       saved.push(item);
     });
     __stiHiddenButtons = saved;
-    console.log("[sti-export] collapsed buttons:", saved.length);
+    console.log("[sti-export] offscreen buttons:", saved.length);
     return saved;
   }
   function restoreButtons(saved) {
     (saved || __stiHiddenButtons || []).forEach(function (x) {
       try {
-        if (x.width != null) x.el.width = x.width;
-        if (x.height != null) x.el.height = x.height;
         if (x.left != null) x.el.left = x.left;
         if (x.top != null) x.el.top = x.top;
+      } catch (e) {}
+      try {
+        if (x.text != null) x.el.text = x.text;
+      } catch (e) {}
+      try {
+        if (x.el.iconSet) {
+          x.el.iconSet.icon = x.icon;
+          x.el.iconSet.checkedIcon = x.checkedIcon;
+          x.el.iconSet.uncheckedIcon = x.uncheckedIcon;
+        }
       } catch (e) {}
     });
     __stiHiddenButtons = [];
@@ -335,7 +358,15 @@ _EXPORT_UI = """
     if (window.viewer && window.viewer.report) return window.viewer.report;
     return null;
   }
-  function makeSettings(kind) {
+  function firstDashboardPage(r) {
+    if (!r || !r.pages) return null;
+    for (var i = 0; i < r.pages.count; i++) {
+      var p = r.pages.getByIndex(i);
+      if (p && Number(p.width) > 0 && Number(p.height) > 0) return p;
+    }
+    return r.pages.count ? r.pages.getByIndex(0) : null;
+  }
+  function makeSettings(kind, r) {
     try {
       var ns =
         (Stimulsoft.Dashboard &&
@@ -351,29 +382,42 @@ _EXPORT_UI = """
             : null;
       if (!C) return null;
       var s = new C();
-      // imageQuality → imageResolution в PDF/Excel; бумага крупнее A4 — меньше сжатие
-      s.imageQuality = 500;
+      // imageQuality → imageResolution в движке PDF/Excel
+      s.imageQuality = 600;
       try {
+        var Or =
+          Stimulsoft.Report &&
+          Stimulsoft.Report.Components &&
+          Stimulsoft.Report.Components.StiPageOrientation;
+        if (Or && Or.Landscape != null) s.orientation = Or.Landscape;
+      } catch (e) {}
+      // PDF по умолчанию A4: scaleX≠scaleY → сжатие. Задаём Custom = пропорции дашборда.
+      try {
+        var page = firstDashboardPage(r);
         var PK =
           Stimulsoft.System &&
           Stimulsoft.System.Drawing &&
           Stimulsoft.System.Drawing.Printing &&
           Stimulsoft.System.Drawing.Printing.PaperKind;
-        var Or =
-          Stimulsoft.Report &&
-          Stimulsoft.Report.Components &&
-          Stimulsoft.Report.Components.StiPageOrientation;
-        if (PK && PK.A3 != null) s.paperSize = PK.A3;
-        if (Or && Or.Landscape != null) s.orientation = Or.Landscape;
+        if (page && Number(page.width) > 0 && Number(page.height) > 0) {
+          var factor = 2.5;
+          var w = Number(page.width) * factor;
+          var h = Number(page.height) * factor;
+          // минимум ~A2 landscape (hundredths of inch), без искажения пропорций
+          var minW = 2000;
+          var minH = 1400;
+          var m = Math.max(minW / w, minH / h, 1);
+          w *= m;
+          h *= m;
+          s.width = w;
+          s.height = h;
+          if (PK && PK.Custom != null) s.paperSize = PK.Custom;
+          console.log("[sti-export] page", w, "x", h, "from dashboard", page.width, "x", page.height);
+        } else if (PK && PK.A2 != null) {
+          s.paperSize = PK.A2;
+        }
       } catch (e) {
         console.warn("paper size skipped", e);
-      }
-      // Excel: явный размер страницы (дюймы), ещё просторнее A3 landscape
-      if (kind === "xlsx") {
-        try {
-          if ("width" in s) s.width = 23.4;
-          if ("height" in s) s.height = 16.5;
-        } catch (e) {}
       }
       return s;
     } catch (e) {
@@ -460,19 +504,21 @@ _EXPORT_UI = """
       }
     }
     document.getElementById("sti-export-pdf").onclick = function () {
+      var r = report();
       exportDoc(
         Stimulsoft.Report.StiExportFormat.Pdf,
         ".pdf",
         "application/pdf",
-        makeSettings("pdf")
+        makeSettings("pdf", r)
       );
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
+      var r = report();
       exportDoc(
         Stimulsoft.Report.StiExportFormat.Excel2007,
         ".xlsx",
         "application/vnd.ms-excel",
-        makeSettings("xlsx")
+        makeSettings("xlsx", r)
       );
     };
   }
