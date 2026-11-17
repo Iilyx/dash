@@ -2,7 +2,8 @@
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
- * Фикс: читаем SVG из iframe.contentDocument, печём в <canvas>, прячем iframe, снимаем страницу.
+ * Фикс: SVG из iframe.contentDocument → offscreen canvas, после html2canvas
+ * рисуем поверх PNG ровно в бокс iframe (DOM не трогаем — элемент над картой остаётся).
  */
 (function () {
   var HTML2CANVAS =
@@ -247,63 +248,6 @@
     });
   }
 
-  /**
-   * Bake в том же parent, что iframe; координаты через getBoundingClientRect.
-   * Если перекрывает titlePanel — сдвигаем вниз и уменьшаем высоту.
-   * Чуть уменьшаем карту (MAP_BAKE_SHRINK), чтобы title/текст не пропадал.
-   */
-  var MAP_BAKE_SHRINK = 0.88;
-
-  function applyIframeBox(el, iframe, host) {
-    var parent = iframe.parentElement || host;
-    var ir = iframe.getBoundingClientRect();
-    var pr = parent.getBoundingClientRect();
-    var left = ir.left - pr.left + (parent.scrollLeft || 0);
-    var top = ir.top - pr.top + (parent.scrollTop || 0);
-    var w = ir.width;
-    var h = ir.height;
-
-    // titlePanel часто поверх iframe — вычитаем перекрытие сверху
-    var titleEl = host && host.titlePanel;
-    if (titleEl && titleEl.offsetParent !== null) {
-      var tr = titleEl.getBoundingClientRect();
-      var overlap = tr.bottom - ir.top;
-      if (overlap > 2 && overlap < h) {
-        top += overlap;
-        h -= overlap;
-      }
-    }
-
-    // чуть меньше iframe — место под title/подписи
-    var padX = w * (1 - MAP_BAKE_SHRINK) * 0.5;
-    var padY = h * (1 - MAP_BAKE_SHRINK) * 0.5;
-    left += padX;
-    top += padY;
-    w = Math.max(1, w - padX * 2);
-    h = Math.max(1, h - padY * 2);
-
-    var cs = window.getComputedStyle(iframe);
-    el.style.position = "absolute";
-    el.style.left = Math.round(left) + "px";
-    el.style.top = Math.round(top) + "px";
-    el.style.width = Math.round(w) + "px";
-    el.style.height = Math.round(h) + "px";
-    var z = cs.zIndex;
-    el.style.zIndex = z && z !== "auto" ? String(z) : "0";
-    el.style.margin = "0";
-    el.style.border = "none";
-    el.style.display = "block";
-    el.style.pointerEvents = "none";
-    el.style.objectFit = "contain";
-    el.style.background = "#fff";
-  }
-
-  function insertBakeNearIframe(bakeEl, iframe, host) {
-    var parent = iframe.parentElement || host;
-    if (iframe.nextSibling) parent.insertBefore(bakeEl, iframe.nextSibling);
-    else parent.appendChild(bakeEl);
-  }
-
   function typeName(c) {
     try {
       if (!c) return "";
@@ -481,12 +425,13 @@
   }
 
   /**
-   * RegionMap: SVG живёт внутри iframe → canvas в host, iframe hide.
-   * OnlineMap без SVG: Stimulsoft Image export → <img>.
+   * Снимаем карту offscreen (DOM не меняем).
+   * Потом paintMapOverlays кладёт её на итоговый PNG в координатах iframe.
    */
-  async function bakeMaps(root, report) {
-    var restorers = [];
+  async function captureMapOverlays(root, report) {
+    var overlays = [];
     var hosts = collectMapHosts(root);
+    var rootRect = root.getBoundingClientRect();
     setStatus("карты " + hosts.length);
 
     for (var i = 0; i < hosts.length; i++) {
@@ -498,6 +443,15 @@
         continue;
       }
 
+      var ir = iframe.getBoundingClientRect();
+      var box = {
+        x: ir.left - rootRect.left + (root.scrollLeft || 0),
+        y: ir.top - rootRect.top + (root.scrollTop || 0),
+        w: ir.width,
+        h: ir.height,
+      };
+      if (box.w < 2 || box.h < 2) continue;
+
       var doc = iframeDoc(iframe);
       var win = iframeWin(iframe);
       var svg = doc && doc.querySelector("svg");
@@ -506,29 +460,27 @@
         hasDoc: !!doc,
         svg: !!svg,
         type: attrType(host),
+        box: box,
       });
-
-      if (getComputedStyle(host).position === "static") {
-        restorers.push({ el: host, position: host.style.position });
-        host.style.position = "relative";
-      }
 
       if (svg) {
         try {
           var baked = await svgToCanvas(svg, win);
-          applyIframeBox(baked.canvas, iframe, host);
-          restorers.push({ iframe: iframe, display: iframe.style.display });
-          iframe.style.display = "none";
-          restorers.push({ canvas: baked.canvas, host: host });
-          insertBakeNearIframe(baked.canvas, iframe, host);
-          console.log("[dash-shot] baked iframe SVG", name, baked.canvas.style.cssText);
+          overlays.push({
+            name: name,
+            canvas: baked.canvas,
+            x: box.x,
+            y: box.y,
+            w: box.w,
+            h: box.h,
+          });
+          console.log("[dash-shot] overlay SVG ready", name, box.w, "x", box.h);
           continue;
         } catch (e) {
           console.warn("[dash-shot] iframe SVG bake failed", name, e);
         }
       }
 
-      // OnlineMap / нет SVG — пробуем Stimulsoft Image
       if (report && /OnlineMap/i.test(attrType(host))) {
         try {
           var maps = collectAll(report).filter(isOnlineMapElement);
@@ -541,48 +493,48 @@
           }
           mapEl = mapEl || maps[0];
           if (!mapEl) throw new Error("no online map el");
-          var rect = iframe.getBoundingClientRect();
-          var data = await exportOnlineMapPng(mapEl, rect.width, rect.height);
+          var data = await exportOnlineMapPng(mapEl, box.w, box.h);
           var url = bytesToPngDataUrl(data);
           if (!url || url.length < 200) throw new Error("empty sti png");
-          var imgEl = document.createElement("img");
-          imgEl.setAttribute("data-sti-map-bake", "1");
-          imgEl.src = url;
-          applyIframeBox(imgEl, iframe, host);
-          // ink check
-          var probeImg = await loadImage(url);
+          var img = await loadImage(url);
           var probe = document.createElement("canvas");
-          probe.width = Math.max(1, Math.round(rect.width));
-          probe.height = Math.max(1, Math.round(rect.height));
-          probe.getContext("2d").drawImage(probeImg, 0, 0, probe.width, probe.height);
+          probe.width = Math.max(1, Math.round(box.w * SCALE));
+          probe.height = Math.max(1, Math.round(box.h * SCALE));
+          probe.getContext("2d").drawImage(img, 0, 0, probe.width, probe.height);
           if (!canvasHasInk(probe)) throw new Error("sti blank");
-          restorers.push({ iframe: iframe, display: iframe.style.display });
-          iframe.style.display = "none";
-          restorers.push({ img: imgEl });
-          insertBakeNearIframe(imgEl, iframe, host);
-          console.log("[dash-shot] baked OnlineMap img", name);
+          overlays.push({
+            name: name,
+            canvas: probe,
+            x: box.x,
+            y: box.y,
+            w: box.w,
+            h: box.h,
+          });
+          console.log("[dash-shot] overlay OnlineMap ready", name);
         } catch (e) {
           console.warn("[dash-shot] OnlineMap bake skipped", name, e);
         }
       }
     }
 
-    return function restore() {
-      restorers.forEach(function (x) {
-        try {
-          if (x.canvas && x.canvas.parentNode) x.canvas.parentNode.removeChild(x.canvas);
-        } catch (e) {}
-        try {
-          if (x.img && x.img.parentNode) x.img.parentNode.removeChild(x.img);
-        } catch (e) {}
-        try {
-          if (x.iframe) x.iframe.style.display = x.display || "";
-        } catch (e) {}
-        try {
-          if (x.el && x.position != null) x.el.style.position = x.position;
-        } catch (e) {}
-      });
-    };
+    return overlays;
+  }
+
+  function paintMapOverlays(pageCanvas, overlays) {
+    if (!overlays || !overlays.length) return 0;
+    var ctx = pageCanvas.getContext("2d");
+    for (var i = 0; i < overlays.length; i++) {
+      var o = overlays[i];
+      ctx.drawImage(
+        o.canvas,
+        Math.round(o.x * SCALE),
+        Math.round(o.y * SCALE),
+        Math.round(o.w * SCALE),
+        Math.round(o.h * SCALE)
+      );
+      console.log("[dash-shot] painted overlay", o.name);
+    }
+    return overlays.length;
   }
 
   function isTableHost(el) {
@@ -907,15 +859,11 @@
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
-    var restoreMaps = function () {};
     var restoreTables = function () {};
     setStatus("снимок…");
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
-
-      setStatus("карты из iframe…");
-      restoreMaps = (await bakeMaps(root, report)) || function () {};
 
       setStatus("раскрываем таблицы…");
       restoreTables = expandTables(root) || function () {};
@@ -929,6 +877,10 @@
       setStatus("данные таблиц…");
       var tableResult = await saveTableData(root);
       var nTables = tableResult.saved || 0;
+
+      // после expand — актуальные координаты; DOM карты не трогаем
+      setStatus("карты из iframe…");
+      var mapOverlays = await captureMapOverlays(root, report);
 
       setStatus("рендер…");
       var canvas = await window.html2canvas(root, {
@@ -944,9 +896,9 @@
       });
 
       restoreTables();
-      restoreMaps();
       restoreTables = function () {};
-      restoreMaps = function () {};
+
+      var nMaps = paintMapOverlays(canvas, mapOverlays);
 
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
@@ -955,19 +907,19 @@
         }, "image/png");
       });
       var name = "dashboard_" + stamp() + ".png";
-      // основной PNG — в браузер + exports/
       downloadBlob(blob, name);
       try {
         var b64 = await blobToBase64(blob);
         var body = await postExportFile(name, b64, "png");
-        var extra =
-          nTables > 0
-            ? " | csv в exports/ (" + nTables + ")"
-            : " | csv нет (см. console)";
-        setStatus("saved " + (body.name || name) + extra);
+        var bits = [];
+        if (nMaps) bits.push(nMaps + " map");
+        if (nTables) bits.push("csv в exports/ (" + nTables + ")");
+        else bits.push("csv нет");
+        setStatus("saved " + (body.name || name) + " | " + bits.join(" | "));
       } catch (err) {
         setStatus(
           "download ok" +
+            (nMaps ? " +" + nMaps + " map" : "") +
             (nTables ? " | csv в exports/ (" + nTables + ")" : "")
         );
         console.warn(err);
@@ -978,9 +930,6 @@
     } finally {
       try {
         restoreTables();
-      } catch (e) {}
-      try {
-        restoreMaps();
       } catch (e) {}
       if (btn) btn.disabled = false;
     }
