@@ -135,19 +135,62 @@ def begin_process_data(args: StiDataEventArgs) -> None:
     args.connectionString = PG_CONN
 
 
+def resolve_save_path(file_name: str | None) -> Path:
+    """Save / Save As: новое имя → файл рядом с MRT_PATH (без path traversal)."""
+    base = MRT_PATH.parent.resolve()
+    if not file_name:
+        return MRT_PATH
+    name = Path(str(file_name)).name.strip()
+    if not name:
+        return MRT_PATH
+    if not name.lower().endswith(".mrt"):
+        name += ".mrt"
+    target = (base / name).resolve()
+    if target.parent != base:
+        return MRT_PATH
+    return target
+
+
 def save_report(args: StiReportEventArgs):
-    """Save / Save As из designer → перезапись MRT_PATH на сервере."""
+    """Save / Save As из designer → .mrt на диске (MRT_PATH или новое имя)."""
     if args.report is None:
         return StiResult.getError("empty report")
+    target = resolve_save_path(getattr(args, "fileName", None))
     try:
-        MRT_PATH.write_text(
+        target.write_text(
             json.dumps(args.report, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     except OSError as exc:
         return StiResult.getError(str(exc))
-    name = getattr(args, "fileName", None) or MRT_PATH.name
-    return f"Saved to {name}"
+    print(f"Saved dashboard → {target}", flush=True)
+    return f"Saved to {target.name}"
+
+
+def normalize_sti_body(body: bytes | str | None) -> bytes | str | None:
+    """Stimulsoft иногда шлёт report/settings уже объектом — StiRequest._setField
+    делает json.loads(value) и падает TypeError → Save 500, «не сохраняет».
+    """
+    if body is None:
+        return body
+    raw = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+    if not raw or raw[:1] != b"{":
+        return body
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return body
+    if not isinstance(obj, dict):
+        return body
+    changed = False
+    for key in ("report", "settings"):
+        val = obj.get(key)
+        if isinstance(val, (dict, list)):
+            obj[key] = json.dumps(val, ensure_ascii=False)
+            changed = True
+    if not changed:
+        return body
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
 def sti_process(component) -> bool:
@@ -157,11 +200,13 @@ def sti_process(component) -> bool:
     """
     handled = component.processRequest(
         query=request.args.to_dict(),
-        body=request.get_data(False),
+        body=normalize_sti_body(request.get_data(False)),
     )
     component.handler.framework = StiFrameworkType.FLASK
     component.handler.origin = request.origin or "*"
-    component.handler.error = None
+    # Не затираем реальные ошибки Save/Data — только django-детект шум.
+    if component.handler.error and "django" in str(component.handler.error).lower():
+        component.handler.error = None
     return handled
 
 
@@ -373,6 +418,35 @@ def serve_mrt():
     return resp
 
 
+_LICENSE_BANNER = """
+<script>
+(function () {
+  if (document.getElementById("sti-lic-banner")) return;
+  var b = document.createElement("div");
+  b.id = "sti-lic-banner";
+  b.textContent =
+    "Нет STIMULSOFT_*LICENSE* в .env — серый trial на Cards/Button и watermark. " +
+    "Ключ локальный (.env в gitignore), не из Designer login.";
+  b.style.cssText =
+    "position:fixed;z-index:2000002;left:12px;bottom:12px;max-width:420px;" +
+    "padding:8px 10px;background:#7a1f1f;color:#fff;font:12px/1.35 system-ui,sans-serif;" +
+    "border-radius:4px;opacity:.95";
+  document.body.appendChild(b);
+})();
+</script>
+"""
+
+
+def inject_license_banner(html: str) -> str:
+    if license_key() or license_file():
+        return html
+    lower = html.lower()
+    idx = lower.rfind("</body>")
+    if idx == -1:
+        return html + _LICENSE_BANNER
+    return html[:idx] + _LICENSE_BANNER + html[idx:]
+
+
 @app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
@@ -384,7 +458,11 @@ def designer():
     designer.options.toolbar.showFileMenu = True
     designer.options.toolbar.showFileMenuSave = True
     designer.options.toolbar.showFileMenuSaveAs = True
+    designer.options.toolbar.showFileMenuNew = True
+    designer.options.toolbar.showFileMenuNewDashboard = True
     designer.options.appearance.showSaveDialog = True
+    designer.options.dashboardElements.showCardsElement = True
+    designer.options.dashboardElements.showButtonElement = True
     designer.onBeginProcessData += begin_process_data
     designer.onSaveReport += save_report
     designer.onSaveAsReport += save_report
@@ -398,7 +476,11 @@ def designer():
     designer.report = report  # копирует designer.license → report.license
     if licensed:
         apply_license(designer.report)
-    return sti_response(designer)
+    resp = sti_response(designer)
+    html = resp.get_data(as_text=True)
+    if isinstance(html, str) and "</body>" in html.lower():
+        resp.set_data(inject_license_banner(html))
+    return resp
 
 
 def enable_full_exports(viewer: StiViewer) -> None:
@@ -442,7 +524,7 @@ def viewer():
     resp = sti_response(viewer)
     html = resp.get_data(as_text=True)
     if isinstance(html, str) and ("</body>" in html.lower() or "StiViewer" in html):
-        html = inject_export_ui(html)
+        html = inject_license_banner(inject_export_ui(html))
         if licensed and "StiLicense.Key" not in html and "StiLicense.loadFromFile" not in html:
             print("WARN: license set in Python but missing in HTML", flush=True)
         resp.set_data(html)
