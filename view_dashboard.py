@@ -222,8 +222,8 @@ def sti_response(component):
 _EXPORT_UI = """
 <script>
 (function () {
-  // Button в PDF 2024.2.2 = серая заливка поверх Text/Cards/Indicator.
-  // enabled=false игнорируется при enabled-expression → снимаем с parent.components.
+  // Button: серая заливка поверх контента, но userFilters живут на Button —
+  // нельзя detach/disable. Прячем нулевым размером, фильтры остаются в дереве.
   var __stiHiddenButtons = [];
   function typeName(c) {
     try {
@@ -250,7 +250,7 @@ _EXPORT_UI = """
         Stimulsoft.Dashboard.Components &&
         Stimulsoft.Dashboard.Components.Button &&
         Stimulsoft.Dashboard.Components.Button.StiButtonElement;
-      if (Btn && (c.is && c.is(Btn) || c instanceof Btn)) return true;
+      if (Btn && ((c.is && c.is(Btn)) || c instanceof Btn)) return true;
     } catch (e) {}
     var tn = typeName(c);
     if (tn === "StiButtonElement" || /ButtonElement/i.test(tn)) return true;
@@ -266,24 +266,11 @@ _EXPORT_UI = """
     } catch (e) {}
     return false;
   }
-  function clearEnabledExpression(c) {
-    try {
-      if (!c || !c.expressions) return;
-      var ex = c.expressions;
-      if (typeof ex.removeByName === "function") ex.removeByName("enabled");
-      else if (typeof ex.getByName === "function") {
-        var item = ex.getByName("enabled");
-        if (item && typeof ex.remove === "function") ex.remove(item);
-        else if (item) item.expression = "";
-      }
-    } catch (e) {}
-  }
   function walkComponents(root, fn) {
     if (!root) return;
     fn(root);
     var kids = root.components;
     if (!kids || kids.count == null) return;
-    // копируем список — при detach индексы не ломают обход
     var arr = [];
     for (var i = 0; i < kids.count; i++) arr.push(kids.getByIndex(i));
     for (var j = 0; j < arr.length; j++) walkComponents(arr[j], fn);
@@ -310,76 +297,36 @@ _EXPORT_UI = """
     } catch (e) {}
     return list;
   }
-  function detachFromParent(c) {
-    var parent = c.parent || c.parentComponent || null;
-    var list = parent && parent.components;
-    if (!list) return { parent: parent, index: -1 };
-    var index = -1;
-    for (var i = 0; i < list.count; i++) {
-      if (list.getByIndex(i) === c) {
-        index = i;
-        break;
-      }
-    }
-    if (index < 0) return { parent: parent, index: -1 };
-    try {
-      if (typeof list.removeAt === "function") list.removeAt(index);
-      else if (typeof list.remove === "function") list.remove(c);
-      else if (typeof list.removeByIndex === "function") list.removeByIndex(index);
-    } catch (e) {
-      console.warn("[sti-export] detach failed", e);
-    }
-    return { parent: parent, index: index };
-  }
   function hideButtonsForExport(report) {
     var saved = [];
     if (!report) return saved;
-    var all = collectAll(report);
-    var types = {};
-    all.forEach(function (c) {
-      var tn = typeName(c) || "?";
-      types[tn] = (types[tn] || 0) + 1;
-    });
-    console.log("[sti-export] component types:", types);
-    all.forEach(function (c) {
+    collectAll(report).forEach(function (c) {
       if (!isButtonElement(c)) return;
-      var wasEnabled = true;
-      try {
-        wasEnabled = c.enabled !== false;
-      } catch (e) {}
-      var det = detachFromParent(c);
-      clearEnabledExpression(c);
-      try {
-        c.enabled = false;
-      } catch (e) {}
-      saved.push({
+      var item = {
         el: c,
-        parent: det.parent,
-        index: det.index,
-        enabled: wasEnabled
-      });
+        width: c.width,
+        height: c.height,
+        left: c.left,
+        top: c.top
+      };
+      try {
+        // 0×0 = unplaced: не рисуется, но userFilters остаются в getComponents
+        c.width = 0;
+        c.height = 0;
+      } catch (e) {}
+      saved.push(item);
     });
     __stiHiddenButtons = saved;
-    console.log("[sti-export] detached buttons:", saved.length);
+    console.log("[sti-export] collapsed buttons:", saved.length);
     return saved;
   }
   function restoreButtons(saved) {
-    var items = (saved || __stiHiddenButtons || []).slice();
-    items.sort(function (a, b) {
-      return (a.index || 0) - (b.index || 0);
-    });
-    items.forEach(function (x) {
+    (saved || __stiHiddenButtons || []).forEach(function (x) {
       try {
-        if (x.parent && x.parent.components && x.index >= 0) {
-          var list = x.parent.components;
-          if (typeof list.insert === "function") list.insert(x.index, x.el);
-          else if (typeof list.add === "function") list.add(x.el);
-        }
-      } catch (e) {
-        console.warn("[sti-export] restore insert failed", e);
-      }
-      try {
-        x.el.enabled = x.enabled !== false;
+        if (x.width != null) x.el.width = x.width;
+        if (x.height != null) x.el.height = x.height;
+        if (x.left != null) x.el.left = x.left;
+        if (x.top != null) x.el.top = x.top;
       } catch (e) {}
     });
     __stiHiddenButtons = [];
@@ -404,7 +351,30 @@ _EXPORT_UI = """
             : null;
       if (!C) return null;
       var s = new C();
-      s.imageQuality = 400;
+      // imageQuality → imageResolution в PDF/Excel; бумага крупнее A4 — меньше сжатие
+      s.imageQuality = 500;
+      try {
+        var PK =
+          Stimulsoft.System &&
+          Stimulsoft.System.Drawing &&
+          Stimulsoft.System.Drawing.Printing &&
+          Stimulsoft.System.Drawing.Printing.PaperKind;
+        var Or =
+          Stimulsoft.Report &&
+          Stimulsoft.Report.Components &&
+          Stimulsoft.Report.Components.StiPageOrientation;
+        if (PK && PK.A3 != null) s.paperSize = PK.A3;
+        if (Or && Or.Landscape != null) s.orientation = Or.Landscape;
+      } catch (e) {
+        console.warn("paper size skipped", e);
+      }
+      // Excel: явный размер страницы (дюймы), ещё просторнее A3 landscape
+      if (kind === "xlsx") {
+        try {
+          if ("width" in s) s.width = 23.4;
+          if ("height" in s) s.height = 16.5;
+        } catch (e) {}
+      }
       return s;
     } catch (e) {
       console.warn("export settings skipped", e);
