@@ -217,8 +217,8 @@ def sti_response(component):
     return component.getFrameworkResponse()
 
 
-# Кнопки поверх viewer: весь дашборд → PDF / Excel (exportDocumentAsync).
-# Stimulsoft fullscreen держит z-index до 1000000 — наши кнопки выше.
+# PDF = снимок fullscreen-viewer (html2canvas), Excel = exportDocumentAsync.
+# Stimulsoft fullscreen z-index до 1000000 — наши кнопки выше.
 _EXPORT_UI = """
 <script>
 (function () {
@@ -445,6 +445,123 @@ _EXPORT_UI = """
       '<button type="button" id="sti-export-xlsx">Excel</button>';
     document.body.appendChild(bar);
 
+    function lockBar(label) {
+      var btns = bar.querySelectorAll("button");
+      var labels = [];
+      btns.forEach(function (b) {
+        labels.push(b.textContent);
+        b.disabled = true;
+      });
+      if (btns[0] && label) btns[0].textContent = label;
+      return { btns: btns, labels: labels };
+    }
+    function unlockBar(state) {
+      if (!state) return;
+      state.btns.forEach(function (b, i) {
+        b.disabled = false;
+        if (state.labels[i]) b.textContent = state.labels[i];
+      });
+    }
+    function loadScript(src) {
+      return new Promise(function (resolve, reject) {
+        var existing = document.querySelector('script[data-sti-cdn="' + src + '"]');
+        if (existing) {
+          if (existing.getAttribute("data-loaded") === "1") resolve();
+          else existing.addEventListener("load", function () { resolve(); });
+          return;
+        }
+        var s = document.createElement("script");
+        s.src = src;
+        s.async = true;
+        s.setAttribute("data-sti-cdn", src);
+        s.onload = function () {
+          s.setAttribute("data-loaded", "1");
+          resolve();
+        };
+        s.onerror = function () {
+          reject(new Error("Не загрузился " + src));
+        };
+        document.head.appendChild(s);
+      });
+    }
+    function captureRoot() {
+      return (
+        document.querySelector(".stiJsViewerDashboardBackPanel") ||
+        document.querySelector(".stiJsViewerReportPanel") ||
+        document.querySelector(".stiJsViewerMainPanel") ||
+        document.querySelector("#StiViewer") ||
+        document.body
+      );
+    }
+    // PDF = снимок того, что видно в fullscreen (WYSIWYG), не перерисовка Stimulsoft
+    function exportPdfAsScreen() {
+      var r = report();
+      if (!r && !captureRoot()) {
+        alert("Дашборд ещё не загружен");
+        return;
+      }
+      var state = lockBar("…");
+      var done = false;
+      function unlock() {
+        if (done) return;
+        done = true;
+        unlockBar(state);
+      }
+      setTimeout(unlock, 120000);
+      Promise.resolve()
+        .then(function () {
+          return loadScript(
+            "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"
+          );
+        })
+        .then(function () {
+          return loadScript(
+            "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+          );
+        })
+        .then(function () {
+          var root = captureRoot();
+          return window.html2canvas(root, {
+            scale: 2,
+            useCORS: true,
+            allowTaint: true,
+            backgroundColor: "#ffffff",
+            logging: false,
+            ignoreElements: function (el) {
+              return (
+                el &&
+                (el.id === "sti-export-bar" ||
+                  el.id === "sti-lic-banner" ||
+                  (el.className &&
+                    String(el.className).indexOf("stiJsViewerToolBar") >= 0))
+              );
+            }
+          });
+        })
+        .then(function (canvas) {
+          var JsPDF =
+            (window.jspdf && window.jspdf.jsPDF) ||
+            (window.jsPDF) ||
+            null;
+          if (!JsPDF) throw new Error("jsPDF не найден");
+          var pdf = new JsPDF({
+            orientation: canvas.width >= canvas.height ? "landscape" : "portrait",
+            unit: "pt",
+            format: [canvas.width, canvas.height],
+            compress: true
+          });
+          var img = canvas.toDataURL("image/png");
+          pdf.addImage(img, "PNG", 0, 0, canvas.width, canvas.height, undefined, "FAST");
+          var name =
+            ((r && (r.reportAlias || r.reportName)) || "dashboard") + ".pdf";
+          pdf.save(name);
+        })
+        .catch(function (e) {
+          console.error(e);
+          alert("Ошибка PDF: " + (e && e.message ? e.message : e));
+        })
+        .then(unlock);
+    }
     function exportDoc(fmt, ext, mime, settings) {
       var r = report();
       if (!r) { alert("Дашборд ещё не загружен"); return; }
@@ -452,25 +569,17 @@ _EXPORT_UI = """
         alert("exportDocumentAsync недоступен");
         return;
       }
-      var btns = bar.querySelectorAll("button");
-      var labels = [];
-      btns.forEach(function (b) {
-        labels.push(b.textContent);
-        b.disabled = true;
-      });
-      btns[0] && (btns[0].textContent = "…");
+      var state = lockBar("…");
       var hiddenButtons = hideButtonsForExport(r);
-      if (btns[0])
-        btns[0].textContent = "…" + (hiddenButtons.length ? "(" + hiddenButtons.length + ")" : "(0)");
+      if (state.btns[0])
+        state.btns[0].textContent =
+          "…" + (hiddenButtons.length ? "(" + hiddenButtons.length + ")" : "(0)");
       var done = false;
       function unlock() {
         if (done) return;
         done = true;
         restoreButtons(hiddenButtons);
-        btns.forEach(function (b, i) {
-          b.disabled = false;
-          if (labels[i]) b.textContent = labels[i];
-        });
+        unlockBar(state);
       }
       setTimeout(unlock, 120000);
       try {
@@ -504,13 +613,7 @@ _EXPORT_UI = """
       }
     }
     document.getElementById("sti-export-pdf").onclick = function () {
-      var r = report();
-      exportDoc(
-        Stimulsoft.Report.StiExportFormat.Pdf,
-        ".pdf",
-        "application/pdf",
-        makeSettings("pdf", r)
-      );
+      exportPdfAsScreen();
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
       var r = report();
