@@ -308,6 +308,125 @@
     return /OnlineMap/i.test(typeName(c));
   }
 
+  function isPivotTableElement(c) {
+    if (!c) return false;
+    try {
+      var I =
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Dashboard &&
+        Stimulsoft.Report.Dashboard.IStiPivotTableElement;
+      if (I && c.is && c.is(I)) return true;
+    } catch (e) {}
+    return /PivotTable/i.test(typeName(c));
+  }
+
+  function exportElementAsync(element, format) {
+    return new Promise(function (resolve, reject) {
+      try {
+        var Tools =
+          Stimulsoft.Dashboard &&
+          Stimulsoft.Dashboard.Export &&
+          Stimulsoft.Dashboard.Export.StiDashboardExportTools;
+        if (!Tools || typeof Tools.exportAsync !== "function") {
+          reject(new Error("StiDashboardExportTools.exportAsync нет"));
+          return;
+        }
+        Tools.exportAsync(
+          function (data) {
+            if (data == null) reject(new Error("empty export"));
+            else resolve(data);
+          },
+          element,
+          format
+        );
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function stiBytesToBase64(data) {
+    var bytes;
+    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (data && data.buffer instanceof ArrayBuffer)
+      bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.length);
+    else if (typeof data === "string") return btoa(data);
+    else if (Array.isArray(data)) bytes = new Uint8Array(data);
+    else throw new Error("unknown export payload");
+    var chunk = 0x8000;
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += chunk) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+    }
+    return btoa(parts.join(""));
+  }
+
+  /** Save на Pivot в viewer → Image/Excel/Data; PDF — через export API (все строки). */
+  async function exportPivotsToPdf() {
+    var report = findReport();
+    if (!report) {
+      setStatus("report не найден");
+      return;
+    }
+    var Pdf =
+      Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
+        ? Stimulsoft.Report.StiExportFormat.Pdf
+        : null;
+    if (Pdf == null) {
+      setStatus("StiExportFormat.Pdf нет");
+      return;
+    }
+    var pivots = collectAll(report).filter(isPivotTableElement);
+    console.log(
+      "[dash-shot] pivots",
+      pivots.map(function (p) {
+        return p.name || typeName(p);
+      })
+    );
+    if (!pivots.length) {
+      setStatus("PivotTable не найден");
+      return;
+    }
+    var btn = document.getElementById("dashPivotPdfBtn");
+    if (btn) btn.disabled = true;
+    var saved = 0;
+    try {
+      for (var i = 0; i < pivots.length; i++) {
+        var el = pivots[i];
+        var base =
+          String(el.name || "PivotTable" + (i + 1)).replace(/\s+/g, "_") +
+          "_" +
+          stamp();
+        setStatus("PDF " + (el.name || base) + "…");
+        var data = await exportElementAsync(el, Pdf);
+        var pdfName = base + ".pdf";
+        try {
+          Stimulsoft.System.StiObject.saveAs(
+            data,
+            pdfName,
+            "application/pdf"
+          );
+        } catch (e) {
+          console.warn("[dash-shot] saveAs pdf", e);
+        }
+        try {
+          var b64 = stiBytesToBase64(data);
+          await postExportFile(pdfName, b64, "pdf");
+          saved++;
+        } catch (e) {
+          console.warn("[dash-shot] pdf upload", e);
+          saved++;
+        }
+      }
+      setStatus("pivot pdf: " + saved + " → exports/");
+    } catch (err) {
+      console.error(err);
+      setStatus(String((err && err.message) || err));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   function normalizeExportBytes(data) {
     if (!data) return null;
     if (data.data && (data.data.length || data.data.byteLength)) data = data.data;
@@ -424,14 +543,40 @@
     return out;
   }
 
+  /** Бокс для карты: contentPanel / iframe, ниже titlePanel — title на скрине остаётся. */
+  function mapContentBox(host, iframe, root) {
+    var rootRect = root.getBoundingClientRect();
+    var target =
+      (host.contentPanel && host.contentPanel.getBoundingClientRect().height > 2
+        ? host.contentPanel
+        : null) || iframe;
+    var ir = target.getBoundingClientRect();
+    var box = {
+      x: ir.left - rootRect.left + (root.scrollLeft || 0),
+      y: ir.top - rootRect.top + (root.scrollTop || 0),
+      w: ir.width,
+      h: ir.height,
+    };
+    var titleEl = host.titlePanel;
+    if (titleEl && titleEl.offsetParent !== null) {
+      var tr = titleEl.getBoundingClientRect();
+      var titleBottom = tr.bottom - rootRect.top + (root.scrollTop || 0);
+      if (box.y < titleBottom - 1) {
+        var cut = titleBottom - box.y;
+        box.y = titleBottom;
+        box.h = Math.max(1, box.h - cut);
+      }
+    }
+    return box;
+  }
+
   /**
    * Снимаем карту offscreen (DOM не меняем).
-   * Потом paintMapOverlays кладёт её на итоговый PNG в координатах iframe.
+   * paintMapOverlays кладёт её только в content-бокс — titlePanel не затираем.
    */
   async function captureMapOverlays(root, report) {
     var overlays = [];
     var hosts = collectMapHosts(root);
-    var rootRect = root.getBoundingClientRect();
     setStatus("карты " + hosts.length);
 
     for (var i = 0; i < hosts.length; i++) {
@@ -443,13 +588,7 @@
         continue;
       }
 
-      var ir = iframe.getBoundingClientRect();
-      var box = {
-        x: ir.left - rootRect.left + (root.scrollLeft || 0),
-        y: ir.top - rootRect.top + (root.scrollTop || 0),
-        w: ir.width,
-        h: ir.height,
-      };
+      var box = mapContentBox(host, iframe, root);
       if (box.w < 2 || box.h < 2) continue;
 
       var doc = iframeDoc(iframe);
@@ -461,6 +600,7 @@
         svg: !!svg,
         type: attrType(host),
         box: box,
+        titleH: host.titlePanel ? host.titlePanel.offsetHeight : 0,
       });
 
       if (svg) {
@@ -943,20 +1083,32 @@
       "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
       "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
       "padding:6px 10px;border-radius:6px;";
+    var btnStyle =
+      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
     var btn = document.createElement("button");
     btn.id = "dashShotBtn";
     btn.type = "button";
     btn.textContent = "Скрин";
-    btn.style.cssText =
-      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
+    btn.style.cssText = btnStyle;
     btn.onclick = function () {
       takeScreenshot();
+    };
+    var pdfBtn = document.createElement("button");
+    pdfBtn.id = "dashPivotPdfBtn";
+    pdfBtn.type = "button";
+    pdfBtn.textContent = "Pivot PDF";
+    pdfBtn.title =
+      "Экспорт PivotTable в PDF (все строки). Кнопка Save на элементе — Image/Excel/Data, не PDF.";
+    pdfBtn.style.cssText = btnStyle;
+    pdfBtn.onclick = function () {
+      exportPivotsToPdf();
     };
     var status = document.createElement("span");
     status.id = "dashShotStatus";
     status.style.cssText =
       "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
     bar.appendChild(btn);
+    bar.appendChild(pdfBtn);
     bar.appendChild(status);
     document.body.appendChild(bar);
   }
@@ -968,4 +1120,5 @@
   }
 
   window.__dashTakeScreenshot = takeScreenshot;
+  window.__dashExportPivotsPdf = exportPivotsToPdf;
 })();
