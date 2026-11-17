@@ -16,17 +16,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
+from stimulsoft_reports.enums.StiHtmlMode import StiHtmlMode
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
+from stimulsoft_reports.events.StiExportEventArgs import StiExportEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 
@@ -83,6 +87,8 @@ if not MRT_PATH.is_file():
 HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
+EXPORT_DIR = path_of(os.environ.get("EXPORT_DIR", "exports").strip() or "exports")
+_SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -124,6 +130,43 @@ def save_report(args: StiReportEventArgs):
     except OSError as exc:
         return StiResult.getError(str(exc))
     return None
+
+
+def _safe_stem(name: str | None, fallback: str) -> str:
+    raw = (name or "").strip() or fallback
+    stem = Path(raw).stem or fallback
+    cleaned = _SAFE_NAME.sub("_", stem).strip("._") or fallback
+    return cleaned[:120]
+
+
+def save_export(args: StiExportEventArgs):
+    """Viewer Export → файл в EXPORT_DIR (HTML/PDF/…). preventDefault уже в StiViewer."""
+    if not args.data:
+        return StiResult.getError("empty export")
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(args.fileName, MRT_PATH.stem)
+    ext = (args.fileExtension or "bin").lstrip(".")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = EXPORT_DIR / f"{stem}_{stamp}.{ext}"
+    try:
+        out.write_bytes(args.data)
+    except OSError as exc:
+        return StiResult.getError(str(exc))
+    print(f"export saved: {out.resolve()}", flush=True)
+    return StiResult.getSuccess(f"saved {out.name}")
+
+
+def build_viewer_shell_html() -> str:
+    """Тот же HTML, что отдаёт GET /viewer (shell + JS, не снимок дашборда)."""
+    viewer = StiViewer()
+    apply_license(viewer)
+    viewer.options.appearance.fullScreenMode = True
+    viewer.onBeginProcessData += begin_process_data
+    viewer.onEndExportReport += save_export
+    report = StiReport()
+    report.loadFile("/mrt")
+    viewer.report = report
+    return viewer.getHtml(StiHtmlMode.HTML_PAGE)
 
 
 def sti_process(component) -> bool:
@@ -186,6 +229,7 @@ def viewer():
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
+    viewer.onEndExportReport += save_export
 
     if sti_process(viewer):
         return sti_response(viewer)
@@ -196,11 +240,34 @@ def viewer():
     return sti_response(viewer)
 
 
+@app.get("/save-html")
+def save_html():
+    """Сохраняет viewer shell HTML в EXPORT_DIR. Не snapshot дашборда — только page+JS."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = EXPORT_DIR / f"{MRT_PATH.stem}_viewer_shell_{stamp}.html"
+    try:
+        out.write_text(build_viewer_shell_html(), encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    print(f"shell html saved: {out.resolve()}", flush=True)
+    return jsonify(
+        {
+            "ok": True,
+            "path": str(out.resolve()),
+            "note": "shell only — needs live /viewer server for JS, /mrt, SQL",
+        }
+    )
+
+
 def main() -> None:
     print("Stimulsoft Dashboards.PYTHON 2024.2.2 — official Flask wiring", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
+    print(f"Exports: {EXPORT_DIR.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Save HTML shell: http://{HOST}:{PORT}/save-html", flush=True)
+    print("Export HTML/PDF from viewer toolbar → also lands in Exports/", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
