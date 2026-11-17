@@ -222,6 +222,78 @@ def sti_response(component):
 _EXPORT_UI = """
 <script>
 (function () {
+  // Button поверх Text/Cards/Indicator: в PDF 2024.2.2 Button = серая заливка
+  // без текста и перекрывает низ. На время export — enabled=false.
+  var __stiHiddenButtons = [];
+  function isButtonElement(c) {
+    if (!c) return false;
+    try {
+      var I =
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Dashboard &&
+        Stimulsoft.Report.Dashboard.IStiButtonElement;
+      if (I && c.is && c.is(I)) return true;
+    } catch (e) {}
+    try {
+      var B =
+        Stimulsoft.Dashboard &&
+        Stimulsoft.Dashboard.Components &&
+        Stimulsoft.Dashboard.Components.Button &&
+        Stimulsoft.Dashboard.Components.Button.StiButtonElement;
+      if (B && c.is && c.is(B)) return true;
+    } catch (e) {}
+    var tn =
+      (c.constructor && (c.constructor.ssTypeName || c.constructor.name)) || "";
+    return tn === "StiButtonElement";
+  }
+  function hideButtonsForExport(report) {
+    var saved = [];
+    if (!report || typeof report.getComponents !== "function") return saved;
+    var comps = report.getComponents();
+    for (var i = 0; i < comps.count; i++) {
+      var c = comps.getByIndex(i);
+      if (!isButtonElement(c)) continue;
+      saved.push({ el: c, enabled: c.enabled });
+      c.enabled = false;
+    }
+    __stiHiddenButtons = saved;
+    return saved;
+  }
+  function restoreButtons(saved) {
+    (saved || __stiHiddenButtons || []).forEach(function (x) {
+      try {
+        x.el.enabled = x.enabled;
+      } catch (e) {}
+    });
+    __stiHiddenButtons = [];
+  }
+  function report() {
+    if (window.viewer && window.viewer.report) return window.viewer.report;
+    return null;
+  }
+  function makeSettings(kind) {
+    try {
+      var ns =
+        (Stimulsoft.Dashboard &&
+          Stimulsoft.Dashboard.Export &&
+          Stimulsoft.Dashboard.Export.Settings) ||
+        null;
+      if (!ns) return null;
+      var C =
+        kind === "pdf"
+          ? ns.StiPdfDashboardExportSettings
+          : kind === "xlsx"
+            ? ns.StiExcelDashboardExportSettings
+            : null;
+      if (!C) return null;
+      var s = new C();
+      s.imageQuality = 400;
+      return s;
+    } catch (e) {
+      console.warn("export settings skipped", e);
+    }
+    return null;
+  }
   function mount() {
     if (document.getElementById("sti-export-bar")) return;
     var style = document.createElement("style");
@@ -242,35 +314,6 @@ _EXPORT_UI = """
       '<button type="button" id="sti-export-xlsx">Excel</button>';
     document.body.appendChild(bar);
 
-    function report() {
-      if (window.viewer && window.viewer.report) return window.viewer.report;
-      return null;
-    }
-    function makeSettings(kind) {
-      // 2024.2.2: Stimulsoft.Dashboard.Export.Settings.* (не Report.Dashboard.Export)
-      // imageQuality → imageResolution при PDF/Excel (default 200).
-      try {
-        var ns =
-          (Stimulsoft.Dashboard &&
-            Stimulsoft.Dashboard.Export &&
-            Stimulsoft.Dashboard.Export.Settings) ||
-          null;
-        if (!ns) return null;
-        var C =
-          kind === "pdf"
-            ? ns.StiPdfDashboardExportSettings
-            : kind === "xlsx"
-              ? ns.StiExcelDashboardExportSettings
-              : null;
-        if (!C) return null;
-        var s = new C();
-        s.imageQuality = 400;
-        return s;
-      } catch (e) {
-        console.warn("export settings skipped", e);
-      }
-      return null;
-    }
     function exportDoc(fmt, ext, mime, settings) {
       var r = report();
       if (!r) { alert("Дашборд ещё не загружен"); return; }
@@ -285,16 +328,17 @@ _EXPORT_UI = """
         b.disabled = true;
       });
       btns[0] && (btns[0].textContent = "…");
+      var hiddenButtons = hideButtonsForExport(r);
       var done = false;
       function unlock() {
         if (done) return;
         done = true;
+        restoreButtons(hiddenButtons);
         btns.forEach(function (b, i) {
           b.disabled = false;
           if (labels[i]) b.textContent = labels[i];
         });
       }
-      // safety: не зависать disabled, если callback не пришёл
       setTimeout(unlock, 120000);
       try {
         var args = [
@@ -315,7 +359,6 @@ _EXPORT_UI = """
           },
           fmt
         ];
-        // signature: exportDocumentAsync(callback, format, file?, settings?)
         if (settings) {
           args.push(null);
           args.push(settings);
@@ -344,12 +387,37 @@ _EXPORT_UI = """
       );
     };
   }
+  function hookViewerExport() {
+    var v = window.viewer;
+    if (!v || v.__stiHideButtonsHooked) return;
+    v.__stiHideButtonsHooked = true;
+    var prevBegin = v.onBeginExportReport;
+    var prevEnd = v.onEndExportReport;
+    v.onBeginExportReport = function (args, callback) {
+      try {
+        hideButtonsForExport(v.report || (args && args.report));
+      } catch (e) {}
+      if (typeof prevBegin === "function") return prevBegin(args, callback);
+      if (typeof callback === "function") callback();
+    };
+    v.onEndExportReport = function (args, callback) {
+      try {
+        restoreButtons();
+      } catch (e) {}
+      if (typeof prevEnd === "function") return prevEnd(args, callback);
+      if (typeof callback === "function") callback();
+    };
+  }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () { setTimeout(mount, 0); });
   } else {
     setTimeout(mount, 0);
   }
-  window.addEventListener("load", function () { setTimeout(mount, 50); });
+  window.addEventListener("load", function () {
+    setTimeout(mount, 50);
+    setTimeout(hookViewerExport, 100);
+    setTimeout(hookViewerExport, 1000);
+  });
 })();
 </script>
 """
