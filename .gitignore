@@ -8,7 +8,6 @@ node_modules/
 # generated / local
 catalog.json
 catalog_pages/
-exports/
 ask_trace.txt
 sql_filled.txt
 sql_trace.txt
