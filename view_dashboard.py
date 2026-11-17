@@ -6,7 +6,6 @@ Docs / samples:
   Showing a Dashboard in the Viewer
   How to Activate the Product
   Using Parameters in SQL Query (onBeginProcessData)
-  Exporting a Dashboard from Code (Pdf / Excel / Html)
 
 Запуск:
   .venv/bin/pip install -r requirements.txt
@@ -15,23 +14,19 @@ Docs / samples:
 
 from __future__ import annotations
 
-import base64
 import json
 import os
-import re
 import sys
 import webbrowser
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 import stimulsoft_dashboards  # noqa: F401 — подтягивает dashboards.js
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, request
 from stimulsoft_data_adapters.enums.StiFrameworkType import StiFrameworkType
 from stimulsoft_reports.classes.StiResult import StiResult
 from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs
-from stimulsoft_reports.events.StiExportEventArgs import StiExportEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
 
@@ -88,8 +83,6 @@ if not MRT_PATH.is_file():
 HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
 OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
-EXPORT_DIR = path_of(os.environ.get("EXPORT_DIR", "exports").strip() or "exports")
-_SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
 
 _db = os.environ.get("DATABASE_URL", "").strip()
 if not _db:
@@ -133,51 +126,6 @@ def save_report(args: StiReportEventArgs):
     return None
 
 
-def _safe_stem(name: str | None, fallback: str) -> str:
-    raw = (name or "").strip() or fallback
-    stem = Path(raw).stem or fallback
-    cleaned = _SAFE_NAME.sub("_", stem).strip("._") or fallback
-    return cleaned[:120]
-
-
-def write_export_bytes(data: bytes, stem: str, ext: str) -> Path:
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = EXPORT_DIR / f"{_safe_stem(stem, MRT_PATH.stem)}_{stamp}.{ext.lstrip('.')}"
-    out.write_bytes(data)
-    print(f"export saved: {out.resolve()}", flush=True)
-    return out
-
-
-def save_export(args: StiExportEventArgs):
-    """Toolbar Save → ExportDashboard → файл в EXPORT_DIR."""
-    if not args.data:
-        return StiResult.getError("empty export")
-    try:
-        out = write_export_bytes(
-            args.data,
-            args.fileName,
-            args.fileExtension or "bin",
-        )
-    except OSError as exc:
-        return StiResult.getError(str(exc))
-    return StiResult.getSuccess(f"saved {out.name}")
-
-
-def wire_viewer(viewer: StiViewer) -> None:
-    apply_license(viewer)
-    viewer.options.appearance.fullScreenMode = True
-    viewer.options.toolbar.visible = True
-    viewer.options.toolbar.showSaveButton = True
-    viewer.options.exports.showExportDialog = True
-    viewer.options.exports.showExportToPdf = True
-    viewer.options.exports.showExportToExcel = True
-    viewer.options.exports.showExportToHtml = True
-    viewer.options.exports.showExportToHtml5 = True
-    viewer.onBeginProcessData += begin_process_data
-    viewer.onEndExportReport += save_export
-
-
 def sti_process(component) -> bool:
     """2024.2.2: ImportError django в __processFrameworkRequest ломает Flask-детект.
 
@@ -193,41 +141,11 @@ def sti_process(component) -> bool:
     return handled
 
 
-def inject_export_ui(html: str) -> str:
-    """Вешаем window.__dashReport и кнопки Pdf/Excel/Html."""
-    needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
-    repl = (
-        "viewer.report = report;\n"
-        "window.__dashViewer = viewer;\n"
-        "window.__dashReport = report;\n"
-        "viewer.renderHtml('viewerContent');"
-    )
-    if needle in html:
-        html = html.replace(needle, repl, 1)
-    try:
-        ver = int((ROOT / "export_dashboard.js").stat().st_mtime)
-    except OSError:
-        ver = 1
-    tag = f'<script src="/export-dashboard.js?v={ver}"></script>\n'
-    if "export-dashboard.js" not in html:
-        if "</body>" in html:
-            html = html.replace("</body>", tag + "</body>", 1)
-        else:
-            html = html + tag
-    return html
-
-
-def sti_response(component, inject_export: bool = False):
+def sti_response(component):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
-    resp = component.getFrameworkResponse()
-    if inject_export and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
-        raw = resp.get_data(as_text=True)
-        if isinstance(raw, str) and "viewer.renderHtml" in raw:
-            resp.set_data(inject_export_ui(raw))
-            resp.mimetype = "text/html"
-    return resp
+    return component.getFrameworkResponse()
 
 
 @app.get("/favicon.ico")
@@ -235,49 +153,9 @@ def favicon():
     return Response(status=204)
 
 
-@app.get("/export-dashboard.js")
-def export_dashboard_js():
-    path = ROOT / "export_dashboard.js"
-    resp = Response(path.read_text(encoding="utf-8"), mimetype="application/javascript; charset=utf-8")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.post("/api/export")
-def api_export():
-    """Принимает результат report.exportDocumentAsync2 и пишет в EXPORT_DIR."""
-    body = request.get_json(silent=True) or {}
-    b64 = body.get("data_b64")
-    if not isinstance(b64, str) or not b64.strip():
-        return jsonify({"ok": False, "error": "data_b64 required"}), 400
-    ext = str(body.get("ext") or "bin").lstrip(".")
-    fmt = str(body.get("format") or "export")
-    try:
-        data = base64.b64decode(b64, validate=False)
-    except Exception as exc:
-        return jsonify({"ok": False, "error": f"bad base64: {exc}"}), 400
-    if not data:
-        return jsonify({"ok": False, "error": "empty payload"}), 400
-    try:
-        out = write_export_bytes(data, f"{MRT_PATH.stem}_{fmt}", ext)
-    except OSError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
-
-
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
-    """Пустой DashboardViewerSettings=0 прячет Export на dashboard — поднимаем All=1023."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        dvs = data.get("DashboardViewerSettings")
-        if dvs in ("", None, 0, "0"):
-            data["DashboardViewerSettings"] = 1023
-            raw = json.dumps(data, ensure_ascii=False)
     resp = Response(raw, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -305,7 +183,9 @@ def designer():
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     viewer = StiViewer()
-    wire_viewer(viewer)
+    apply_license(viewer)
+    viewer.options.appearance.fullScreenMode = True
+    viewer.onBeginProcessData += begin_process_data
 
     if sti_process(viewer):
         return sti_response(viewer)
@@ -313,7 +193,7 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer, inject_export=True)
+    return sti_response(viewer)
 
 
 def main() -> None:
@@ -321,7 +201,6 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
-    print(f"Exports:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")

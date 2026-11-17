@@ -19,4 +19,3 @@ data/
 init/
 *.error.txt
 *.ipynb
-exports/
