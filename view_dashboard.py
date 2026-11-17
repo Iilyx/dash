@@ -148,6 +148,68 @@ def sti_response(component):
     return component.getFrameworkResponse()
 
 
+# Кнопки поверх viewer: весь дашборд → PDF / Excel (exportDocumentAsync).
+_EXPORT_UI = """
+<style>
+#sti-export-bar{position:fixed;z-index:99999;top:10px;right:10px;display:flex;gap:6px;
+font:13px/1.2 system-ui,sans-serif}
+#sti-export-bar button{cursor:pointer;padding:7px 12px;border:1px solid #333;background:#111;color:#fff;
+border-radius:4px}
+#sti-export-bar button:hover{background:#333}
+#sti-export-bar button:disabled{opacity:.5;cursor:wait}
+</style>
+<div id="sti-export-bar">
+  <button type="button" id="sti-export-pdf">PDF</button>
+  <button type="button" id="sti-export-xlsx">Excel</button>
+</div>
+<script>
+(function () {
+  function report() {
+    if (window.viewer && window.viewer.report) return window.viewer.report;
+    var vs = Stimulsoft.Viewer && Stimulsoft.Viewer.StiViewer && Stimulsoft.Viewer.StiViewer.viewers;
+    if (vs && vs.length && vs[0].report) return vs[0].report;
+    return null;
+  }
+  function exportDoc(fmt, ext, mime) {
+    var r = report();
+    if (!r) { alert("Дашборд ещё не загружен"); return; }
+    var btns = document.querySelectorAll("#sti-export-bar button");
+    btns.forEach(function (b) { b.disabled = true; });
+    r.exportDocumentAsync(function (data) {
+      var name = (r.reportAlias || r.reportName || "dashboard") + ext;
+      Stimulsoft.System.StiObject.saveAs(data, name, mime);
+      btns.forEach(function (b) { b.disabled = false; });
+    }, fmt);
+  }
+  document.getElementById("sti-export-pdf").onclick = function () {
+    exportDoc(Stimulsoft.Report.StiExportFormat.Pdf, ".pdf", "application/pdf");
+  };
+  document.getElementById("sti-export-xlsx").onclick = function () {
+    exportDoc(
+      Stimulsoft.Report.StiExportFormat.Excel2007,
+      ".xlsx",
+      "application/vnd.ms-excel"
+    );
+  };
+})();
+</script>
+"""
+
+
+def inject_export_ui(html: str) -> str:
+    """Экспортируем window.viewer (в скрипте Stimulsoft — let viewer) + кнопки PDF/Excel."""
+    html = html.replace(
+        "let viewer = new Stimulsoft.Viewer.StiViewer",
+        "var viewer = window.viewer = new Stimulsoft.Viewer.StiViewer",
+        1,
+    )
+    lower = html.lower()
+    idx = lower.rfind("</body>")
+    if idx == -1:
+        return html + _EXPORT_UI
+    return html[:idx] + _EXPORT_UI + html[idx:]
+
+
 @app.get("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -185,6 +247,9 @@ def viewer():
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    viewer.options.toolbar.showSaveButton = True
+    viewer.options.exports.showExportToPdf = True
+    viewer.options.exports.showExportToExcel = True
     viewer.onBeginProcessData += begin_process_data
 
     if sti_process(viewer):
@@ -193,7 +258,11 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer)
+    resp = sti_response(viewer)
+    html = resp.get_data(as_text=True)
+    if isinstance(html, str) and ("</body>" in html.lower() or "StiViewer" in html):
+        resp.set_data(inject_export_ui(html))
+    return resp
 
 
 def main() -> None:
