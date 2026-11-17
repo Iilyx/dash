@@ -210,18 +210,58 @@ _EXPORT_UI = """
 """
 
 
+# Включает Save / View Data / Full Screen на всех dashboard-элементах
+# и полный набор пунктов в меню Save (PDF, Excel, Image, Data, Document…).
+_ELEMENT_SAVE_JS = """
+<script>
+window.stiEnableElementSaves = function (report) {
+  if (!report) return;
+  function enable(c) {
+    var di = c && c.dashboardInteraction;
+    if (!di) return;
+    di.showSaveButton = true;
+    if ("showViewDataButton" in di) di.showViewDataButton = true;
+    if ("showFullScreenButton" in di) di.showFullScreenButton = true;
+  }
+  if (typeof report.getComponents === "function") {
+    var comps = report.getComponents();
+    for (var i = 0; i < comps.count; i++) enable(comps.getByIndex(i));
+    return;
+  }
+  if (!report.pages) return;
+  for (var p = 0; p < report.pages.count; p++) {
+    var page = report.pages.getByIndex(p);
+    if (!page || !page.components) continue;
+    for (var c = 0; c < page.components.count; c++) enable(page.components.getByIndex(c));
+  }
+};
+</script>
+"""
+
+
 def inject_export_ui(html: str) -> str:
-    """Экспортируем window.viewer (в скрипте Stimulsoft — let viewer) + кнопки PDF/Excel."""
+    """window.viewer + кнопки PDF/Excel + Save на всех элементах до assign в viewer."""
     html = html.replace(
         "let viewer = new Stimulsoft.Viewer.StiViewer",
         "var viewer = window.viewer = new Stimulsoft.Viewer.StiViewer",
         1,
     )
+    # Docs: после load, до assign в viewer. loadFile может догрузить async — ещё раз через timeout.
+    html = html.replace(
+        "viewer.report = report;",
+        (
+            "stiEnableElementSaves(report); viewer.report = report; "
+            "setTimeout(function(){ stiEnableElementSaves(viewer.report||report); }, 0); "
+            "setTimeout(function(){ stiEnableElementSaves(viewer.report||report); }, 800);"
+        ),
+        1,
+    )
+    inject = _ELEMENT_SAVE_JS + _EXPORT_UI
     lower = html.lower()
     idx = lower.rfind("</body>")
     if idx == -1:
-        return html + _EXPORT_UI
-    return html[:idx] + _EXPORT_UI + html[idx:]
+        return html + inject
+    return html[:idx] + inject + html[idx:]
 
 
 @app.get("/favicon.ico")
@@ -256,14 +296,33 @@ def designer():
     return sti_response(designer)
 
 
+def enable_full_exports(viewer: StiViewer) -> None:
+    """Полное меню Save: диалог настроек + все форматы (элемент и весь дашборд)."""
+    ex = viewer.options.exports
+    viewer.options.toolbar.showSaveButton = True
+    ex.showExportDialog = True
+    ex.showExportToDocument = True
+    ex.showExportToPdf = True
+    ex.showExportToExcel = True
+    ex.showExportToImageSvg = True
+    ex.showExportToCsv = True
+    ex.showExportToJson = True
+    ex.showExportToHtml = True
+    ex.showExportToHtml5 = True
+    ex.showExportToWord = True
+    ex.showExportToText = True
+    ex.showExportToPowerPoint = True
+    ex.showExportToOpenDocumentCalc = True
+    ex.showExportToOpenDocumentWriter = True
+    ex.showExportToXps = True
+
+
 @app.route("/viewer", methods=["GET", "POST"])
 def viewer():
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
-    viewer.options.toolbar.showSaveButton = True
-    viewer.options.exports.showExportToPdf = True
-    viewer.options.exports.showExportToExcel = True
+    enable_full_exports(viewer)
     viewer.onBeginProcessData += begin_process_data
 
     if sti_process(viewer):
@@ -284,6 +343,20 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    lic = (
+        os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_KEY", "").strip()
+        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_KEY", "").strip()
+        or os.environ.get("STIMULSOFT_LICENSE_KEY", "").strip()
+        or os.environ.get("STIMULSOFT_DASHBOARDS_LICENSE_FILE", "").strip()
+        or os.environ.get("STIMULSOFT_REPORTS_LICENSE_FILE", "").strip()
+        or os.environ.get("STIMULSOFT_LICENSE_FILE", "").strip()
+    )
+    if not lic:
+        print(
+            "WARN: нет Stimulsoft license — серый trial/DEMO watermark на элементах. "
+            "Задай STIMULSOFT_DASHBOARDS_LICENSE_KEY в .env",
+            flush=True,
+        )
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
