@@ -14,6 +14,7 @@ Docs / samples:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -156,17 +157,60 @@ def save_export(args: StiExportEventArgs):
     return StiResult.getSuccess(f"saved {out.name}")
 
 
+def write_export_bytes(filename: str, data: bytes) -> Path:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = _safe_stem(Path(filename).name, MRT_PATH.stem)
+    ext = Path(filename).suffix.lstrip(".") or "bin"
+    # keep caller stamp/name if already unique
+    raw_stem = _SAFE_NAME.sub("_", Path(filename).stem).strip("._")[:160] or stem
+    out = EXPORT_DIR / f"{raw_stem}.{ext}"
+    out.write_bytes(data)
+    return out
+
+
+def enable_viewer_exports(viewer: StiViewer) -> None:
+    viewer.options.toolbar.showSaveButton = True
+    ex = viewer.options.exports
+    ex.showExportDialog = True
+    ex.showExportToPdf = True
+    ex.showExportToExcel = True
+    ex.showExportToHtml = True
+    ex.showExportToHtml5 = True
+    ex.showExportToImageSvg = True
+
+
+def inject_element_exports(html: str) -> str:
+    """window.viewer + кнопка Elements→PDF+Excel (element_exports.js)."""
+    if "element_exports.js" in html:
+        return html
+    hook = (
+        "viewer.renderHtml('viewerContent');\n"
+        "window.viewer = viewer;\n"
+    )
+    if "viewer.renderHtml('viewerContent');" in html:
+        html = html.replace(
+            "viewer.renderHtml('viewerContent');",
+            hook,
+            1,
+        )
+    tag = '<script src="/element_exports.js"></script>\n</body>'
+    if "</body>" in html:
+        return html.replace("</body>", tag, 1)
+    return html + "\n" + tag
+
+
 def build_viewer_shell_html() -> str:
     """Тот же HTML, что отдаёт GET /viewer (shell + JS, не снимок дашборда)."""
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    enable_viewer_exports(viewer)
     viewer.onBeginProcessData += begin_process_data
     viewer.onEndExportReport += save_export
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return viewer.getHtml(StiHtmlMode.HTML_PAGE)
+    return inject_element_exports(viewer.getHtml(StiHtmlMode.HTML_PAGE))
 
 
 def sti_process(component) -> bool:
@@ -204,6 +248,36 @@ def serve_mrt():
     return resp
 
 
+@app.get("/element_exports.js")
+def serve_element_exports_js():
+    path = ROOT / "element_exports.js"
+    resp = Response(path.read_text(encoding="utf-8"), mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/api/export")
+def api_export():
+    """JS element export → exports/. Body: {filename, data: base64}."""
+    body = request.get_json(silent=True) or {}
+    filename = str(body.get("filename") or "").strip()
+    raw_b64 = body.get("data")
+    if not filename or not isinstance(raw_b64, str) or not raw_b64:
+        return jsonify({"ok": False, "error": "filename + data(base64) required"}), 400
+    try:
+        data = base64.b64decode(raw_b64, validate=False)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"bad base64: {exc}"}), 400
+    if not data:
+        return jsonify({"ok": False, "error": "empty data"}), 400
+    try:
+        out = write_export_bytes(filename, data)
+    except OSError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    print(f"element export saved: {out.resolve()} ({len(data)} bytes)", flush=True)
+    return jsonify({"ok": True, "path": str(out.resolve()), "bytes": len(data)})
+
+
 @app.route("/", methods=["GET", "POST"])
 @app.route("/designer", methods=["GET", "POST"])
 def designer():
@@ -228,6 +302,7 @@ def viewer():
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    enable_viewer_exports(viewer)
     viewer.onBeginProcessData += begin_process_data
     viewer.onEndExportReport += save_export
 
@@ -237,7 +312,10 @@ def viewer():
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer)
+    resp = sti_response(viewer)
+    html = resp.get_data(as_text=True)
+    resp.set_data(inject_element_exports(html))
+    return resp
 
 
 @app.get("/save-html")
@@ -267,7 +345,7 @@ def main() -> None:
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Save HTML shell: http://{HOST}:{PORT}/save-html", flush=True)
-    print("Export HTML/PDF from viewer toolbar → also lands in Exports/", flush=True)
+    print("Viewer: Elements → PDF+Excel (per widget with Save) → Exports/", flush=True)
     if OPEN_BROWSER:
         try:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
