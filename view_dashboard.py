@@ -217,13 +217,15 @@ def sti_response(component):
     return component.getFrameworkResponse()
 
 
-# PDF = снимок fullscreen-viewer (html2canvas), Excel = exportDocumentAsync.
+# PDF/Excel = Stimulsoft exportDocumentAsync (карта + userFilters с Button/Map).
+# Снимок экрана не умеет iframe-карту и отбрасывает фильтры кликов.
 # Stimulsoft fullscreen z-index до 1000000 — наши кнопки выше.
 _EXPORT_UI = """
 <script>
 (function () {
-  // Button: серая заливка поверх контента, но userFilters живут на Button —
-  // нельзя detach/disable. Прячем нулевым размером, фильтры остаются в дереве.
+  // Button: серая заливка в PDF, но userFilters (клики) и фильтры карты
+  // живут на элементах — нельзя detach/disable/уводить за край.
+  // Только прозрачная заливка на время экспорта.
   var __stiHiddenButtons = [];
   function typeName(c) {
     try {
@@ -233,6 +235,15 @@ _EXPORT_UI = """
       );
     } catch (e) {
       return "";
+    }
+  }
+  function transparentBrush() {
+    try {
+      var C = Stimulsoft.System.Drawing.Color;
+      var B = Stimulsoft.Base.Drawing.StiSolidBrush;
+      return new B(C.fromArgb(0, 0, 0, 0));
+    } catch (e) {
+      return null;
     }
   }
   function isButtonElement(c) {
@@ -300,24 +311,39 @@ _EXPORT_UI = """
   function hideButtonsForExport(report) {
     var saved = [];
     if (!report) return saved;
+    var tb = transparentBrush();
     collectAll(report).forEach(function (c) {
       if (!isButtonElement(c)) return;
       var item = {
         el: c,
-        left: c.left,
-        top: c.top,
+        brush: c.brush,
+        textBrush: c.textBrush,
         text: c.text,
+        border: c.border,
         icon: null,
         checkedIcon: null,
         uncheckedIcon: null
       };
+      // enabled и позиция не трогаем — иначе пропадают фильтры кликов Button/Map
       try {
-        // Не 0×0 — icon font в PDF даёт «звёзды». Уводим за край, фильтры остаются.
-        c.left = -10000;
+        if (tb) {
+          c.brush = tb;
+          if ("textBrush" in c) c.textBrush = tb;
+        }
       } catch (e) {}
       try {
         item.text = c.text;
         c.text = "";
+      } catch (e) {}
+      try {
+        if (c.border) {
+          item.border = c.border;
+          if (typeof c.border.clone === "function") {
+            var b = c.border.clone();
+            if ("side" in b) b.side = 0;
+            c.border = b;
+          }
+        }
       } catch (e) {}
       try {
         if (c.iconSet) {
@@ -332,17 +358,22 @@ _EXPORT_UI = """
       saved.push(item);
     });
     __stiHiddenButtons = saved;
-    console.log("[sti-export] offscreen buttons:", saved.length);
+    console.log("[sti-export] soft-hidden buttons:", saved.length);
     return saved;
   }
   function restoreButtons(saved) {
     (saved || __stiHiddenButtons || []).forEach(function (x) {
       try {
-        if (x.left != null) x.el.left = x.left;
-        if (x.top != null) x.el.top = x.top;
+        if (x.brush !== undefined) x.el.brush = x.brush;
+      } catch (e) {}
+      try {
+        if (x.textBrush !== undefined) x.el.textBrush = x.textBrush;
       } catch (e) {}
       try {
         if (x.text != null) x.el.text = x.text;
+      } catch (e) {}
+      try {
+        if (x.border !== undefined) x.el.border = x.border;
       } catch (e) {}
       try {
         if (x.el.iconSet) {
@@ -382,7 +413,6 @@ _EXPORT_UI = """
             : null;
       if (!C) return null;
       var s = new C();
-      // imageQuality → imageResolution в движке PDF/Excel
       s.imageQuality = 600;
       try {
         var Or =
@@ -391,7 +421,7 @@ _EXPORT_UI = """
           Stimulsoft.Report.Components.StiPageOrientation;
         if (Or && Or.Landscape != null) s.orientation = Or.Landscape;
       } catch (e) {}
-      // PDF по умолчанию A4: scaleX≠scaleY → сжатие. Задаём Custom = пропорции дашборда.
+      // Custom page = пропорции дашборда (иначе A4 сжимает по осям)
       try {
         var page = firstDashboardPage(r);
         var PK =
@@ -400,21 +430,20 @@ _EXPORT_UI = """
           Stimulsoft.System.Drawing.Printing &&
           Stimulsoft.System.Drawing.Printing.PaperKind;
         if (page && Number(page.width) > 0 && Number(page.height) > 0) {
-          var factor = 2.5;
-          var w = Number(page.width) * factor;
-          var h = Number(page.height) * factor;
-          // минимум ~A2 landscape (hundredths of inch), без искажения пропорций
-          var minW = 2000;
-          var minH = 1400;
-          var m = Math.max(minW / w, minH / h, 1);
-          w *= m;
-          h *= m;
-          s.width = w;
-          s.height = h;
+          var factor = 2;
+          s.width = Number(page.width) * factor;
+          s.height = Number(page.height) * factor;
           if (PK && PK.Custom != null) s.paperSize = PK.Custom;
-          console.log("[sti-export] page", w, "x", h, "from dashboard", page.width, "x", page.height);
-        } else if (PK && PK.A2 != null) {
-          s.paperSize = PK.A2;
+          console.log(
+            "[sti-export] page",
+            s.width,
+            "x",
+            s.height,
+            "dashboard",
+            page.width,
+            "x",
+            page.height
+          );
         }
       } catch (e) {
         console.warn("paper size skipped", e);
@@ -461,106 +490,6 @@ _EXPORT_UI = """
         b.disabled = false;
         if (state.labels[i]) b.textContent = state.labels[i];
       });
-    }
-    function loadScript(src) {
-      return new Promise(function (resolve, reject) {
-        var existing = document.querySelector('script[data-sti-cdn="' + src + '"]');
-        if (existing) {
-          if (existing.getAttribute("data-loaded") === "1") resolve();
-          else existing.addEventListener("load", function () { resolve(); });
-          return;
-        }
-        var s = document.createElement("script");
-        s.src = src;
-        s.async = true;
-        s.setAttribute("data-sti-cdn", src);
-        s.onload = function () {
-          s.setAttribute("data-loaded", "1");
-          resolve();
-        };
-        s.onerror = function () {
-          reject(new Error("Не загрузился " + src));
-        };
-        document.head.appendChild(s);
-      });
-    }
-    function captureRoot() {
-      return (
-        document.querySelector(".stiJsViewerDashboardBackPanel") ||
-        document.querySelector(".stiJsViewerReportPanel") ||
-        document.querySelector(".stiJsViewerMainPanel") ||
-        document.querySelector("#StiViewer") ||
-        document.body
-      );
-    }
-    // PDF = снимок того, что видно в fullscreen (WYSIWYG), не перерисовка Stimulsoft
-    function exportPdfAsScreen() {
-      var r = report();
-      if (!r && !captureRoot()) {
-        alert("Дашборд ещё не загружен");
-        return;
-      }
-      var state = lockBar("…");
-      var done = false;
-      function unlock() {
-        if (done) return;
-        done = true;
-        unlockBar(state);
-      }
-      setTimeout(unlock, 120000);
-      Promise.resolve()
-        .then(function () {
-          return loadScript(
-            "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"
-          );
-        })
-        .then(function () {
-          return loadScript(
-            "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
-          );
-        })
-        .then(function () {
-          var root = captureRoot();
-          return window.html2canvas(root, {
-            scale: 2,
-            useCORS: true,
-            allowTaint: true,
-            backgroundColor: "#ffffff",
-            logging: false,
-            ignoreElements: function (el) {
-              return (
-                el &&
-                (el.id === "sti-export-bar" ||
-                  el.id === "sti-lic-banner" ||
-                  (el.className &&
-                    String(el.className).indexOf("stiJsViewerToolBar") >= 0))
-              );
-            }
-          });
-        })
-        .then(function (canvas) {
-          var JsPDF =
-            (window.jspdf && window.jspdf.jsPDF) ||
-            (window.jsPDF) ||
-            null;
-          if (!JsPDF) throw new Error("jsPDF не найден");
-          var pdf = new JsPDF({
-            orientation: canvas.width >= canvas.height ? "landscape" : "portrait",
-            unit: "pt",
-            format: [canvas.width, canvas.height],
-            compress: true
-          });
-          var img = canvas.toDataURL("image/png");
-          pdf.addImage(img, "PNG", 0, 0, canvas.width, canvas.height, undefined, "FAST");
-          var name =
-            ((r && (r.reportAlias || r.reportName)) || "dashboard") + ".pdf";
-          pdf.save(name);
-        })
-        .catch(function (e) {
-          console.error(e);
-          alert("Ошибка PDF: " + (e && e.message ? e.message : e));
-        })
-        .then(unlock);
     }
     function exportDoc(fmt, ext, mime, settings) {
       var r = report();
@@ -613,7 +542,13 @@ _EXPORT_UI = """
       }
     }
     document.getElementById("sti-export-pdf").onclick = function () {
-      exportPdfAsScreen();
+      var r = report();
+      exportDoc(
+        Stimulsoft.Report.StiExportFormat.Pdf,
+        ".pdf",
+        "application/pdf",
+        makeSettings("pdf", r)
+      );
     };
     document.getElementById("sti-export-xlsx").onclick = function () {
       var r = report();
