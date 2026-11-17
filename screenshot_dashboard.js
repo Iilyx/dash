@@ -421,6 +421,189 @@
     return /OnlineMap/i.test(typeName(c));
   }
 
+  function isTableElement(c) {
+    if (!c) return false;
+    try {
+      var I =
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Dashboard &&
+        Stimulsoft.Report.Dashboard.IStiTableElement;
+      if (I && c.is && c.is(I)) return true;
+    } catch (e) {}
+    return /StiTableElement/i.test(typeName(c)) && !/Pivot/i.test(typeName(c));
+  }
+
+  function isPivotTableElement(c) {
+    if (!c) return false;
+    try {
+      var I =
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Dashboard &&
+        Stimulsoft.Report.Dashboard.IStiPivotTableElement;
+      if (I && c.is && c.is(I)) return true;
+    } catch (e) {}
+    return /PivotTable/i.test(typeName(c));
+  }
+
+  function isExportableTable(c) {
+    return isTableElement(c) || isPivotTableElement(c);
+  }
+
+  function exportElementAsync(element, format) {
+    return new Promise(function (resolve, reject) {
+      try {
+        var Tools =
+          Stimulsoft.Dashboard &&
+          Stimulsoft.Dashboard.Export &&
+          Stimulsoft.Dashboard.Export.StiDashboardExportTools;
+        if (!Tools || typeof Tools.exportAsync !== "function") {
+          reject(new Error("StiDashboardExportTools.exportAsync нет"));
+          return;
+        }
+        Tools.exportAsync(
+          function (data) {
+            if (data == null) reject(new Error("empty export"));
+            else resolve(data);
+          },
+          element,
+          format
+        );
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function stiBytesToBase64(data) {
+    var bytes;
+    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (data && data.buffer instanceof ArrayBuffer)
+      bytes = new Uint8Array(
+        data.buffer,
+        data.byteOffset || 0,
+        data.byteLength || data.length
+      );
+    else if (typeof data === "string") return btoa(data);
+    else if (Array.isArray(data)) bytes = new Uint8Array(data);
+    else {
+      data = normalizeExportBytes(data);
+      if (!data) throw new Error("unknown export payload");
+      if (typeof data === "string") return btoa(unescape(encodeURIComponent(data)));
+      bytes = data;
+    }
+    var chunk = 0x8000;
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += chunk) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)));
+    }
+    return btoa(parts.join(""));
+  }
+
+  async function postExportFile(name, data_b64, ext) {
+    var res = await fetch("/api/screenshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, data_b64: data_b64, ext: ext || "" }),
+    });
+    var body = await res.json().catch(function () {
+      return {};
+    });
+    if (!res.ok) throw new Error(body.error || String(res.status));
+    console.log("[dash-shot] server file", body.name || name, body.path || "");
+    return body;
+  }
+
+  /** Имена Table/Pivot, видимых на текущей панели. */
+  function visibleTableNames(root) {
+    var names = {};
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var t = attrType(nodes[i]);
+      if (/TableElement|PivotTable/i.test(t)) {
+        var n = attrName(nodes[i]);
+        if (n) names[n] = true;
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Save на Table/Pivot → Image/Excel/Data; PDF — через export API (все строки).
+   * Скачивает PDF + кладёт в exports/.
+   */
+  async function exportTablesToPdf(report, root) {
+    if (!report) return 0;
+    var Pdf =
+      Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
+        ? Stimulsoft.Report.StiExportFormat.Pdf
+        : null;
+    if (Pdf == null) {
+      console.warn("[dash-shot] StiExportFormat.Pdf нет");
+      return 0;
+    }
+    var visible = visibleTableNames(root || document);
+    var comps = collectAll(report).filter(isExportableTable);
+    console.log(
+      "[dash-shot] tables for pdf",
+      comps.map(function (c) {
+        return c.name || typeName(c);
+      }),
+      "visible",
+      Object.keys(visible)
+    );
+    if (Object.keys(visible).length) {
+      var onPage = comps.filter(function (c) {
+        return c.name && visible[c.name];
+      });
+      if (onPage.length) comps = onPage;
+    }
+    if (!comps.length) {
+      console.warn("[dash-shot] Table/Pivot не найден");
+      return 0;
+    }
+    var saved = 0;
+    for (var i = 0; i < comps.length; i++) {
+      var el = comps[i];
+      var base =
+        String(el.name || "Table" + (i + 1)).replace(/\s+/g, "_") +
+        "_" +
+        stamp();
+      var pdfName = base + ".pdf";
+      setStatus("PDF " + (el.name || base) + "…");
+      try {
+        var data = await exportElementAsync(el, Pdf);
+        try {
+          Stimulsoft.System.StiObject.saveAs(
+            data,
+            pdfName,
+            "application/pdf"
+          );
+        } catch (e) {
+          console.warn("[dash-shot] saveAs pdf", e);
+          try {
+            var b64dl = stiBytesToBase64(data);
+            var bin = atob(b64dl);
+            var arr = new Uint8Array(bin.length);
+            for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+            downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
+          } catch (e2) {
+            console.warn("[dash-shot] blob pdf", e2);
+          }
+        }
+        try {
+          await postExportFile(pdfName, stiBytesToBase64(data), "pdf");
+        } catch (e) {
+          console.warn("[dash-shot] pdf upload", e);
+        }
+        saved++;
+        console.log("[dash-shot] table pdf", pdfName);
+      } catch (err) {
+        console.warn("[dash-shot] table pdf failed", el.name, err);
+      }
+    }
+    return saved;
+  }
+
   function normalizeExportBytes(data) {
     if (!data) return null;
     if (data.data && (data.data.length || data.data.byteLength)) data = data.data;
@@ -1066,22 +1249,29 @@
       });
       var name = "dashboard_" + stamp() + ".png";
       downloadBlob(blob, name);
+      var pngOk = false;
       try {
         var b64 = await blobToBase64(blob);
-        var res = await fetch("/api/screenshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: name, data_b64: b64 }),
-        });
-        var body = await res.json().catch(function () {
-          return {};
-        });
-        if (res.ok) setStatus("saved " + (body.name || name));
-        else setStatus("download ok; server: " + (body.error || res.status));
+        var body = await postExportFile(name, b64, "png");
+        pngOk = true;
+        setStatus("saved " + (body.name || name));
       } catch (err) {
         setStatus("download ok");
         console.warn(err);
       }
+
+      // дополнительно: Table/Pivot → PDF (все строки, как Save→но PDF)
+      setStatus("таблица → PDF…");
+      var nPdf = 0;
+      try {
+        nPdf = await exportTablesToPdf(report, root);
+      } catch (err) {
+        console.warn("[dash-shot] tables pdf", err);
+      }
+      setStatus(
+        (pngOk ? "saved " + name : "png download") +
+          (nPdf ? " | +" + nPdf + " pdf" : " | pdf нет")
+      );
     } catch (err) {
       console.error(err);
       setStatus(String((err && err.message) || err));
@@ -1129,4 +1319,7 @@
   }
 
   window.__dashTakeScreenshot = takeScreenshot;
+  window.__dashExportTablesPdf = function () {
+    return exportTablesToPdf(findReport(), captureRoot());
+  };
 })();

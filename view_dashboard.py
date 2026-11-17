@@ -187,7 +187,7 @@ def _safe_name(name: str, fallback: str = "dashboard.png", ext: str | None = Non
     raw = (name or "").strip() or fallback
     base = Path(raw).name
     cleaned = _SAFE_NAME.sub("_", base).strip("._") or fallback
-    allowed = {".png", ".csv", ".json", ".txt", ".html"}
+    allowed = {".png", ".csv", ".json", ".txt", ".html", ".pdf"}
     suffix = Path(cleaned).suffix.lower()
     want = ("." + ext.lstrip(".")).lower() if ext else ""
     if want in allowed and not cleaned.lower().endswith(want):
