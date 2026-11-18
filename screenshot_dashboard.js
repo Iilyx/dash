@@ -1416,7 +1416,27 @@
 
   var LIST_CLICK_CAP = 8; // макс. пунктов ListBox
   var COMBO_CLICK_CAP = 10; // макс. значений ComboBox
-  var DRILL_CLICK_CAP = 8; // макс. проваливаний в карту/чарт
+  var DRILL_CLICK_CAP = 8; // макс. проваливаний в карту
+  /** Коды областей РБ из map-region-click.md */
+  var MAP_REGION_ALIASES = [
+    { label: "Брестская", codes: ["brestskaia", "brest", "by-br", "брест"] },
+    { label: "Витебская", codes: ["vitsebskaia", "viteb", "by-vi", "витеб"] },
+    { label: "Гомельская", codes: ["homelskaia", "homel", "gomel", "by-ho", "гомел"] },
+    { label: "Гродненская", codes: ["hrodnenskaia", "hrodn", "grodn", "by-hr", "гродн"] },
+    { label: "Могилёвская", codes: ["mahiliouskaia", "mahil", "mogil", "by-ma", "могил"] },
+    {
+      label: "Минская",
+      codes: ["minskaia", "by-mi"],
+      reject: ["by-hm"],
+      rejectLabel: ["минск город", "г. минск"],
+    },
+    {
+      label: "Минск",
+      codes: ["by-hm"],
+      reject: ["minskaia", "by-mi"],
+      rejectLabel: ["минская"],
+    },
+  ];
 
   function isButtonHost(el) {
     return /^StiButtonElement$/i.test(attrType(el));
@@ -1777,82 +1797,344 @@
     return true;
   }
 
-  function mapDrillMode(host) {
+  /** Атрибут геома: свойство, потом getAttribute. Пусто / sti_IsNullValue — нет. */
+  function geomAttr(node, name) {
+    if (!node) return "";
     try {
-      var ca =
-        host.elementAttributes && host.elementAttributes.contentAttributes;
-      var ix = ca && ca.interaction;
-      if (!ix) return null;
-      if (ix.onClick === "ShowDashboard") return "ShowDashboard";
-      if (ix.onClick === "DrillDown" || ix.allowUserDrillDown) return "DrillDown";
-      return null; // ApplyFilter и пр. — не кликаем массово
+      var v = node[name];
+      if (v == null && node.getAttribute) v = node.getAttribute(name);
+      v = v == null ? "" : String(v);
+      if (!v || v === "sti_IsNullValue") return "";
+      return v;
     } catch (e) {
-      return null;
+      return "";
     }
   }
 
-  async function drillUpMap(host) {
+  function geomBlob(node) {
+    return (
+      geomAttr(node, "elementident") +
+      " " +
+      geomAttr(node, "elementargument") +
+      " " +
+      geomAttr(node, "elementvalue") +
+      " " +
+      geomAttr(node, "interactiontooltip")
+    ).toLowerCase();
+  }
+
+  function geomLabel(geom) {
+    return (
+      geomAttr(geom, "elementident") ||
+      geomAttr(geom, "elementargument") ||
+      geomAttr(geom, "elementvalue") ||
+      "geom"
+    );
+  }
+
+  function isUnderMapElement(node) {
+    var cur = node;
+    for (var i = 0; i < 40 && cur; i++) {
+      try {
+        var t =
+          (cur.elementAttributes && cur.elementAttributes.type) ||
+          attrType(cur);
+        if (t && /Map/i.test(String(t))) return true;
+      } catch (e) {}
+      cur = cur.parentElement || cur.parentNode;
+    }
     try {
-      if (host.buttons && host.buttons.drillUp && typeof host.buttons.drillUp.action === "function") {
-        host.buttons.drillUp.action();
-        console.log("[dash-shot] drillUp button");
-        return true;
+      var frame =
+        node.ownerDocument &&
+        node.ownerDocument.defaultView &&
+        node.ownerDocument.defaultView.frameElement;
+      if (frame) {
+        cur = frame;
+        for (var j = 0; j < 40 && cur; j++) {
+          var t2 =
+            (cur.elementAttributes && cur.elementAttributes.type) ||
+            attrType(cur);
+          if (t2 && /Map/i.test(String(t2))) return true;
+          cur = cur.parentElement || cur.parentNode;
+        }
       }
     } catch (e) {}
+    return false;
+  }
+
+  function findMapHostForGeom(node) {
+    var cur = node;
+    for (var i = 0; i < 40 && cur; i++) {
+      if (cur.elementAttributes && /Map/i.test(String(cur.elementAttributes.type || "")))
+        return cur;
+      cur = cur.parentElement || cur.parentNode;
+    }
     try {
-      var js = getViewerJs();
-      if (js && typeof js.ApplyDrillUpToDashboardElement === "function") {
-        js.ApplyDrillUpToDashboardElement(host);
-        console.log("[dash-shot] ApplyDrillUp");
-        return true;
+      var frame =
+        node.ownerDocument &&
+        node.ownerDocument.defaultView &&
+        node.ownerDocument.defaultView.frameElement;
+      cur = frame;
+      for (var j = 0; j < 40 && cur; j++) {
+        if (cur.elementAttributes && /Map/i.test(String(cur.elementAttributes.type || "")))
+          return cur;
+        cur = cur.parentElement || cur.parentNode;
       }
-    } catch (e) {
-      console.warn("[dash-shot] drillUp", e);
+    } catch (e) {}
+    return null;
+  }
+
+  /** Ключ экрана — чтобы понять, что провал открылся (map-region-click.md). */
+  function dashboardScreenKey(root) {
+    root = root || captureRoot() || document.body;
+    var parts = [];
+    try {
+      var nodes = root.querySelectorAll("*");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var t = attrType(el);
+        if (!t) continue;
+        if (/StiIndicatorElement|StiCardsElement|StiRegionMapElement|StiTextElement/i.test(t)) {
+          var tx = "";
+          try {
+            tx = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+          } catch (e) {}
+          if (tx && tx.length < 120) parts.push(t + ":" + tx.slice(0, 80));
+        }
+        if (isFilterHost(el)) {
+          var fl = readFilterLabel(el);
+          if (
+            fl &&
+            (/област/i.test(fl) || /ИМНС/i.test(fl) || /Пинск/i.test(fl))
+          )
+            parts.push("filter:" + fl);
+        }
+      }
+    } catch (e) {}
+    return parts.join("|");
+  }
+
+  async function waitScreenKeyChange(before, maxMs) {
+    var t0 = Date.now();
+    maxMs = maxMs || 8000;
+    while (Date.now() - t0 < maxMs) {
+      await sleep(250);
+      var now = dashboardScreenKey();
+      if (now && now !== before) return true;
     }
     return false;
   }
 
   /**
-   * RegionMap/Chart: только проваливание (DrillDown / ShowDashboard), не ApplyFilter по всем регионам.
-   * Возвращает {ok, needDrillUp}.
+   * Возврат на страну перед следующей областью (map-region-click.md):
+   * pageNumber=0, dashboardDrillDownGuid=null, postAction("Refresh").
+   */
+  async function returnToCountryMap() {
+    var js = getViewerJs();
+    if (!js) return false;
+    try {
+      if (js.reportParams) {
+        js.reportParams.pageNumber = 0;
+        js.reportParams.dashboardDrillDownGuid = null;
+      }
+      if (typeof js.postAction === "function") js.postAction("Refresh");
+      console.log("[dash-shot] returnToCountry Refresh");
+    } catch (e) {
+      console.warn("[dash-shot] returnToCountry", e);
+      return false;
+    }
+    var t0 = Date.now();
+    while (Date.now() - t0 < 10000) {
+      await sleep(400);
+      var root = captureRoot();
+      if (!root) continue;
+      var maps = [];
+      var nodes = root.querySelectorAll("*");
+      for (var i = 0; i < nodes.length; i++) {
+        if (/RegionMap/i.test(attrType(nodes[i]))) maps.push(nodes[i]);
+      }
+      for (var m = 0; m < maps.length; m++) {
+        if (collectMapRegionGeoms(maps[m]).length >= 3) return true;
+      }
+    }
+    await waitDashboardIdle(500, 8000);
+    return true;
+  }
+
+  function matchRegionAlias(blob, alias) {
+    var b = String(blob || "").toLowerCase();
+    if (!b) return false;
+    if (alias.reject) {
+      for (var r = 0; r < alias.reject.length; r++) {
+        if (b.indexOf(alias.reject[r]) >= 0) return false;
+      }
+    }
+    if (alias.rejectLabel) {
+      for (var rl = 0; rl < alias.rejectLabel.length; rl++) {
+        if (b.indexOf(alias.rejectLabel[rl]) >= 0) return false;
+      }
+    }
+    // Минск город: не путать с Минской областью
+    if (alias.label === "Минск") {
+      if (/minskaia|by-mi|минская/.test(b) && !/by-hm/.test(b)) return false;
+    }
+    if (alias.label === "Минская") {
+      if (/by-hm/.test(b) && !/minskaia|by-mi/.test(b)) return false;
+    }
+    for (var i = 0; i < alias.codes.length; i++) {
+      if (b.indexOf(alias.codes[i]) >= 0) return true;
+    }
+    var lab = String(alias.label || "").toLowerCase();
+    if (lab && b.indexOf(lab.slice(0, Math.min(5, lab.length))) >= 0) return true;
+    return false;
+  }
+
+  function findGeomOnclick(node) {
+    var cur = node;
+    for (var i = 0; i < 20 && cur; i++) {
+      if (typeof cur.onclick === "function") return cur;
+      cur = cur.parentElement || cur.parentNode;
+    }
+    return null;
+  }
+
+  /**
+   * Геомы карты: iframe + parent, только узлы с ident/argument/value под Map.
+   * см. map-region-click.md
+   */
+  function collectMapRegionGeoms(host) {
+    var out = [];
+    var seen = [];
+    function consider(node) {
+      if (!node || seen.indexOf(node) >= 0) return;
+      var ident = geomAttr(node, "elementident");
+      var arg = geomAttr(node, "elementargument");
+      var val = geomAttr(node, "elementvalue");
+      if (!ident && !arg && !val) return;
+      if (!isUnderMapElement(node) && host && !host.contains(node) && host !== node) {
+        // во фрейме host.contains не работает — isUnderMapElement достаточно
+        if (!isUnderMapElement(node)) return;
+      }
+      var clickNode = findGeomOnclick(node) || node;
+      if (typeof clickNode.onclick !== "function") return;
+      seen.push(node);
+      out.push(clickNode);
+    }
+    function walk(node) {
+      if (!node) return;
+      consider(node);
+      var kids = node.childNodes || [];
+      for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    }
+    try {
+      var iframe = host.frame || (host.querySelector && host.querySelector("iframe"));
+      var doc = iframe ? iframeDoc(iframe) : null;
+      if (doc && doc.body) walk(doc.body);
+      walk(host);
+    } catch (e) {
+      console.warn("[dash-shot] collectMapRegionGeoms", e);
+    }
+    // fallback: короткие text/tspan/title → вверх к onclick
+    if (!out.length) {
+      try {
+        var iframe2 = host.frame || host.querySelector("iframe");
+        var doc2 = iframe2 ? iframeDoc(iframe2) : null;
+        var scope = doc2 || host;
+        var texts = scope.querySelectorAll
+          ? scope.querySelectorAll("text, tspan, title")
+          : [];
+        for (var t = 0; t < texts.length; t++) {
+          var el = texts[t];
+          var s = (el.textContent || "").trim();
+          if (!s || s.length > 48) continue;
+          if (el.querySelector && el.querySelector("tspan")) continue;
+          var up = findGeomOnclick(el);
+          if (up && typeof up.onclick === "function") {
+            if (seen.indexOf(up) < 0) {
+              seen.push(up);
+              out.push(up);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  function pickRegionGeoms(host) {
+    var geoms = collectMapRegionGeoms(host);
+    var picked = [];
+    var used = [];
+    for (var a = 0; a < MAP_REGION_ALIASES.length; a++) {
+      var alias = MAP_REGION_ALIASES[a];
+      var best = null;
+      var bestLen = 1e9;
+      for (var g = 0; g < geoms.length; g++) {
+        if (used.indexOf(geoms[g]) >= 0) continue;
+        var blob = geomBlob(geoms[g]);
+        if (!matchRegionAlias(blob, alias)) continue;
+        if (blob.length < bestLen) {
+          best = geoms[g];
+          bestLen = blob.length;
+        }
+      }
+      if (best) {
+        used.push(best);
+        picked.push({
+          geom: best,
+          label: alias.label,
+          code: geomLabel(best),
+        });
+      }
+    }
+    // если алиасы не сработали — первые N с onclick
+    if (!picked.length) {
+      var cap = Math.min(geoms.length, DRILL_CLICK_CAP);
+      for (var i = 0; i < cap; i++) {
+        picked.push({
+          geom: geoms[i],
+          label: geomLabel(geoms[i]),
+          code: geomLabel(geoms[i]),
+        });
+      }
+    }
+    console.log(
+      "[dash-shot] map regions",
+      attrName(host),
+      picked.map(function (p) {
+        return p.label + "=" + p.code;
+      })
+    );
+    return picked;
+  }
+
+  /**
+   * Провал в регион: node.onclick.call(node) — штатный ShowDashboard/DrillDown.
+   * Синтетический MouseEvent карту не открывает (map-region-click.md).
    */
   async function activateGeom(host, geom) {
-    if (!host || !geom) return { ok: false, needDrillUp: false };
-    var mode = mapDrillMode(host);
-    var js = getViewerJs();
-    console.log("[dash-shot] geom mode", mode, geomLabel(geom));
-
-    if (mode === "ShowDashboard") {
-      try {
-        if (typeof geom.onclick === "function") {
-          geom.onclick();
-          return { ok: true, needDrillUp: false };
-        }
-      } catch (e) {
-        console.warn("[dash-shot] ShowDashboard onclick", e);
-      }
+    if (!geom) return { ok: false, needReturnCountry: false };
+    var clickNode = findGeomOnclick(geom) || geom;
+    if (typeof clickNode.onclick !== "function") {
+      console.warn("[dash-shot] no onclick on geom", geomLabel(geom));
+      return { ok: false, needReturnCountry: false };
     }
-
-    if (mode === "DrillDown") {
-      try {
-        if (typeof host.selectGeom === "function") host.selectGeom(geom, false);
-        var filters =
-          typeof host.getFilters === "function" ? host.getFilters() : [];
-        if (js && typeof js.ApplyDrillDownToDashboardElement === "function") {
-          js.ApplyDrillDownToDashboardElement(host, filters);
-          return { ok: true, needDrillUp: true };
-        }
-        if (typeof geom.onclick === "function") {
-          geom.onclick();
-          return { ok: true, needDrillUp: true };
-        }
-      } catch (e) {
-        console.warn("[dash-shot] DrillDown", e);
-      }
+    var before = dashboardScreenKey();
+    console.log("[dash-shot] map onclick.call", geomLabel(clickNode), "key~", before.slice(0, 80));
+    try {
+      clickNode.onclick.call(clickNode);
+    } catch (e) {
+      console.warn("[dash-shot] onclick.call", e);
+      return { ok: false, needReturnCountry: false };
     }
+    var changed = await waitScreenKeyChange(before, 8000);
+    console.log("[dash-shot] map drill", changed ? "OK screen changed" : "FAIL key same");
+    return { ok: changed, needReturnCountry: true };
+  }
 
-    // без drill — не кликаем
-    return { ok: false, needDrillUp: false };
+  async function drillUpMap(host) {
+    // предпочтительно полный возврат на страну
+    return returnToCountryMap();
   }
 
   /** Image/Text с interaction.onClick. */
@@ -1981,55 +2263,8 @@
     return { counts: counts, elements: list };
   }
 
-  function geomLabel(geom) {
-    try {
-      return String(
-        geom.getAttribute("elementargument") ||
-          geom.getAttribute("elementvalue") ||
-          geom.getAttribute("elementident") ||
-          geom.getAttribute("elementseries") ||
-          "geom"
-      );
-    } catch (e) {
-      return "geom";
-    }
-  }
-
   function collectGeoms(host) {
-    var out = [];
-    var seen = [];
-    function addGeom(g) {
-      if (!g || seen.indexOf(g) >= 0) return;
-      try {
-        if (
-          g.getAttribute("elementargument") == null &&
-          g.getAttribute("elementvalue") == null &&
-          g.getAttribute("elementident") == null &&
-          g.getAttribute("elementseries") == null
-        )
-          return;
-      } catch (e) {
-        return;
-      }
-      seen.push(g);
-      out.push(g);
-    }
-    function walk(node) {
-      if (!node) return;
-      addGeom(node);
-      var kids = node.childNodes || [];
-      for (var i = 0; i < kids.length; i++) walk(kids[i]);
-    }
-    try {
-      var iframe = host.frame || host.querySelector("iframe");
-      var doc = iframe ? iframeDoc(iframe) : null;
-      if (doc && doc.body) walk(doc.body);
-      else if (host.contentPanel) walk(host.contentPanel);
-      else walk(host);
-    } catch (e) {
-      console.warn("[dash-shot] collectGeoms", e);
-    }
-    return out;
+    return collectMapRegionGeoms(host);
   }
 
   /**
@@ -2188,36 +2423,26 @@
       })(ihost);
     }
 
-    // 5) RegionMap / Chart — только DrillDown / ShowDashboard (проваливание)
+    // 5) RegionMap — области по map-region-click.md (onclick.call + возврат на страну)
     for (var gi = 0; gi < nodes.length; gi++) {
       var ghost = nodes[gi];
-      if (!isGeomHost(ghost)) continue;
-      var mode = mapDrillMode(ghost);
-      if (!mode) {
-        console.log(
-          "[dash-shot] skip map/chart (no drill)",
-          attrName(ghost),
-          attrType(ghost)
-        );
-        continue;
-      }
-      var gname = attrName(ghost) || attrType(ghost) || "Map";
-      var geoms = collectGeoms(ghost);
-      var cap = Math.min(geoms.length, DRILL_CLICK_CAP);
-      for (var gj = 0; gj < cap; gj++) {
-        (function (hst, geom, fname, drillMode) {
-          var gl = geomLabel(geom);
+      if (!/RegionMap/i.test(attrType(ghost))) continue;
+      if (!isVisibleBox(ghost)) continue;
+      var gname = attrName(ghost) || "Map";
+      var regions = pickRegionGeoms(ghost);
+      for (var gj = 0; gj < regions.length; gj++) {
+        (function (hst, reg, fname) {
           add({
             kind: "geom",
             host: hst,
             el: hst,
-            label: fname + " ↓ " + gl,
-            needDrillUp: drillMode === "DrillDown",
+            label: fname + " ↓ " + reg.label,
+            needReturnCountry: true,
             activate: function () {
-              return activateGeom(hst, geom);
+              return activateGeom(hst, reg.geom);
             },
           });
-        })(ghost, geoms[gj], gname, mode);
+        })(ghost, regions[gj], gname);
       }
     }
 
@@ -2450,7 +2675,7 @@
   }
 
   async function activateClickTarget(target) {
-    if (!target) return { ok: false, needDrillUp: false };
+    if (!target) return { ok: false, needReturnCountry: false };
     console.log("[dash-shot] activate", target.kind, target.label);
     var result = null;
     if (typeof target.activate === "function") {
@@ -2458,12 +2683,22 @@
         result = await target.activate();
       } catch (e) {
         console.warn("[dash-shot] activate threw", e);
-        return { ok: false, needDrillUp: false };
+        return { ok: false, needReturnCountry: false };
       }
     }
-    if (result && typeof result === "object" && "ok" in result) return result;
-    if (result) return { ok: true, needDrillUp: !!target.needDrillUp };
-    return { ok: false, needDrillUp: false };
+    if (result && typeof result === "object" && "ok" in result) {
+      return {
+        ok: !!result.ok,
+        needReturnCountry: !!(
+          result.needReturnCountry ||
+          result.needDrillUp ||
+          target.needReturnCountry
+        ),
+      };
+    }
+    if (result)
+      return { ok: true, needReturnCountry: !!target.needReturnCountry };
+    return { ok: false, needReturnCountry: false };
   }
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
@@ -2592,7 +2827,7 @@
           clearHl = highlightClickTarget(target.el, label, step);
           await sleep(700);
 
-          var act = { ok: false, needDrillUp: false };
+          var act = { ok: false, needReturnCountry: false };
           try {
             act = await activateClickTarget(target);
           } catch (e) {
@@ -2607,13 +2842,17 @@
             console.warn("[dash-shot] activate false", label);
             clearHl();
             clearHl = function () {};
+            // после неудачного провала всё равно сбросим карту
+            if (target.kind === "geom") {
+              await returnToCountryMap();
+            }
             continue;
           }
 
           setStatus(page.label + " " + step + " ждём перерисовку…");
           clearHl();
           clearHl = function () {};
-          var redrawn = await waitDashboardIdle(800, 14000);
+          var redrawn = await waitDashboardIdle(600, 12000);
           console.log(
             "[dash-shot] idle",
             label,
@@ -2626,7 +2865,7 @@
             clearHl = highlightClickTarget(
               el,
               label,
-              step + (act.needDrillUp ? " ↓ drill" : " нажато")
+              step + (act.needReturnCountry ? " ↓ регион" : " нажато")
             );
             await sleep(250);
           }
@@ -2638,7 +2877,7 @@
               page.label +
               " | " +
               step +
-              (act.needDrillUp ? " Провалились: " : " Нажато: ") +
+              (act.needReturnCountry ? " Провалились: " : " Нажато: ") +
               label,
             quiet: true,
           });
@@ -2648,7 +2887,7 @@
           logLines.push(
             slug +
               " | " +
-              (act.needDrillUp ? "DRILL" : "CLICK") +
+              (act.needReturnCountry ? "DRILL" : "CLICK") +
               " " +
               label +
               " | kind=" +
@@ -2659,12 +2898,11 @@
               ((shot && shot.pdfs) || []).join(",")
           );
 
-          // после проваливания в карту — подняться назад
-          if (act.needDrillUp && target.host) {
-            setStatus(page.label + " " + step + " drillUp…");
-            await drillUpMap(target.host);
-            await waitDashboardIdle(800, 12000);
-            await sleep(300);
+          // перед следующей областью — назад на страну (map-region-click.md)
+          if (act.needReturnCountry || target.kind === "geom") {
+            setStatus(page.label + " " + step + " → страна…");
+            await returnToCountryMap();
+            await sleep(400);
           }
         }
       }
