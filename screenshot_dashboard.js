@@ -1024,162 +1024,16 @@
   }
 
   /**
-   * html2canvas плохо рисует Stimulsoft ComboBox caption.
-   * Печём текст фильтра поверх contentPanel.
+   * ComboBox/ListBox не трогаем: без оверлеев и без visibility:hidden —
+   * оставляем родной дизайн Stimulsoft.
    */
-  function bakeFilterValues(root) {
-    var restorers = [];
-    var hosts = [];
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      if (isFilterHost(nodes[i])) hosts.push(nodes[i]);
-    }
-    var selects = root.querySelectorAll("select");
-    console.log("[dash-shot] filter hosts", hosts.length, "selects", selects.length);
-
-    function placeLabel(target, text, host) {
-      if (!text || !target) return;
-      var ir = target.getBoundingClientRect();
-      var hr = host.getBoundingClientRect();
-      if (ir.width < 2 || ir.height < 2) return;
-      if (getComputedStyle(host).position === "static") {
-        restorers.push({ el: host, position: host.style.position });
-        host.style.position = "relative";
-      }
-      var div = document.createElement("div");
-      div.setAttribute("data-sti-filter-bake", "1");
-      div.textContent = text;
-      var cs = window.getComputedStyle(target);
-      var bg = cs.backgroundColor;
-      if (!bg || bg === "rgba(0, 0, 0, 0)" || bg === "transparent") bg = "#ffffff";
-      var color = cs.color || "#111111";
-      // если текст почти белый на белом — форсим тёмный
-      if (color === "rgb(255, 255, 255)" || color === "#ffffff") color = "#111111";
-      div.style.cssText = [
-        "position:absolute",
-        "left:" + Math.round(ir.left - hr.left) + "px",
-        "top:" + Math.round(ir.top - hr.top) + "px",
-        "width:" + Math.round(ir.width) + "px",
-        "height:" + Math.round(ir.height) + "px",
-        "box-sizing:border-box",
-        "display:flex",
-        "align-items:center",
-        "padding:0 8px",
-        "overflow:hidden",
-        "white-space:nowrap",
-        "background:" + bg,
-        "color:" + color,
-        "font:" + (cs.font || "12px sans-serif"),
-        "border-radius:" + (cs.borderRadius || "0"),
-        "z-index:5",
-        "pointer-events:none",
-      ].join(";");
-      host.appendChild(div);
-      restorers.push({ div: div });
-      // не visibility:hidden на весь contentPanel — только прячем детей-кнопок
-      try {
-        for (var c = 0; c < target.childNodes.length; c++) {
-          var ch = target.childNodes[c];
-          if (ch && ch.nodeType === 1 && ch.getAttribute("data-sti-filter-bake") !== "1") {
-            restorers.push({ el: ch, visibility: ch.style.visibility });
-            ch.style.visibility = "hidden";
-          }
-        }
-      } catch (e) {}
-    }
-
-    for (var h = 0; h < hosts.length; h++) {
-      var host = hosts[h];
-      var label = readFilterLabel(host);
-      var ca =
-        host.elementAttributes && host.elementAttributes.contentAttributes;
-      console.log("[dash-shot] filter", {
-        name: attrName(host),
-        type: attrType(host),
-        label: label,
-        selectionMode: ca && ca.selectionMode,
-        filters: ca && ca.filters,
-        items: ca && ca.items && ca.items.length,
-        hasContentPanel: !!host.contentPanel,
-        captionProbe: (function () {
-          try {
-            var cp = host.contentPanel;
-            if (!cp || !cp.childNodes.length) return null;
-            var b = cp.childNodes[0];
-            return b && b.caption
-              ? String(b.caption.innerText || "").slice(0, 80)
-              : String(cp.innerText || "").slice(0, 80);
-          } catch (e) {
-            return String(e);
-          }
-        })(),
-      });
-      if (!label) continue;
-      var paintTarget = host.contentPanel || host;
-      // не красить поверх title
-      if (host.titlePanel && paintTarget === host) {
-        paintTarget = host.contentPanel || host;
-      }
-      placeLabel(paintTarget, label, host);
-    }
-
-    for (var s = 0; s < selects.length; s++) {
-      var sel = selects[s];
-      if (sel.closest && hosts.some(function (hh) { return hh.contains(sel); }))
-        continue;
-      var text = "";
-      if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
-        text =
-          sel.options[sel.selectedIndex].textContent ||
-          sel.options[sel.selectedIndex].text ||
-          "";
-      }
-      if (!text) continue;
-      var parent = sel.parentElement || root;
-      placeLabel(sel, text, parent);
-    }
-
-    return function restore() {
-      restorers.forEach(function (x) {
-        try {
-          if (x.div && x.div.parentNode) x.div.parentNode.removeChild(x.div);
-        } catch (e) {}
-        try {
-          if (x.el && x.visibility != null) x.el.style.visibility = x.visibility;
-        } catch (e) {}
-        try {
-          if (x.el && x.position != null) x.el.style.position = x.position;
-        } catch (e) {}
-      });
-    };
+  function bakeFilterValues() {
+    return function () {};
   }
 
   function onCloneFixFormValues(doc) {
     try {
-      var selects = doc.querySelectorAll("select");
-      for (var i = 0; i < selects.length; i++) {
-        var sel = selects[i];
-        if (sel.getAttribute("data-sti-filter-bake")) continue;
-        var text = "";
-        if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
-          text =
-            sel.options[sel.selectedIndex].textContent ||
-            sel.options[sel.selectedIndex].text ||
-            "";
-        }
-        if (!text) continue;
-        var div = doc.createElement("div");
-        div.textContent = text;
-        div.setAttribute("style", sel.getAttribute("style") || "");
-        div.style.display = "flex";
-        div.style.alignItems = "center";
-        div.style.paddingLeft = "8px";
-        div.style.overflow = "hidden";
-        div.style.whiteSpace = "nowrap";
-        div.style.background = "#fff";
-        div.style.color = "#111";
-        if (sel.parentNode) sel.parentNode.replaceChild(div, sel);
-      }
+      // только синхронизация value у input — без подмены select/ComboBox белым блоком
       var inputs = doc.querySelectorAll("input, textarea");
       for (var j = 0; j < inputs.length; j++) {
         var inp = inputs[j];
@@ -1189,7 +1043,7 @@
         } catch (e) {}
       }
     } catch (e) {
-      console.warn("[dash-shot] onclone filters", e);
+      console.warn("[dash-shot] onclone values", e);
     }
   }
 
@@ -1210,9 +1064,8 @@
 
       setStatus("карты из iframe…");
       restoreMaps = (await bakeMaps(root, report)) || function () {};
-
-      setStatus("фильтры…");
-      restoreFilters = bakeFilterValues(root) || function () {};
+      // ComboBox не печём — дизайн как в viewer
+      restoreFilters = bakeFilterValues() || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
