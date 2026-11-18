@@ -1414,10 +1414,9 @@
     }
   }
 
-  // Lean-скан: только карта (области) + немного ComboBox. Без ListBox/кнопок/image.
-  var COMBO_HOST_CAP = 2; // сколько ComboBox на странице
-  var COMBO_CLICK_CAP = 3; // значений в каждом
-  var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ ≤7)
+  var LIST_CLICK_CAP = 8; // макс. пунктов ListBox
+  var COMBO_CLICK_CAP = 10; // макс. значений ComboBox
+  var DRILL_CLICK_CAP = 8; // макс. проваливаний в карту
   /** Коды областей РБ из map-region-click.md */
   var MAP_REGION_ALIASES = [
     { label: "Брестская", codes: ["brestskaia", "brest", "by-br", "брест"] },
@@ -2269,8 +2268,8 @@
   }
 
   /**
-   * Lean: только RegionMap (области) + до COMBO_HOST_CAP×COMBO_CLICK_CAP ComboBox.
-   * ListBox / Button / Image — не кликаем (лишний шум).
+   * Цели: ComboBox (открытие меню), ListBox (лимит), Button,
+   * Image interaction, RegionMap/Chart только DrillDown/ShowDashboard.
    */
   function collectClickTargets(root) {
     var out = [];
@@ -2279,6 +2278,7 @@
       if (!t || !t.el) return;
       var key = t.kind + "|" + t.label;
       if (seen.indexOf(key) >= 0) return;
+      // combo/geom могут подсвечивать host даже если «лицо» мелкое
       if (t.kind !== "combo" && t.kind !== "geom" && !isVisibleBox(t.el)) return;
       seen.push(key);
       out.push(t);
@@ -2286,7 +2286,144 @@
 
     var nodes = root.querySelectorAll("*");
 
-    // 1) RegionMap — области РБ (главное)
+    // 1) ComboBox — сначала (открытие меню + выбор), лимит значений
+    for (var cbi = 0; cbi < nodes.length; cbi++) {
+      var combo = nodes[cbi];
+      if (!isComboHost(combo)) continue;
+      if (!isVisibleBox(combo)) continue;
+      var cname = attrName(combo) || "Combo";
+      var ca =
+        combo.elementAttributes && combo.elementAttributes.contentAttributes;
+      var items = (ca && ca.items) || [];
+      var useItems = items.slice(0, COMBO_CLICK_CAP);
+      if (!useItems.length && ca && ca.showAllValue) {
+        useItems = [{ value: null, label: "All", isAllValue: true }];
+      }
+      for (var ui = 0; ui < useItems.length; ui++) {
+        (function (hst, it, fname) {
+          var lab = listItemLabel(it);
+          var spec = {
+            value: it.value,
+            label: it.label != null ? it.label : lab,
+            isAllValue: !!it.isAllValue,
+          };
+          add({
+            kind: "combo",
+            host: hst,
+            item: spec,
+            el: hst,
+            label: fname + ": " + lab,
+            activate: function () {
+              return activateComboValue(hst, spec);
+            },
+          });
+        })(combo, useItems[ui], cname);
+      }
+    }
+
+    // 2) ListBox — лимит, без дублей «лишних»
+    for (var i = 0; i < nodes.length; i++) {
+      var host = nodes[i];
+      if (!isListBoxHost(host)) continue;
+      var filterName = attrName(host) || "List";
+      var panel =
+        host.itemsPanel ||
+        (host.contentPanel &&
+          host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
+        host.contentPanel;
+      var listAdded = 0;
+      var pools = [];
+      if (panel) pools.push(panel);
+      if (host.contentPanel && host.contentPanel.horTable) {
+        try {
+          var cells = host.contentPanel.horTable.querySelectorAll("td");
+          for (var c = 0; c < cells.length && listAdded < LIST_CLICK_CAP; c++) {
+            var child = cells[c].firstElementChild || cells[c];
+            if (typeof child.action !== "function" && child.value == null && child.label == null)
+              continue;
+            (function (it, hst, fname) {
+              add({
+                kind: "listbox",
+                host: hst,
+                item: it,
+                el: it.button || it,
+                label: fname + ": " + listItemLabel(it),
+                activate: function () {
+                  return activateListItem(it, hst);
+                },
+              });
+            })(child, host, filterName);
+            listAdded++;
+          }
+        } catch (e) {}
+      }
+      for (var p = 0; p < pools.length; p++) {
+        var kids = pools[p].childNodes || [];
+        for (var k = 0; k < kids.length && listAdded < LIST_CLICK_CAP; k++) {
+          var item = kids[k];
+          if (!item || item.nodeType !== 1) continue;
+          if (!(typeof item.action === "function" || item.value != null || item.label != null))
+            continue;
+          (function (it, hst, fname) {
+            add({
+              kind: "listbox",
+              host: hst,
+              item: it,
+              el: it.button || it,
+              label: fname + ": " + listItemLabel(it),
+              activate: function () {
+                return activateListItem(it, hst);
+              },
+            });
+          })(item, host, filterName);
+          listAdded++;
+        }
+      }
+    }
+
+    // 3) StiButtonElement
+    for (var b = 0; b < nodes.length; b++) {
+      var btn = nodes[b];
+      if (!isButtonHost(btn)) continue;
+      (function (h) {
+        var face = buttonFace(h);
+        add({
+          kind: "button",
+          host: h,
+          el: face || h,
+          label: buttonLabel(h),
+          activate: function () {
+            return activateDashButton(h);
+          },
+        });
+      })(btn);
+    }
+
+    // 4) Image / Text с ShowDashboard (не OpenHyperlink)
+    for (var ii = 0; ii < nodes.length; ii++) {
+      var ihost = nodes[ii];
+      if (!isInteractionHost(ihost)) continue;
+      (function (h) {
+        var ca =
+          h.elementAttributes && h.elementAttributes.contentAttributes;
+        var onClick =
+          ca && ca.interaction && ca.interaction.onClick
+            ? ca.interaction.onClick
+            : "?";
+        if (onClick === "OpenHyperlink") return;
+        add({
+          kind: "interaction",
+          host: h,
+          el: h,
+          label: attrName(h) + " [" + onClick + "]",
+          activate: function () {
+            return activateInteractionHost(h);
+          },
+        });
+      })(ihost);
+    }
+
+    // 5) RegionMap — области по map-region-click.md (onclick.call + возврат на страну)
     for (var gi = 0; gi < nodes.length; gi++) {
       var ghost = nodes[gi];
       if (!/RegionMap/i.test(attrType(ghost))) continue;
@@ -2306,51 +2443,6 @@
             },
           });
         })(ghost, regions[gj], gname);
-      }
-    }
-
-    // 2) ComboBox — мало: 2 фильтра × 3 значения
-    var comboHosts = 0;
-    for (var cbi = 0; cbi < nodes.length; cbi++) {
-      if (comboHosts >= COMBO_HOST_CAP) break;
-      var combo = nodes[cbi];
-      if (!isComboHost(combo)) continue;
-      if (!isVisibleBox(combo)) continue;
-      comboHosts++;
-      var cname = attrName(combo) || "Combo";
-      var ca =
-        combo.elementAttributes && combo.elementAttributes.contentAttributes;
-      var items = (ca && ca.items) || [];
-      // пропуск пустых / All-only если есть нормальные
-      var filtered = [];
-      for (var fi = 0; fi < items.length; fi++) {
-        var it0 = items[fi];
-        if (!it0) continue;
-        if (it0.isAllValue) continue;
-        var lab0 = listItemLabel(it0);
-        if (!lab0 || /^all$/i.test(lab0)) continue;
-        filtered.push(it0);
-      }
-      var useItems = filtered.slice(0, COMBO_CLICK_CAP);
-      for (var ui = 0; ui < useItems.length; ui++) {
-        (function (hst, it, fname) {
-          var lab = listItemLabel(it);
-          var spec = {
-            value: it.value,
-            label: it.label != null ? it.label : lab,
-            isAllValue: false,
-          };
-          add({
-            kind: "combo",
-            host: hst,
-            item: spec,
-            el: hst,
-            label: fname + ": " + lab,
-            activate: function () {
-              return activateComboValue(hst, spec);
-            },
-          });
-        })(combo, useItems[ui], cname);
       }
     }
 
@@ -2627,30 +2719,12 @@
     var totalClicks = 0;
     try {
       await loadScript(HTML2CANVAS);
-      var allPages = collectDashboardPages();
-      // lean: только текущая вкладка, не бегать по всем страницам
-      var pages = allPages;
-      var selected = null;
-      for (var spi = 0; spi < allPages.length; spi++) {
-        var pb = allPages[spi].el;
-        if (pb && (pb.isSelected || pb.className && /Selected/i.test(pb.className))) {
-          selected = allPages[spi];
-          break;
-        }
-      }
-      pages = selected ? [selected] : allPages.slice(0, 1);
-      setStatus("скан: " + pages[0].label + " (lean)…");
-      inventoryLines.push("LEAN: только текущая страница + карта/combo");
-      inventoryLines.push("PAGES all (" + allPages.length + "):");
-      allPages.forEach(function (p, i) {
+      var pages = collectDashboardPages();
+      setStatus("страниц: " + pages.length + " — инвентарь…");
+      inventoryLines.push("PAGES (" + pages.length + "):");
+      pages.forEach(function (p, i) {
         inventoryLines.push(
-          "  " +
-            (i + 1) +
-            ") [" +
-            p.index +
-            "] " +
-            p.label +
-            (pages[0] === p ? " ← SCAN" : "")
+          "  " + (i + 1) + ") [" + p.index + "] " + p.label
         );
       });
 
@@ -2731,10 +2805,10 @@
         }
 
         setStatus(
-          page.label + ": " + targets.length + " целей (карта+combo)…"
+          page.label + ": " + targets.length + " целей — номера…"
         );
         previewAllTargets(targets);
-        await sleep(900);
+        await sleep(2200);
         clearClickHighlight();
 
         for (var i = 0; i < targets.length; i++) {
@@ -2842,10 +2916,10 @@
         "\n";
       var logName = "buttons_scan_" + scanId + ".txt";
       var logBody =
-        "Скан кликов (LEAN) " +
+        "Скан кликов " +
         scanId +
         "\n" +
-        "Только: RegionMap области + ComboBox (≤2×3). Без ListBox/Button/Image.\n" +
+        "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms\n" +
         "Кликов: " +
         totalClicks +
         "\n\n" +
@@ -2919,7 +2993,7 @@
     scanBtn.type = "button";
     scanBtn.textContent = "Скан кликов";
     scanBtn.title =
-      "Lean: текущая страница → области карты + до 2 ComboBox×3 значения → скрин+PDF";
+      "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart → скрин+PDF";
     scanBtn.style.cssText = btnStyle;
     scanBtn.onclick = function () {
       scanButtons();
