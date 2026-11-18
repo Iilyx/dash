@@ -1023,9 +1023,79 @@
     return String(label || "").trim();
   }
 
+  /** Цвет/шрифт подписи — как заданы у caption/контрола, без подмены. */
+  function readFilterTextStyle(host) {
+    var color = "";
+    var font = "";
+    var bg = "";
+    function fromEl(el) {
+      if (!el || !el.getBoundingClientRect) return;
+      try {
+        var cs = window.getComputedStyle(el);
+        if (!color && cs.color) color = cs.color;
+        if (!font && cs.font) font = cs.font;
+        if (
+          !bg &&
+          cs.backgroundColor &&
+          cs.backgroundColor !== "transparent" &&
+          cs.backgroundColor !== "rgba(0, 0, 0, 0)"
+        )
+          bg = cs.backgroundColor;
+      } catch (e) {}
+    }
+    try {
+      var cp = host.contentPanel;
+      if (cp) {
+        for (var i = 0; i < cp.childNodes.length; i++) {
+          var btn = cp.childNodes[i];
+          if (!btn) continue;
+          if (btn.caption) {
+            fromEl(btn.caption);
+            try {
+              var svgText = btn.caption.querySelector && btn.caption.querySelector("text, tspan");
+              if (svgText) {
+                var fill = svgText.getAttribute("fill") || svgText.style.fill;
+                if (fill && fill !== "none") color = fill;
+              }
+            } catch (e) {}
+          }
+          fromEl(btn);
+        }
+        fromEl(cp);
+      }
+    } catch (e) {}
+    fromEl(host);
+    // brush / foreColor из атрибутов Stimulsoft, если есть
+    try {
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      var style = (ca && ca.style) || (host.elementAttributes && host.elementAttributes.style);
+      var brush =
+        (style && (style.textBrush || style.brush || style.foreColor)) ||
+        (ca && (ca.foreColor || ca.color || ca.fontColor));
+      if (brush && !color) {
+        if (typeof brush === "string") color = brush;
+        else if (brush.color) color = String(brush.color);
+        else if (brush.toString) {
+          var s = String(brush.toString());
+          if (/#|[rgb]/i.test(s)) color = s;
+        }
+      }
+      var fnt = ca && ca.font;
+      if (fnt && !font) {
+        try {
+          font =
+            (fnt.size != null ? fnt.size + "px " : "") +
+            (fnt.name || fnt.fontFamily || "sans-serif");
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return { color: color, font: font, bg: bg };
+  }
+
   /**
-   * Живой ComboBox не меняем (без оверлеев/visibility).
-   * Только помечаем contentPanel data-атрибутом — текст дорисуем в onclone снимка.
+   * Живой ComboBox не меняем.
+   * Метка для onclone: текст + цвет/шрифт как заданы в контроле.
    */
   function markFilterLabels(root) {
     var marked = [];
@@ -1036,30 +1106,15 @@
       var label = readFilterLabel(host);
       if (!label) continue;
       var panel = host.contentPanel || host;
-      var cs;
-      try {
-        cs = window.getComputedStyle(panel);
-      } catch (e) {
-        cs = null;
-      }
-      var color = (cs && cs.color) || "#222222";
-      if (
-        color === "rgb(255, 255, 255)" ||
-        color === "#ffffff" ||
-        color === "rgba(0, 0, 0, 0)"
-      )
-        color = "#222222";
-      var font = (cs && cs.font) || "12px sans-serif";
-      var bg = (cs && cs.backgroundColor) || "";
-      if (!bg || bg === "transparent" || bg === "rgba(0, 0, 0, 0)") bg = "";
+      var st = readFilterTextStyle(host);
       try {
         panel.setAttribute("data-dash-filter-label", label);
-        panel.setAttribute("data-dash-filter-color", color);
-        panel.setAttribute("data-dash-filter-font", font);
-        if (bg) panel.setAttribute("data-dash-filter-bg", bg);
+        if (st.color) panel.setAttribute("data-dash-filter-color", st.color);
+        if (st.font) panel.setAttribute("data-dash-filter-font", st.font);
+        if (st.bg) panel.setAttribute("data-dash-filter-bg", st.bg);
         marked.push(panel);
       } catch (e) {}
-      console.log("[dash-shot] mark filter", attrName(host), label);
+      console.log("[dash-shot] mark filter", attrName(host), label, st.color);
     }
     return function restore() {
       for (var m = 0; m < marked.length; m++) {
@@ -1073,7 +1128,7 @@
     };
   }
 
-  /** В клоне html2canvas: подпись ComboBox; фон/шрифт с контрола, без белой заливки. */
+  /** В клоне: подпись ComboBox цветом/шрифтом контрола. */
   function onClonePaintFilterLabels(doc) {
     try {
       var panels = doc.querySelectorAll("[data-dash-filter-label]");
@@ -1081,14 +1136,13 @@
         var panel = panels[i];
         var label = panel.getAttribute("data-dash-filter-label") || "";
         if (!label) continue;
-        var color = panel.getAttribute("data-dash-filter-color") || "#222222";
-        var font = panel.getAttribute("data-dash-filter-font") || "12px sans-serif";
+        var color = panel.getAttribute("data-dash-filter-color") || "";
+        var font = panel.getAttribute("data-dash-filter-font") || "";
         var bg = panel.getAttribute("data-dash-filter-bg") || "transparent";
         try {
           var texts = panel.querySelectorAll("text, tspan");
           for (var t = 0; t < texts.length; t++) {
-            if (!texts[t].getAttribute("fill") || texts[t].getAttribute("fill") === "none")
-              texts[t].setAttribute("fill", color);
+            if (color) texts[t].setAttribute("fill", color);
           }
         } catch (e) {}
         var pos = "static";
@@ -1103,7 +1157,7 @@
         var div = doc.createElement("div");
         div.setAttribute("data-dash-filter-tip", "1");
         div.textContent = label;
-        div.style.cssText = [
+        var css = [
           "position:absolute",
           "left:0",
           "top:0",
@@ -1116,11 +1170,12 @@
           "overflow:hidden",
           "white-space:nowrap",
           "background:" + bg,
-          "color:" + color,
-          "font:" + font,
           "z-index:6",
           "pointer-events:none",
-        ].join(";");
+        ];
+        if (color) css.push("color:" + color);
+        if (font) css.push("font:" + font);
+        div.style.cssText = css.join(";");
         panel.appendChild(div);
       }
     } catch (e) {
