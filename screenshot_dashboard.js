@@ -2205,6 +2205,24 @@
     return false;
   }
 
+  /** Отсечь «призраков» в углу 0,0 (iframe-coords без offset / пустой SVG). */
+  function isSaneScreenRect(r) {
+    if (!r) return false;
+    var w = Number(r.width) || 0;
+    var h = Number(r.height) || 0;
+    var L = Number(r.left) || 0;
+    var T = Number(r.top) || 0;
+    if (w < 10 || h < 10) return false;
+    if (!isFinite(L) || !isFinite(T)) return false;
+    // типичный артефакт: локальные coords iframe → рамка в верхнем левом углу страницы
+    if (L < 8 && T < 8) return false;
+    if (L + w < 12 || T + h < 12) return false;
+    try {
+      if (L > window.innerWidth + 40 || T > window.innerHeight + 40) return false;
+    } catch (e) {}
+    return true;
+  }
+
   /** Rect элемента в координатах окна (карта часто в iframe). */
   function screenRectOf(el, host) {
     if (!el || !el.getBoundingClientRect) return null;
@@ -2219,19 +2237,22 @@
             iframe = el.ownerDocument.defaultView.frameElement;
           } catch (e) {}
         }
-        if (iframe) {
-          var ir = iframe.getBoundingClientRect();
-          return {
-            left: ir.left + r.left,
-            top: ir.top + r.top,
-            width: r.width,
-            height: r.height,
-            right: ir.left + r.left + r.width,
-            bottom: ir.top + r.top + r.height,
-          };
+        if (!iframe) {
+          // нельзя отдавать iframe-local как screen — будет клик/рамка в (0,0)
+          return host && host !== el ? screenRectOf(host, null) : null;
         }
+        var ir = iframe.getBoundingClientRect();
+        var out = {
+          left: ir.left + r.left,
+          top: ir.top + r.top,
+          width: r.width,
+          height: r.height,
+          right: ir.left + r.left + r.width,
+          bottom: ir.top + r.top + r.height,
+        };
+        return isSaneScreenRect(out) ? out : screenRectOf(host, null);
       }
-      return {
+      var same = {
         left: r.left,
         top: r.top,
         width: r.width,
@@ -2239,6 +2260,7 @@
         right: r.right,
         bottom: r.bottom,
       };
+      return isSaneScreenRect(same) ? same : null;
     } catch (e) {
       return null;
     }
@@ -2389,6 +2411,26 @@
       var key = t.kind + "|" + t.label;
       if (seen.indexOf(key) >= 0) return;
       if (t.kind !== "combo" && t.kind !== "geom" && !isVisibleBox(t.el)) return;
+      // отбросить цели с рамкой в (0,0) / нулевым боксом
+      try {
+        var sr =
+          (typeof t.screenRect === "function" && t.screenRect()) ||
+          screenRectOf(t.el, t.host || null);
+        if (t.kind === "geom" && !isSaneScreenRect(sr)) {
+          // геом без нормального rect — подсветим хост карты, если он ок
+          var hr = screenRectOf(t.host || t.el, null);
+          if (!isSaneScreenRect(hr)) {
+            console.warn("[dash-shot] skip bad geom rect", t.label, sr);
+            return;
+          }
+          t.screenRect = function () {
+            return screenRectOf(t.host || t.el, null);
+          };
+        } else if (t.kind !== "geom" && sr && !isSaneScreenRect(sr)) {
+          console.warn("[dash-shot] skip bad target rect", t.label, sr);
+          return;
+        }
+      } catch (e) {}
       seen.push(key);
       out.push(t);
     }
@@ -2572,11 +2614,12 @@
         if (el) el.scrollIntoView(true);
       } catch (e2) {}
     }
-    var r = optRect || (el && el.getBoundingClientRect && el.getBoundingClientRect());
-    if (!r || !(r.width > 0 || r.height > 0)) {
-      if (el && el.getBoundingClientRect) r = el.getBoundingClientRect();
+    var r = isSaneScreenRect(optRect) ? optRect : null;
+    if (!r) r = screenRectOf(el, null);
+    if (!isSaneScreenRect(r)) {
+      console.warn("[dash-shot] highlight skipped — bad rect", label, optRect || r);
+      return function () {};
     }
-    if (!r) return function () {};
     var pad = 6;
     var caption =
       (stepText ? stepText + " " : "") + "КЛИК → " + (label || "?");
@@ -2723,8 +2766,8 @@
       var el = t.el;
       var r =
         (typeof t.screenRect === "function" && t.screenRect()) ||
-        (el && el.getBoundingClientRect && el.getBoundingClientRect());
-      if (!r || !(r.width > 2 || r.height > 2)) continue;
+        screenRectOf(el, t.host || null);
+      if (!isSaneScreenRect(r)) continue;
       if (t.kind === "geom" && t.geom) {
         try {
           flashGeom(t.geom);
