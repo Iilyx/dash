@@ -1414,7 +1414,9 @@
     }
   }
 
-  var GEOM_CLICK_CAP = 40; // макс. регионов/точек на одну карту/чарт
+  var LIST_CLICK_CAP = 8; // макс. пунктов ListBox
+  var COMBO_CLICK_CAP = 10; // макс. значений ComboBox
+  var DRILL_CLICK_CAP = 8; // макс. проваливаний в карту/чарт
 
   function isButtonHost(el) {
     return /^StiButtonElement$/i.test(attrType(el));
@@ -1629,92 +1631,228 @@
     }
   }
 
-  /** ComboBox / TreeViewBox: выбрать значение → ApplyFilters. */
-  function activateComboValue(host, item) {
-    if (!host || !item) return false;
+  function comboDropButton(host) {
     try {
-      if (item.button && typeof item.button.action === "function") {
-        item.button.action();
-        return true;
+      var cp = host && host.contentPanel;
+      if (!cp) return null;
+      for (var i = 0; i < cp.childNodes.length; i++) {
+        var ch = cp.childNodes[i];
+        if (ch && typeof ch.action === "function") return ch;
       }
-      if (typeof item.action === "function") {
-        item.action();
-        return true;
+    } catch (e) {}
+    return null;
+  }
+
+  /** Открыть выпадающий список ComboBox. */
+  async function openComboMenu(host) {
+    if (!host) return false;
+    try {
+      if (host.menu && host.menu.visible) return true;
+    } catch (e) {}
+    try {
+      if (host.menu && typeof host.menu.changeVisibleState === "function") {
+        host.menu.changeVisibleState(true);
+        await sleep(450);
+        return !!(host.menu && host.menu.visible);
+      }
+    } catch (e) {}
+    try {
+      var btn = comboDropButton(host);
+      if (btn) {
+        btn.action();
+        await sleep(450);
+        return !!(host.menu && host.menu.visible);
       }
     } catch (e) {
-      console.warn("[dash-shot] combo item.action", e);
+      console.warn("[dash-shot] openCombo", e);
     }
+    return false;
+  }
+
+  async function closeComboMenu(host) {
     try {
-      var js = getViewerJs();
-      if (!js || typeof js.ApplyFiltersToDashboardElement !== "function") return false;
+      if (host && host.menu && host.menu.visible && host.menu.changeVisibleState) {
+        host.menu.changeVisibleState(false);
+        await sleep(250);
+      }
+    } catch (e) {}
+  }
+
+  function findComboMenuItem(host, spec) {
+    if (!host || !host.menu) return null;
+    var wantVal = spec && spec.value != null ? String(spec.value) : null;
+    var wantLab = spec && spec.label != null ? String(spec.label) : null;
+    var roots = [];
+    try {
+      if (host.menu.innerContent) roots.push(host.menu.innerContent);
+    } catch (e) {}
+    try {
+      var box = host.menu.querySelector && host.menu.querySelector("div");
+      if (box) roots.push(box);
+    } catch (e) {}
+    for (var r = 0; r < roots.length; r++) {
+      var root = roots[r];
+      var nodes = root.querySelectorAll ? root.querySelectorAll("*") : root.childNodes;
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (!n || (n.value == null && n.label == null && typeof n.action !== "function"))
+          continue;
+        if (wantVal != null && n.value != null && String(n.value) === wantVal) return n;
+        if (wantLab && n.label != null && String(n.label) === wantLab) return n;
+        var cap =
+          (n.caption && (n.caption.innerText || n.caption.textContent)) ||
+          n.innerText ||
+          "";
+        if (wantLab && String(cap).trim() === wantLab) return n;
+      }
+      // прямые дети scroll-контейнера
+      for (var c = 0; c < (root.childNodes || []).length; c++) {
+        var ch = root.childNodes[c];
+        if (!ch || ch.nodeType !== 1) continue;
+        if (wantVal != null && ch.value != null && String(ch.value) === wantVal)
+          return ch;
+        if (typeof ch.action === "function" && (ch.value != null || ch.label != null))
+          return ch;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * ComboBox: реально открыть меню → клик по пункту → закрыть (onHide ApplyFilters).
+   */
+  async function activateComboValue(host, spec) {
+    if (!host || !spec) return false;
+    var opened = await openComboMenu(host);
+    console.log("[dash-shot] combo open", attrName(host), opened);
+    var item = findComboMenuItem(host, spec);
+    if (!item && opened) {
+      // взять N-й видимый пункт
+      try {
+        var ic = host.menu && host.menu.innerContent;
+        var kids = ic && ic.childNodes;
+        if (kids) {
+          for (var i = 0; i < kids.length; i++) {
+            if (kids[i] && kids[i].nodeType === 1 && typeof kids[i].action === "function") {
+              item = kids[i];
+              break;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    if (item) {
+      try {
+        if (item.button && typeof item.button.action === "function") item.button.action();
+        else if (typeof item.action === "function") item.action();
+        else if (typeof item.onclick === "function") item.onclick();
+        console.log("[dash-shot] combo pick", listItemLabel(item));
+      } catch (e) {
+        console.warn("[dash-shot] combo pick", e);
+      }
+    } else {
+      // fallback без меню
+      try {
+        var js = getViewerJs();
+        var ca =
+          host.elementAttributes && host.elementAttributes.contentAttributes;
+        var path = (ca && ca.columnPath) || "";
+        var val = spec.value;
+        var filters =
+          spec.isAllValue || val == null
+            ? []
+            : [{ condition: "equalTo", value: val, path: path }];
+        if (js && typeof js.ApplyFiltersToDashboardElement === "function") {
+          js.ApplyFiltersToDashboardElement(host, filters, true, null);
+          console.log("[dash-shot] combo ApplyFilters fallback", filters);
+        }
+      } catch (e) {
+        console.warn("[dash-shot] combo fallback", e);
+        await closeComboMenu(host);
+        return false;
+      }
+    }
+    await sleep(300);
+    await closeComboMenu(host);
+    return true;
+  }
+
+  function mapDrillMode(host) {
+    try {
       var ca =
         host.elementAttributes && host.elementAttributes.contentAttributes;
-      var path = (ca && ca.columnPath) || "";
-      var val = item.value != null ? item.value : item;
-      var isAll =
-        item.isAllValue ||
-        val === "StiAllValue" ||
-        val === "StiUnCheckAll" ||
-        String(item.label || "").toLowerCase() === "all";
-      var filters = isAll
-        ? []
-        : [{ condition: "equalTo", value: val, path: path }];
-      var params =
-        typeof host.getFilterParameters === "function"
-          ? host.getFilterParameters()
-          : null;
-      js.ApplyFiltersToDashboardElement(host, filters, true, params);
-      console.log("[dash-shot] combo ApplyFilters", attrName(host), filters);
-      return true;
+      var ix = ca && ca.interaction;
+      if (!ix) return null;
+      if (ix.onClick === "ShowDashboard") return "ShowDashboard";
+      if (ix.onClick === "DrillDown" || ix.allowUserDrillDown) return "DrillDown";
+      return null; // ApplyFilter и пр. — не кликаем массово
     } catch (e) {
-      console.warn("[dash-shot] combo ApplyFilters", e);
-      return false;
+      return null;
     }
   }
 
-  /** RegionMap / Chart geom в iframe → onclick (ApplyFilter / DrillDown). */
-  function activateGeom(host, geom) {
-    if (!geom) return false;
+  async function drillUpMap(host) {
     try {
-      if (typeof geom.onclick === "function") {
-        geom.onclick();
-        console.log(
-          "[dash-shot] geom.onclick",
-          geom.getAttribute &&
-            (geom.getAttribute("elementargument") ||
-              geom.getAttribute("elementvalue") ||
-              geom.getAttribute("elementident"))
-        );
+      if (host.buttons && host.buttons.drillUp && typeof host.buttons.drillUp.action === "function") {
+        host.buttons.drillUp.action();
+        console.log("[dash-shot] drillUp button");
+        return true;
+      }
+    } catch (e) {}
+    try {
+      var js = getViewerJs();
+      if (js && typeof js.ApplyDrillUpToDashboardElement === "function") {
+        js.ApplyDrillUpToDashboardElement(host);
+        console.log("[dash-shot] ApplyDrillUp");
         return true;
       }
     } catch (e) {
-      console.warn("[dash-shot] geom.onclick", e);
-    }
-    try {
-      var js = getViewerJs();
-      if (host && typeof host.selectGeom === "function") {
-        host.selectGeom(geom, false);
-        var filters =
-          typeof host.getFilters === "function" ? host.getFilters() : [];
-        var params =
-          typeof geom.getFilterParameters === "function"
-            ? geom.getFilterParameters(
-                host.elementAttributes &&
-                  host.elementAttributes.contentAttributes &&
-                  host.elementAttributes.contentAttributes.interaction &&
-                  host.elementAttributes.contentAttributes.interaction
-                    .drillDownParameters
-              )
-            : null;
-        if (js && typeof js.ApplyFiltersToDashboardElement === "function") {
-          js.ApplyFiltersToDashboardElement(host, filters, null, params);
-          return true;
-        }
-      }
-    } catch (e) {
-      console.warn("[dash-shot] geom ApplyFilters", e);
+      console.warn("[dash-shot] drillUp", e);
     }
     return false;
+  }
+
+  /**
+   * RegionMap/Chart: только проваливание (DrillDown / ShowDashboard), не ApplyFilter по всем регионам.
+   * Возвращает {ok, needDrillUp}.
+   */
+  async function activateGeom(host, geom) {
+    if (!host || !geom) return { ok: false, needDrillUp: false };
+    var mode = mapDrillMode(host);
+    var js = getViewerJs();
+    console.log("[dash-shot] geom mode", mode, geomLabel(geom));
+
+    if (mode === "ShowDashboard") {
+      try {
+        if (typeof geom.onclick === "function") {
+          geom.onclick();
+          return { ok: true, needDrillUp: false };
+        }
+      } catch (e) {
+        console.warn("[dash-shot] ShowDashboard onclick", e);
+      }
+    }
+
+    if (mode === "DrillDown") {
+      try {
+        if (typeof host.selectGeom === "function") host.selectGeom(geom, false);
+        var filters =
+          typeof host.getFilters === "function" ? host.getFilters() : [];
+        if (js && typeof js.ApplyDrillDownToDashboardElement === "function") {
+          js.ApplyDrillDownToDashboardElement(host, filters);
+          return { ok: true, needDrillUp: true };
+        }
+        if (typeof geom.onclick === "function") {
+          geom.onclick();
+          return { ok: true, needDrillUp: true };
+        }
+      } catch (e) {
+        console.warn("[dash-shot] DrillDown", e);
+      }
+    }
+
+    // без drill — не кликаем
+    return { ok: false, needDrillUp: false };
   }
 
   /** Image/Text с interaction.onClick. */
@@ -1895,62 +2033,77 @@
   }
 
   /**
-   * Цели клика: сначала пункты ListBox/TreeView (часто выглядят как «кнопки»),
-   * потом StiButtonElement. У каждой — el (куда рамка/клик) + activate().
+   * Цели: ComboBox (открытие меню), ListBox (лимит), Button,
+   * Image interaction, RegionMap/Chart только DrillDown/ShowDashboard.
    */
   function collectClickTargets(root) {
     var out = [];
     var seen = [];
     function add(t) {
-      if (!t || !t.el || seen.indexOf(t.el) >= 0) return;
-      if (!isVisibleBox(t.el)) return;
-      seen.push(t.el);
+      if (!t || !t.el) return;
+      var key = t.kind + "|" + t.label;
+      if (seen.indexOf(key) >= 0) return;
+      // combo/geom могут подсвечивать host даже если «лицо» мелкое
+      if (t.kind !== "combo" && t.kind !== "geom" && !isVisibleBox(t.el)) return;
+      seen.push(key);
       out.push(t);
     }
 
     var nodes = root.querySelectorAll("*");
-    // 1) ListBox / TreeView items
+
+    // 1) ComboBox — сначала (открытие меню + выбор), лимит значений
+    for (var cbi = 0; cbi < nodes.length; cbi++) {
+      var combo = nodes[cbi];
+      if (!isComboHost(combo)) continue;
+      if (!isVisibleBox(combo)) continue;
+      var cname = attrName(combo) || "Combo";
+      var ca =
+        combo.elementAttributes && combo.elementAttributes.contentAttributes;
+      var items = (ca && ca.items) || [];
+      var useItems = items.slice(0, COMBO_CLICK_CAP);
+      if (!useItems.length && ca && ca.showAllValue) {
+        useItems = [{ value: null, label: "All", isAllValue: true }];
+      }
+      for (var ui = 0; ui < useItems.length; ui++) {
+        (function (hst, it, fname) {
+          var lab = listItemLabel(it);
+          var spec = {
+            value: it.value,
+            label: it.label != null ? it.label : lab,
+            isAllValue: !!it.isAllValue,
+          };
+          add({
+            kind: "combo",
+            host: hst,
+            item: spec,
+            el: hst,
+            label: fname + ": " + lab,
+            activate: function () {
+              return activateComboValue(hst, spec);
+            },
+          });
+        })(combo, useItems[ui], cname);
+      }
+    }
+
+    // 2) ListBox — лимит, без дублей «лишних»
     for (var i = 0; i < nodes.length; i++) {
       var host = nodes[i];
       if (!isListBoxHost(host)) continue;
       var filterName = attrName(host) || "List";
       var panel =
         host.itemsPanel ||
-        (host.contentPanel && host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
+        (host.contentPanel &&
+          host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
         host.contentPanel;
+      var listAdded = 0;
       var pools = [];
       if (panel) pools.push(panel);
-      if (host.contentPanel && host.contentPanel !== panel) pools.push(host.contentPanel);
-      for (var p = 0; p < pools.length; p++) {
-        var kids = pools[p].childNodes || [];
-        for (var k = 0; k < kids.length; k++) {
-          var item = kids[k];
-          if (!item || item.nodeType !== 1) continue;
-          if (item.getAttribute && item.getAttribute("data-dash-shot-hl")) continue;
-          var hasAction = typeof item.action === "function";
-          var hasVal = item.value != null || item.label != null;
-          if (!hasAction && !hasVal) continue;
-          (function (it, hst, fname) {
-            add({
-              kind: "listbox",
-              host: hst,
-              item: it,
-              el: it.button || it,
-              label: fname + ": " + listItemLabel(it),
-              activate: function () {
-                return activateListItem(it, hst);
-              },
-            });
-          })(item, host, filterName);
-        }
-      }
-      // horizontal table cells
-      try {
-        if (host.contentPanel && host.contentPanel.horTable) {
+      if (host.contentPanel && host.contentPanel.horTable) {
+        try {
           var cells = host.contentPanel.horTable.querySelectorAll("td");
-          for (var c = 0; c < cells.length; c++) {
-            var cell = cells[c];
-            var child = cell.firstElementChild || cell;
+          for (var c = 0; c < cells.length && listAdded < LIST_CLICK_CAP; c++) {
+            var child = cells[c].firstElementChild || cells[c];
             if (typeof child.action !== "function" && child.value == null && child.label == null)
               continue;
             (function (it, hst, fname) {
@@ -1965,50 +2118,31 @@
                 },
               });
             })(child, host, filterName);
+            listAdded++;
           }
-        }
-      } catch (e) {}
-    }
-
-    // 2) ComboBox / TreeViewBox — значения из items / меню
-    for (var cbi = 0; cbi < nodes.length; cbi++) {
-      var combo = nodes[cbi];
-      if (!isComboHost(combo)) continue;
-      var cname = attrName(combo) || "Combo";
-      var ca =
-        combo.elementAttributes && combo.elementAttributes.contentAttributes;
-      var items = (ca && ca.items) || [];
-      var menuItems = [];
-      try {
-        if (combo.menu && combo.menu.innerContent) {
-          var kids = combo.menu.innerContent.querySelectorAll
-            ? combo.menu.innerContent.querySelectorAll("*")
-            : combo.menu.innerContent.childNodes;
-          for (var mi = 0; mi < kids.length; mi++) {
-            var m = kids[mi];
-            if (m && (m.value != null || m.label != null || typeof m.action === "function"))
-              menuItems.push(m);
-          }
-        }
-      } catch (e) {}
-      var useItems = menuItems.length ? menuItems : items;
-      if (!useItems.length && ca && ca.showAllValue) {
-        useItems = [{ value: null, label: "All", isAllValue: true }];
+        } catch (e) {}
       }
-      for (var ui = 0; ui < useItems.length; ui++) {
-        (function (hst, it, fname, idx) {
-          var lab = listItemLabel(it);
-          add({
-            kind: "combo",
-            host: hst,
-            item: it,
-            el: hst,
-            label: fname + ": " + lab,
-            activate: function () {
-              return activateComboValue(hst, it);
-            },
-          });
-        })(combo, useItems[ui], cname, ui);
+      for (var p = 0; p < pools.length; p++) {
+        var kids = pools[p].childNodes || [];
+        for (var k = 0; k < kids.length && listAdded < LIST_CLICK_CAP; k++) {
+          var item = kids[k];
+          if (!item || item.nodeType !== 1) continue;
+          if (!(typeof item.action === "function" || item.value != null || item.label != null))
+            continue;
+          (function (it, hst, fname) {
+            add({
+              kind: "listbox",
+              host: hst,
+              item: it,
+              el: it.button || it,
+              label: fname + ": " + listItemLabel(it),
+              activate: function () {
+                return activateListItem(it, hst);
+              },
+            });
+          })(item, host, filterName);
+          listAdded++;
+        }
       }
     }
 
@@ -2030,7 +2164,7 @@
       })(btn);
     }
 
-    // 4) Image / Text / Indicator с interaction.onClick
+    // 4) Image / Text с ShowDashboard (не OpenHyperlink)
     for (var ii = 0; ii < nodes.length; ii++) {
       var ihost = nodes[ii];
       if (!isInteractionHost(ihost)) continue;
@@ -2041,6 +2175,7 @@
           ca && ca.interaction && ca.interaction.onClick
             ? ca.interaction.onClick
             : "?";
+        if (onClick === "OpenHyperlink") return;
         add({
           kind: "interaction",
           host: h,
@@ -2053,35 +2188,36 @@
       })(ihost);
     }
 
-    // 5) RegionMap / Chart — кликабельные geom в iframe
+    // 5) RegionMap / Chart — только DrillDown / ShowDashboard (проваливание)
     for (var gi = 0; gi < nodes.length; gi++) {
       var ghost = nodes[gi];
       if (!isGeomHost(ghost)) continue;
+      var mode = mapDrillMode(ghost);
+      if (!mode) {
+        console.log(
+          "[dash-shot] skip map/chart (no drill)",
+          attrName(ghost),
+          attrType(ghost)
+        );
+        continue;
+      }
       var gname = attrName(ghost) || attrType(ghost) || "Map";
       var geoms = collectGeoms(ghost);
-      var cap = Math.min(geoms.length, GEOM_CLICK_CAP);
-      if (geoms.length > GEOM_CLICK_CAP) {
-        console.warn(
-          "[dash-shot] geoms capped",
-          gname,
-          geoms.length,
-          "→",
-          GEOM_CLICK_CAP
-        );
-      }
+      var cap = Math.min(geoms.length, DRILL_CLICK_CAP);
       for (var gj = 0; gj < cap; gj++) {
-        (function (hst, geom, fname, idx) {
+        (function (hst, geom, fname, drillMode) {
           var gl = geomLabel(geom);
           add({
             kind: "geom",
             host: hst,
-            el: hst, // рамка на карте/чарте целиком (geom в iframe)
-            label: fname + ": " + gl,
+            el: hst,
+            label: fname + " ↓ " + gl,
+            needDrillUp: drillMode === "DrillDown",
             activate: function () {
               return activateGeom(hst, geom);
             },
           });
-        })(ghost, geoms[gj], gname, gj);
+        })(ghost, geoms[gj], gname, mode);
       }
     }
 
@@ -2313,25 +2449,21 @@
     }
   }
 
-  function activateClickTarget(target) {
-    if (!target) return false;
+  async function activateClickTarget(target) {
+    if (!target) return { ok: false, needDrillUp: false };
     console.log("[dash-shot] activate", target.kind, target.label);
+    var result = null;
     if (typeof target.activate === "function") {
       try {
-        return !!target.activate();
+        result = await target.activate();
       } catch (e) {
         console.warn("[dash-shot] activate threw", e);
+        return { ok: false, needDrillUp: false };
       }
     }
-    if (target.kind === "button" && target.host)
-      return activateDashButton(target.host);
-    if (target.kind === "listbox" && target.item)
-      return activateListItem(target.item, target.host);
-    if (target.kind === "combo" && target.item)
-      return activateComboValue(target.host, target.item);
-    if (target.kind === "interaction" && target.host)
-      return activateInteractionHost(target.host);
-    return false;
+    if (result && typeof result === "object" && "ok" in result) return result;
+    if (result) return { ok: true, needDrillUp: !!target.needDrillUp };
+    return { ok: false, needDrillUp: false };
   }
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
@@ -2460,9 +2592,9 @@
           clearHl = highlightClickTarget(target.el, label, step);
           await sleep(700);
 
-          var clicked = false;
+          var act = { ok: false, needDrillUp: false };
           try {
-            clicked = activateClickTarget(target);
+            act = await activateClickTarget(target);
           } catch (e) {
             console.warn("[dash-shot] click failed", label, e);
             logLines.push(slug + " | CLICK FAIL " + label);
@@ -2470,9 +2602,12 @@
             clearHl = function () {};
             continue;
           }
-          if (!clicked) {
+          if (!act.ok) {
             logLines.push(slug + " | ACTIVATE FALSE " + label);
             console.warn("[dash-shot] activate false", label);
+            clearHl();
+            clearHl = function () {};
+            continue;
           }
 
           setStatus(page.label + " " + step + " ждём перерисовку…");
@@ -2486,27 +2621,25 @@
           );
           await sleep(350);
 
-          var el = null;
-          try {
-            root = captureRoot() || root;
-            var again = collectClickTargets(root);
-            var match = again.filter(function (t) {
-              return t.kind === target.kind && t.label === label;
-            })[0];
-            if (match) {
-              target = match;
-              el = match.el;
-            }
-          } catch (e) {}
+          var el = target.el;
           if (el && el.isConnected) {
-            clearHl = highlightClickTarget(el, label, step + " нажато");
+            clearHl = highlightClickTarget(
+              el,
+              label,
+              step + (act.needDrillUp ? " ↓ drill" : " нажато")
+            );
             await sleep(250);
           }
 
           var shot = await takeScreenshot({
             label: slug,
             banner:
-              "Стр. " + page.label + " | " + step + " Нажато: " + label,
+              "Стр. " +
+              page.label +
+              " | " +
+              step +
+              (act.needDrillUp ? " Провалились: " : " Нажато: ") +
+              label,
             quiet: true,
           });
           clearHl();
@@ -2514,7 +2647,9 @@
           totalClicks++;
           logLines.push(
             slug +
-              " | Нажато: " +
+              " | " +
+              (act.needDrillUp ? "DRILL" : "CLICK") +
+              " " +
               label +
               " | kind=" +
               target.kind +
@@ -2523,6 +2658,14 @@
               " | pdf=" +
               ((shot && shot.pdfs) || []).join(",")
           );
+
+          // после проваливания в карту — подняться назад
+          if (act.needDrillUp && target.host) {
+            setStatus(page.label + " " + step + " drillUp…");
+            await drillUpMap(target.host);
+            await waitDashboardIdle(800, 12000);
+            await sleep(300);
+          }
         }
       }
 
