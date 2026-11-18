@@ -1414,11 +1414,13 @@
     }
   }
 
-  // Скан: карта (области) + Combo + Button + Image/Text с OnClick. Без ListBox-спама.
-  var COMBO_HOST_CAP = 2; // сколько ComboBox на странице
-  var COMBO_CLICK_CAP = 3; // значений в каждом
-  var MAP_HOST_CAP = 1; // сколько карт на странице (иначе 4×7 кликов)
-  var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ ≤7)
+  // Скан по сценарию: кнопки → image/action → 1 область → снова → глубже → снова.
+  var COMBO_HOST_CAP = 2;
+  var COMBO_CLICK_CAP = 3;
+  var MAP_HOST_CAP = 1;
+  var MAP_REGION_ONE = 1; // одна область на провал
+  var DEEP_DRILL_ONE = 1; // один район/ИМНС внутри области
+  var DRILL_CLICK_CAP = 8;
   /** Коды областей РБ из map-region-click.md */
   var MAP_REGION_ALIASES = [
     { label: "Брестская", codes: ["brestskaia", "brest", "by-br", "брест"] },
@@ -2400,24 +2402,30 @@
   }
 
   /**
-   * Цели: RegionMap (области) + Combo + Button + Image/Text OnClick.
-   * ListBox не трогаем (шум).
+   * Собрать цели одного типа. Порядок внутри типа — сверху вниз.
+   * kinds: "button" | "interaction" | "geom" | "deep" | "combo"
+   * opts.maxRegions — сколько областей карты (по умолчанию все алиасы / DRILL_CLICK_CAP)
    */
-  function collectClickTargets(root) {
+  function collectClickTargets(root, kinds, opts) {
+    opts = opts || {};
+    var want = {};
+    var kindList = kinds || ["button", "interaction", "geom", "combo"];
+    for (var ki = 0; ki < kindList.length; ki++) want[kindList[ki]] = true;
+    var maxRegions =
+      opts.maxRegions != null ? opts.maxRegions : DRILL_CLICK_CAP;
     var out = [];
     var seen = [];
     function add(t) {
       if (!t || !t.el) return;
       var key = t.kind + "|" + t.label;
       if (seen.indexOf(key) >= 0) return;
-      if (t.kind !== "combo" && t.kind !== "geom" && !isVisibleBox(t.el)) return;
-      // отбросить цели с рамкой в (0,0) / нулевым боксом
+      if (t.kind !== "combo" && t.kind !== "geom" && t.kind !== "deep" && !isVisibleBox(t.el))
+        return;
       try {
         var sr =
           (typeof t.screenRect === "function" && t.screenRect()) ||
           screenRectOf(t.el, t.host || null);
-        if (t.kind === "geom" && !isSaneScreenRect(sr)) {
-          // геом без нормального rect — подсветим хост карты, если он ок
+        if ((t.kind === "geom" || t.kind === "deep") && !isSaneScreenRect(sr)) {
           var hr = screenRectOf(t.host || t.el, null);
           if (!isSaneScreenRect(hr)) {
             console.warn("[dash-shot] skip bad geom rect", t.label, sr);
@@ -2426,7 +2434,7 @@
           t.screenRect = function () {
             return screenRectOf(t.host || t.el, null);
           };
-        } else if (t.kind !== "geom" && sr && !isSaneScreenRect(sr)) {
+        } else if (t.kind !== "geom" && t.kind !== "deep" && sr && !isSaneScreenRect(sr)) {
           console.warn("[dash-shot] skip bad target rect", t.label, sr);
           return;
         }
@@ -2437,155 +2445,237 @@
 
     var nodes = root.querySelectorAll("*");
 
-    // 1) RegionMap — области (подсветка по SVG-геоме, не по всей карте)
-    var mapHosts = 0;
-    for (var gi = 0; gi < nodes.length; gi++) {
-      if (mapHosts >= MAP_HOST_CAP) break;
-      var ghost = nodes[gi];
-      if (!/RegionMap/i.test(attrType(ghost))) continue;
-      if (!isVisibleBox(ghost)) continue;
-      mapHosts++;
-      var gname = attrName(ghost) || "Map";
-      var regions = pickRegionGeoms(ghost);
-      console.log("[dash-shot] map", gname, "regions", regions.length);
-      for (var gj = 0; gj < regions.length; gj++) {
-        (function (hst, reg, fname) {
+    if (want.button) {
+      for (var b = 0; b < nodes.length; b++) {
+        var btn = nodes[b];
+        if (!isButtonHost(btn)) continue;
+        if (!isVisibleBox(btn)) continue;
+        (function (h) {
+          var face = buttonFace(h);
           add({
-            kind: "geom",
-            host: hst,
-            geom: reg.geom,
-            el: hst,
-            label: fname + " ↓ " + reg.label,
-            needReturnCountry: true,
-            screenRect: function () {
-              return screenRectOf(reg.geom, hst) || screenRectOf(hst, null);
-            },
+            kind: "button",
+            host: h,
+            el: face || h,
+            label: buttonLabel(h),
             activate: function () {
-              return activateGeom(hst, reg.geom);
+              return activateDashButton(h);
             },
           });
-        })(ghost, regions[gj], gname);
+        })(btn);
       }
     }
 
-    // 2) ComboBox — мало: 2 фильтра × 3 значения
-    var comboHosts = 0;
-    for (var cbi = 0; cbi < nodes.length; cbi++) {
-      if (comboHosts >= COMBO_HOST_CAP) break;
-      var combo = nodes[cbi];
-      if (!isComboHost(combo)) continue;
-      if (!isVisibleBox(combo)) continue;
-      comboHosts++;
-      var cname = attrName(combo) || "Combo";
-      var ca =
-        combo.elementAttributes && combo.elementAttributes.contentAttributes;
-      var items = (ca && ca.items) || [];
-      var filtered = [];
-      for (var fi = 0; fi < items.length; fi++) {
-        var it0 = items[fi];
-        if (!it0) continue;
-        if (it0.isAllValue) continue;
-        var lab0 = listItemLabel(it0);
-        if (!lab0 || /^all$/i.test(lab0)) continue;
-        filtered.push(it0);
-      }
-      var useItems = filtered.slice(0, COMBO_CLICK_CAP);
-      for (var ui = 0; ui < useItems.length; ui++) {
-        (function (hst, it, fname) {
-          var lab = listItemLabel(it);
-          var spec = {
-            value: it.value,
-            label: it.label != null ? it.label : lab,
-            isAllValue: false,
-          };
+    if (want.interaction) {
+      for (var ii = 0; ii < nodes.length; ii++) {
+        var ihost = nodes[ii];
+        if (!isInteractionHost(ihost)) continue;
+        if (!isVisibleBox(ihost)) continue;
+        (function (h) {
+          var ix = readElementInteraction(h);
           add({
-            kind: "combo",
-            host: hst,
-            item: spec,
-            el: hst,
-            label: fname + ": " + lab,
+            kind: "interaction",
+            host: h,
+            el: h,
+            label:
+              (attrName(h) || attrType(h) || "img") +
+              " [" +
+              (ix && ix.onClick ? ix.onClick : "?") +
+              "]",
             activate: function () {
-              return activateComboValue(hst, spec);
+              return activateInteractionHost(h);
             },
           });
-        })(combo, useItems[ui], cname);
+        })(ihost);
       }
     }
 
-    // 3) StiButtonElement
-    for (var b = 0; b < nodes.length; b++) {
-      var btn = nodes[b];
-      if (!isButtonHost(btn)) continue;
-      if (!isVisibleBox(btn)) continue;
-      (function (h) {
-        var face = buttonFace(h);
-        add({
-          kind: "button",
-          host: h,
-          el: face || h,
-          label: buttonLabel(h),
-          activate: function () {
-            return activateDashButton(h);
-          },
-        });
-      })(btn);
+    if (want.combo) {
+      var comboHosts = 0;
+      for (var cbi = 0; cbi < nodes.length; cbi++) {
+        if (comboHosts >= COMBO_HOST_CAP) break;
+        var combo = nodes[cbi];
+        if (!isComboHost(combo)) continue;
+        if (!isVisibleBox(combo)) continue;
+        comboHosts++;
+        var cname = attrName(combo) || "Combo";
+        var ca =
+          combo.elementAttributes && combo.elementAttributes.contentAttributes;
+        var items = (ca && ca.items) || [];
+        var filtered = [];
+        for (var fi = 0; fi < items.length; fi++) {
+          var it0 = items[fi];
+          if (!it0 || it0.isAllValue) continue;
+          var lab0 = listItemLabel(it0);
+          if (!lab0 || /^all$/i.test(lab0)) continue;
+          filtered.push(it0);
+        }
+        var useItems = filtered.slice(0, COMBO_CLICK_CAP);
+        for (var ui = 0; ui < useItems.length; ui++) {
+          (function (hst, it, fname) {
+            var lab = listItemLabel(it);
+            var spec = {
+              value: it.value,
+              label: it.label != null ? it.label : lab,
+              isAllValue: false,
+            };
+            add({
+              kind: "combo",
+              host: hst,
+              item: spec,
+              el: hst,
+              label: fname + ": " + lab,
+              activate: function () {
+                return activateComboValue(hst, spec);
+              },
+            });
+          })(combo, useItems[ui], cname);
+        }
+      }
     }
 
-    // 4) Image / Text с OnClick (не OpenHyperlink)
-    for (var ii = 0; ii < nodes.length; ii++) {
-      var ihost = nodes[ii];
-      if (!isInteractionHost(ihost)) continue;
-      if (!isVisibleBox(ihost)) continue;
-      (function (h) {
-        var ix = readElementInteraction(h);
-        add({
-          kind: "interaction",
-          host: h,
-          el: h,
-          label:
-            (attrName(h) || attrType(h) || "img") +
-            " [" +
-            (ix && ix.onClick ? ix.onClick : "?") +
-            "]",
-          activate: function () {
-            return activateInteractionHost(h);
-          },
-        });
-      })(ihost);
+    if (want.geom) {
+      var mapHosts = 0;
+      var regionAdded = 0;
+      for (var gi = 0; gi < nodes.length; gi++) {
+        if (mapHosts >= MAP_HOST_CAP) break;
+        if (regionAdded >= maxRegions) break;
+        var ghost = nodes[gi];
+        if (!/RegionMap/i.test(attrType(ghost))) continue;
+        if (!isVisibleBox(ghost)) continue;
+        mapHosts++;
+        var gname = attrName(ghost) || "Map";
+        var regions = pickRegionGeoms(ghost);
+        console.log("[dash-shot] map", gname, "regions", regions.length);
+        for (var gj = 0; gj < regions.length && regionAdded < maxRegions; gj++) {
+          (function (hst, reg, fname) {
+            add({
+              kind: "geom",
+              host: hst,
+              geom: reg.geom,
+              el: hst,
+              label: fname + " ↓ " + reg.label,
+              needReturnCountry: true,
+              stayAfter: true,
+              screenRect: function () {
+                return screenRectOf(reg.geom, hst) || screenRectOf(hst, null);
+              },
+              activate: function () {
+                return activateGeom(hst, reg.geom);
+              },
+            });
+          })(ghost, regions[gj], gname);
+          regionAdded++;
+        }
+      }
     }
 
+    if (want.deep) {
+      var deep = collectDeepDrillTargets(root, opts.maxDeep || DEEP_DRILL_ONE);
+      for (var d = 0; d < deep.length; d++) add(deep[d]);
+    }
+
+    // внутри фазы — сверху вниз (не мешаем фазы между собой)
     out.sort(function (a, b) {
       var ra =
         (a.screenRect && a.screenRect()) ||
-        (a.el && a.el.getBoundingClientRect && a.el.getBoundingClientRect()) ||
+        screenRectOf(a.el, a.host) ||
         { top: 0, left: 0 };
       var rb =
         (b.screenRect && b.screenRect()) ||
-        (b.el && b.el.getBoundingClientRect && b.el.getBoundingClientRect()) ||
+        screenRectOf(b.el, b.host) ||
         { top: 0, left: 0 };
       if (Math.abs(ra.top - rb.top) > 12) return ra.top - rb.top;
       return ra.left - rb.left;
     });
 
     console.log(
-      "[dash-shot] click targets",
+      "[dash-shot] targets",
+      kindList.join("+"),
       out.map(function (t) {
-        var r =
-          (t.screenRect && t.screenRect()) ||
-          (t.el && t.el.getBoundingClientRect && t.el.getBoundingClientRect());
-        return {
-          kind: t.kind,
-          label: t.label,
-          box: r
-            ? Math.round(r.left) +
-              "," +
-              Math.round(r.top) +
-              " " +
-              Math.round(r.width) +
-              "x" +
-              Math.round(r.height)
-            : "?",
-        };
+        return t.kind + ":" + t.label;
+      })
+    );
+    return out;
+  }
+
+  /**
+   * Провал «ещё ниже» внутри области: chart/pivot/table с onclick,
+   * НЕ контур карты (map-region-click.md).
+   */
+  function collectDeepDrillTargets(root, limit) {
+    limit = limit || DEEP_DRILL_ONE;
+    var scored = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (typeof node.onclick !== "function") continue;
+      if (isUnderMapElement(node)) continue;
+      if (isButtonHost(node) || isComboHost(node) || isListBoxHost(node)) continue;
+      if (isInteractionHost(node)) continue;
+      var blob = (
+        geomBlob(node) +
+        " " +
+        ((node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
+      ).toLowerCase();
+      if (!blob || blob.length > 200) continue;
+      var score = 0;
+      if (/имнс|пинск|pinsk|район|rayon/.test(blob)) score += 5;
+      var hostType = "";
+      var cur = node;
+      for (var u = 0; u < 25 && cur; u++) {
+        var ht = attrType(cur);
+        if (ht && /Chart|Pivot|Table|DataBars|Indicator/i.test(ht)) {
+          hostType = ht;
+          score += 2;
+          break;
+        }
+        cur = cur.parentElement || cur.parentNode;
+      }
+      if (!score) continue;
+      var lab =
+        geomAttr(node, "elementargument") ||
+        geomAttr(node, "elementident") ||
+        (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60) ||
+        "deep";
+      scored.push({
+        score: score,
+        node: node,
+        hostType: hostType,
+        label: lab,
+      });
+    }
+    scored.sort(function (a, b) {
+      return b.score - a.score;
+    });
+    var out = [];
+    var seenLab = [];
+    for (var s = 0; s < scored.length && out.length < limit; s++) {
+      var it = scored[s];
+      var key = String(it.label).toLowerCase();
+      if (seenLab.indexOf(key) >= 0) continue;
+      seenLab.push(key);
+      (function (n, lab, ht) {
+        out.push({
+          kind: "deep",
+          host: n,
+          geom: n,
+          el: n,
+          label: "↓↓ " + lab + (ht ? " (" + ht + ")" : ""),
+          needReturnCountry: true,
+          stayAfter: true,
+          screenRect: function () {
+            return screenRectOf(n, null);
+          },
+          activate: function () {
+            return activateGeom(null, n);
+          },
+        });
+      })(it.node, it.label, it.hostType);
+    }
+    console.log(
+      "[dash-shot] deep drills",
+      out.map(function (t) {
+        return t.label;
       })
     );
     return out;
@@ -2838,10 +2928,12 @@
     return { ok: false, needReturnCountry: false };
   }
 
-  /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
   /**
-   * Скан по страницам: инвентарь → baseline → клики
-   * (ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms).
+   * Сценарий:
+   *   L0 страна: КНОПКИ → IMAGE/ACTION → провал в 1 область
+   *   L1 область: КНОПКИ → IMAGE/ACTION → провал ещё ниже (ИМНС/район)
+   *   L2 ниже:    КНОПКИ → IMAGE/ACTION
+   *   → возврат на страну
    */
   async function scanButtons() {
     var btn = document.getElementById("dashShotBtn");
@@ -2854,34 +2946,177 @@
     var scanId = stamp();
     var clearHl = function () {};
     var totalClicks = 0;
+    var stepNo = 0;
+
+    async function pokeTargets(targets, meta) {
+      meta = meta || {};
+      var level = meta.level != null ? meta.level : 0;
+      var levelName = meta.levelName || "страна";
+      var phase = meta.phase || "?";
+      var pageSlug = meta.pageSlug || "page";
+      var stayAfterDrill = !!meta.stayAfterDrill;
+
+      for (var i = 0; i < targets.length; i++) {
+        var target = targets[i];
+        var label = target.label;
+        stepNo++;
+        var step = stepNo + "";
+        var phaseStep = i + 1 + "/" + targets.length;
+        var slug =
+          pageSlug +
+          "__L" +
+          level +
+          "_" +
+          String(stepNo).padStart(2, "0") +
+          "_" +
+          safeSlug(phase) +
+          "_" +
+          target.kind +
+          "_" +
+          safeSlug(label);
+        var bannerPrefix =
+          "L" + level + " " + levelName + " | " + phase + " | " + phaseStep;
+        setStatus(bannerPrefix + " → " + label);
+        logLines.push(bannerPrefix + " → " + label);
+
+        var preRect =
+          typeof target.screenRect === "function" ? target.screenRect() : null;
+        var unflash = function () {};
+        if ((target.kind === "geom" || target.kind === "deep") && target.geom) {
+          unflash = flashGeom(target.geom);
+        }
+        clearHl = highlightClickTarget(target.el, label, bannerPrefix, preRect);
+        await sleep(800);
+
+        var beforeKey = dashboardScreenKey();
+        var act = { ok: false, needReturnCountry: false };
+        try {
+          act = await activateClickTarget(target);
+        } catch (e) {
+          console.warn("[dash-shot] click failed", label, e);
+          logLines.push(slug + " | CLICK FAIL");
+          try {
+            unflash();
+          } catch (e2) {}
+          clearHl();
+          clearHl = function () {};
+          continue;
+        }
+        try {
+          unflash();
+        } catch (e3) {}
+
+        if (!act.ok) {
+          logLines.push(slug + " | ACTIVATE FALSE");
+          clearHl();
+          clearHl = function () {};
+          continue;
+        }
+
+        clearHl();
+        clearHl = function () {};
+        await waitDashboardIdle(600, 12000);
+        await sleep(300);
+
+        var afterKey = dashboardScreenKey();
+        var leftContext = !!(afterKey && beforeKey && afterKey !== beforeKey);
+        var isDrill =
+          target.kind === "geom" ||
+          target.kind === "deep" ||
+          !!act.needReturnCountry;
+
+        clearHl = highlightClickTarget(
+          target.el,
+          label,
+          bannerPrefix + (isDrill ? " ПРОВАЛ" : " ОКАТО"),
+          typeof target.screenRect === "function" ? target.screenRect() : null
+        );
+        await sleep(200);
+
+        var shot = await takeScreenshot({
+          label: slug,
+          banner: bannerPrefix + (isDrill ? " | Провалились: " : " | Нажато: ") + label,
+          quiet: true,
+        });
+        clearHl();
+        clearHl = function () {};
+        totalClicks++;
+        logLines.push(
+          slug +
+            " | " +
+            (isDrill ? "DRILL" : "CLICK") +
+            " | png=" +
+            (shot && shot.png) +
+            " | pdf=" +
+            ((shot && shot.pdfs) || []).join(",")
+        );
+
+        // провал карты/глубже — остаёмся внутри, если сценарий просит
+        if (isDrill && stayAfterDrill) {
+          await sleep(400);
+          continue;
+        }
+        // image/action увёл экран — вернуть на страну только на L0
+        if (leftContext && level === 0 && target.kind === "interaction") {
+          setStatus("L0 возврат после image…");
+          await returnToCountryMap();
+          await sleep(400);
+        }
+      }
+    }
+
+    async function runButtonsAndImages(level, levelName, pageSlug) {
+      var root = captureRoot();
+      if (!root) return;
+      var buttons = collectClickTargets(root, ["button"]);
+      logLines.push(
+        "L" + level + " " + levelName + " | фаза КНОПКИ: " + buttons.length
+      );
+      setStatus("L" + level + " " + levelName + " — кнопки (" + buttons.length + ")…");
+      await pokeTargets(buttons, {
+        level: level,
+        levelName: levelName,
+        phase: "КНОПКИ",
+        pageSlug: pageSlug,
+      });
+
+      root = captureRoot();
+      if (!root) return;
+      var images = collectClickTargets(root, ["interaction"]);
+      logLines.push(
+        "L" + level + " " + levelName + " | фаза IMAGE/ACTION: " + images.length
+      );
+      setStatus(
+        "L" + level + " " + levelName + " — image/action (" + images.length + ")…"
+      );
+      await pokeTargets(images, {
+        level: level,
+        levelName: levelName,
+        phase: "IMAGE",
+        pageSlug: pageSlug,
+      });
+    }
+
     try {
       await loadScript(HTML2CANVAS);
       var allPages = collectDashboardPages();
-      // lean: только текущая вкладка, не бегать по всем страницам
-      var pages = allPages;
       var selected = null;
       for (var spi = 0; spi < allPages.length; spi++) {
         var pb = allPages[spi].el;
-        if (pb && (pb.isSelected || pb.className && /Selected/i.test(pb.className))) {
+        if (
+          pb &&
+          (pb.isSelected || (pb.className && /Selected/i.test(pb.className)))
+        ) {
           selected = allPages[spi];
           break;
         }
       }
-      pages = selected ? [selected] : allPages.slice(0, 1);
-      setStatus("скан: " + pages[0].label + " (lean)…");
-      inventoryLines.push("LEAN: только текущая страница + карта/combo");
-      inventoryLines.push("PAGES all (" + allPages.length + "):");
-      allPages.forEach(function (p, i) {
-        inventoryLines.push(
-          "  " +
-            (i + 1) +
-            ") [" +
-            p.index +
-            "] " +
-            p.label +
-            (pages[0] === p ? " ← SCAN" : "")
-        );
-      });
+      var pages = selected ? [selected] : allPages.slice(0, 1);
+      setStatus("сценарий: кнопки→image→карта→глубже | " + pages[0].label);
+      inventoryLines.push(
+        "СЦЕНАРИЙ: L0 кнопки→image→1 область → L1 кнопки→image→1 глубже → L2 кнопки→image → страна"
+      );
+      inventoryLines.push("PAGE: " + pages[0].label);
 
       for (var pi = 0; pi < pages.length; pi++) {
         var page = pages[pi];
@@ -2890,11 +3125,8 @@
           String(page.index).padStart(2, "0") +
           "_" +
           safeSlug(page.label);
-        setStatus(
-          "стр. " + (pi + 1) + "/" + pages.length + ": " + page.label
-        );
         logLines.push("");
-        logLines.push("=== PAGE " + page.label + " (index " + page.index + ") ===");
+        logLines.push("=== PAGE " + page.label + " ===");
 
         if (typeof page.activate === "function") {
           try {
@@ -2903,198 +3135,119 @@
             console.warn("[dash-shot] page switch", e);
           }
           await waitDashboardIdle(1000, 14000);
-          await sleep(500);
+          await sleep(400);
         }
 
-        var root = captureRoot();
-        if (!root) {
+        var root0 = captureRoot();
+        if (!root0) {
           logLines.push("page root missing");
           continue;
         }
-
-        var inv = inventoryPageElements(root);
-        inventoryLines.push("");
-        inventoryLines.push("PAGE " + page.label + " elements:");
-        Object.keys(inv.counts)
-          .sort()
-          .forEach(function (t) {
-            inventoryLines.push("  " + t + ": " + inv.counts[t]);
-          });
+        var inv = inventoryPageElements(root0);
+        inventoryLines.push("elements:");
         inv.elements.forEach(function (e) {
+          if (!e.role && !e.interaction) return;
           inventoryLines.push(
             "  - " +
               e.type +
               " / " +
               (e.name || "?") +
               (e.role ? " role=" + e.role : "") +
-              (e.interaction ? " interaction=" + e.interaction : "") +
-              (e.items ? " items=" + e.items : "")
+              (e.interaction ? " interaction=" + e.interaction : "")
           );
         });
-        console.log("[dash-shot] inventory", page.label, inv);
 
-        setStatus(page.label + " — baseline…");
+        setStatus("L0 страна — baseline…");
         var base = await takeScreenshot({
-          label: pageSlug + "__00_baseline",
-          banner: "Страница: " + page.label + " (без клика)",
+          label: pageSlug + "__L0_00_baseline",
+          banner: "L0 страна | baseline (без клика)",
           quiet: true,
         });
         logLines.push(
-          "baseline | png=" +
-            (base && base.png) +
-            " | pdf=" +
-            ((base && base.pdfs) || []).join(",")
+          "L0 baseline | png=" + (base && base.png)
         );
 
-        var targets = collectClickTargets(root);
-        logLines.push("targets: " + targets.length);
-        targets.forEach(function (t, idx) {
-          logLines.push(
-            "  " + (idx + 1) + ") [" + t.kind + "] " + t.label
-          );
+        // ——— L0: кнопки → image ———
+        await runButtonsAndImages(0, "страна", pageSlug);
+
+        // ——— L0→L1: одна область карты, ОСТАЁМСЯ ———
+        root0 = captureRoot();
+        var regions = collectClickTargets(root0, ["geom"], {
+          maxRegions: MAP_REGION_ONE,
         });
+        logLines.push("L0 | провал в область: " + regions.length);
+        if (regions.length) {
+          setStatus("L0 → провал в область…");
+          await pokeTargets(regions, {
+            level: 0,
+            levelName: "страна",
+            phase: "КАРТА",
+            pageSlug: pageSlug,
+            stayAfterDrill: true,
+          });
 
-        if (!targets.length) {
-          setStatus(page.label + " — нет кликабельных целей");
-          await sleep(600);
-          continue;
-        }
-
-        setStatus(
-          page.label +
-            ": " +
-            targets.length +
-            " целей (карта/combo/button/image)…"
-        );
-        previewAllTargets(targets);
-        await sleep(900);
-        clearClickHighlight();
-
-        for (var i = 0; i < targets.length; i++) {
-          var target = targets[i];
-          var label = target.label;
-          var step = i + 1 + "/" + targets.length;
-          var slug =
-            pageSlug +
-            "__" +
-            String(i + 1).padStart(2, "0") +
-            "_" +
-            target.kind +
-            "_" +
-            safeSlug(label);
-          setStatus(page.label + " " + step + " → " + label);
-          var preRect =
-            typeof target.screenRect === "function" ? target.screenRect() : null;
-          var unflash = function () {};
-          if (target.kind === "geom" && target.geom) {
-            unflash = flashGeom(target.geom);
-          }
-          clearHl = highlightClickTarget(target.el, label, step, preRect);
-          await sleep(900);
-
-          var act = { ok: false, needReturnCountry: false };
-          try {
-            act = await activateClickTarget(target);
-          } catch (e) {
-            console.warn("[dash-shot] click failed", label, e);
-            logLines.push(slug + " | CLICK FAIL " + label);
-            try {
-              unflash();
-            } catch (e2) {}
-            clearHl();
-            clearHl = function () {};
-            continue;
-          }
-          try {
-            unflash();
-          } catch (e3) {}
-          if (!act.ok) {
-            logLines.push(slug + " | ACTIVATE FALSE " + label);
-            console.warn("[dash-shot] activate false", label);
-            clearHl();
-            clearHl = function () {};
-            if (target.kind === "geom") {
-              await returnToCountryMap();
-            }
-            continue;
-          }
-
-          setStatus(page.label + " " + step + " ждём перерисовку…");
-          clearHl();
-          clearHl = function () {};
-          var redrawn = await waitDashboardIdle(600, 12000);
-          console.log(
-            "[dash-shot] idle",
-            label,
-            redrawn ? "redraw" : "no-busy"
-          );
-          await sleep(350);
-
-          var el = target.el;
-          if (el && el.isConnected) {
-            var postRect =
-              typeof target.screenRect === "function"
-                ? target.screenRect()
-                : null;
-            clearHl = highlightClickTarget(
-              el,
-              label,
-              step + (act.needReturnCountry ? " ↓ регион" : " нажато"),
-              postRect
-            );
-            await sleep(250);
-          }
-
-          var shot = await takeScreenshot({
-            label: slug,
-            banner:
-              "Стр. " +
-              page.label +
-              " | " +
-              step +
-              (act.needReturnCountry ? " Провалились: " : " Нажато: ") +
-              label,
+          var regionName = regions[0].label;
+          setStatus("L1 " + regionName + " — baseline…");
+          await waitDashboardIdle(600, 10000);
+          var base1 = await takeScreenshot({
+            label: pageSlug + "__L1_00_baseline",
+            banner: "L1 область | " + regionName + " | baseline",
             quiet: true,
           });
-          clearHl();
-          clearHl = function () {};
-          totalClicks++;
-          logLines.push(
-            slug +
-              " | " +
-              (act.needReturnCountry ? "DRILL" : "CLICK") +
-              " " +
-              label +
-              " | kind=" +
-              target.kind +
-              " | png=" +
-              (shot && shot.png) +
-              " | pdf=" +
-              ((shot && shot.pdfs) || []).join(",")
-          );
+          logLines.push("L1 baseline | png=" + (base1 && base1.png));
 
-          // перед следующей областью — назад на страну (map-region-click.md)
-          if (act.needReturnCountry || target.kind === "geom") {
-            setStatus(page.label + " " + step + " → страна…");
-            await returnToCountryMap();
-            await sleep(400);
+          // ——— L1: кнопки → image ———
+          await runButtonsAndImages(1, regionName, pageSlug);
+
+          // ——— L1→L2: ещё ниже (ИМНС/район), ОСТАЁМСЯ ———
+          var root1 = captureRoot();
+          var deeps = collectClickTargets(root1, ["deep"], {
+            maxDeep: DEEP_DRILL_ONE,
+          });
+          logLines.push("L1 | провал глубже: " + deeps.length);
+          if (deeps.length) {
+            setStatus("L1 → провал глубже…");
+            await pokeTargets(deeps, {
+              level: 1,
+              levelName: regionName,
+              phase: "ГЛУБЖЕ",
+              pageSlug: pageSlug,
+              stayAfterDrill: true,
+            });
+
+            var deepName = deeps[0].label;
+            setStatus("L2 " + deepName + " — baseline…");
+            await waitDashboardIdle(600, 10000);
+            var base2 = await takeScreenshot({
+              label: pageSlug + "__L2_00_baseline",
+              banner: "L2 глубже | " + deepName + " | baseline",
+              quiet: true,
+            });
+            logLines.push("L2 baseline | png=" + (base2 && base2.png));
+
+            await runButtonsAndImages(2, deepName, pageSlug);
+          } else {
+            logLines.push("L1 | глубже не найдено — пропуск L2");
           }
+
+          setStatus("возврат на страну…");
+          logLines.push("→ returnToCountry");
+          await returnToCountryMap();
+          await sleep(500);
+        } else {
+          logLines.push("L0 | карта/область не найдена — без провала");
         }
       }
 
       var invName = "inventory_" + scanId + ".txt";
       var invBody =
-        "Инвентарь дашборда " +
-        scanId +
-        "\n\n" +
-        inventoryLines.join("\n") +
-        "\n";
+        "Инвентарь " + scanId + "\n\n" + inventoryLines.join("\n") + "\n";
       var logName = "buttons_scan_" + scanId + ".txt";
       var logBody =
-        "Скан кликов (LEAN) " +
+        "Скан по сценарию " +
         scanId +
         "\n" +
-        "Только: RegionMap области + ComboBox (≤2×3). Без ListBox/Button/Image.\n" +
+        "L0 кнопки→image→1 область → L1 кнопки→image→глубже → L2 кнопки→image → страна\n" +
         "Кликов: " +
         totalClicks +
         "\n\n" +
@@ -3122,14 +3275,7 @@
       } catch (e) {
         console.warn("[dash-shot] scan log", e);
       }
-      setStatus(
-        "скан готов: " +
-          pages.length +
-          " стр., " +
-          totalClicks +
-          " кликов | " +
-          logName
-      );
+      setStatus("сценарий готов: " + totalClicks + " кликов | " + logName);
       console.log("[dash-shot] inventory\n" + invBody);
       console.log("[dash-shot] scan log\n" + logBody);
     } catch (err) {
@@ -3168,7 +3314,7 @@
     scanBtn.type = "button";
     scanBtn.textContent = "Скан кликов";
     scanBtn.title =
-      "Lean: текущая страница → области карты + до 2 ComboBox×3 значения → скрин+PDF";
+      "Сценарий: кнопки → image/action → 1 область → кнопки/image → глубже → кнопки/image → страна";
     scanBtn.style.cssText = btnStyle;
     scanBtn.onclick = function () {
       scanButtons();
