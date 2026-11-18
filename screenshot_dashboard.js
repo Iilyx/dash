@@ -1024,16 +1024,112 @@
   }
 
   /**
-   * ComboBox/ListBox не трогаем: без оверлеев и без visibility:hidden —
-   * оставляем родной дизайн Stimulsoft.
+   * Живой ComboBox не меняем (без оверлеев/visibility).
+   * Только помечаем contentPanel data-атрибутом — текст дорисуем в onclone снимка.
    */
-  function bakeFilterValues() {
-    return function () {};
+  function markFilterLabels(root) {
+    var marked = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var host = nodes[i];
+      if (!isFilterHost(host)) continue;
+      var label = readFilterLabel(host);
+      if (!label) continue;
+      var panel = host.contentPanel || host;
+      var cs;
+      try {
+        cs = window.getComputedStyle(panel);
+      } catch (e) {
+        cs = null;
+      }
+      var color = (cs && cs.color) || "#222222";
+      if (
+        color === "rgb(255, 255, 255)" ||
+        color === "#ffffff" ||
+        color === "rgba(0, 0, 0, 0)"
+      )
+        color = "#222222";
+      var font = (cs && cs.font) || "12px sans-serif";
+      var bg = (cs && cs.backgroundColor) || "";
+      if (!bg || bg === "transparent" || bg === "rgba(0, 0, 0, 0)") bg = "";
+      try {
+        panel.setAttribute("data-dash-filter-label", label);
+        panel.setAttribute("data-dash-filter-color", color);
+        panel.setAttribute("data-dash-filter-font", font);
+        if (bg) panel.setAttribute("data-dash-filter-bg", bg);
+        marked.push(panel);
+      } catch (e) {}
+      console.log("[dash-shot] mark filter", attrName(host), label);
+    }
+    return function restore() {
+      for (var m = 0; m < marked.length; m++) {
+        try {
+          marked[m].removeAttribute("data-dash-filter-label");
+          marked[m].removeAttribute("data-dash-filter-color");
+          marked[m].removeAttribute("data-dash-filter-font");
+          marked[m].removeAttribute("data-dash-filter-bg");
+        } catch (e) {}
+      }
+    };
+  }
+
+  /** В клоне html2canvas: подпись ComboBox; фон/шрифт с контрола, без белой заливки. */
+  function onClonePaintFilterLabels(doc) {
+    try {
+      var panels = doc.querySelectorAll("[data-dash-filter-label]");
+      for (var i = 0; i < panels.length; i++) {
+        var panel = panels[i];
+        var label = panel.getAttribute("data-dash-filter-label") || "";
+        if (!label) continue;
+        var color = panel.getAttribute("data-dash-filter-color") || "#222222";
+        var font = panel.getAttribute("data-dash-filter-font") || "12px sans-serif";
+        var bg = panel.getAttribute("data-dash-filter-bg") || "transparent";
+        try {
+          var texts = panel.querySelectorAll("text, tspan");
+          for (var t = 0; t < texts.length; t++) {
+            if (!texts[t].getAttribute("fill") || texts[t].getAttribute("fill") === "none")
+              texts[t].setAttribute("fill", color);
+          }
+        } catch (e) {}
+        var pos = "static";
+        try {
+          pos = doc.defaultView
+            ? doc.defaultView.getComputedStyle(panel).position
+            : "static";
+        } catch (e) {}
+        if (pos === "static") panel.style.position = "relative";
+        var tip = panel.querySelector("[data-dash-filter-tip]");
+        if (tip && tip.parentNode) tip.parentNode.removeChild(tip);
+        var div = doc.createElement("div");
+        div.setAttribute("data-dash-filter-tip", "1");
+        div.textContent = label;
+        div.style.cssText = [
+          "position:absolute",
+          "left:0",
+          "top:0",
+          "right:0",
+          "bottom:0",
+          "box-sizing:border-box",
+          "display:flex",
+          "align-items:center",
+          "padding:0 28px 0 8px",
+          "overflow:hidden",
+          "white-space:nowrap",
+          "background:" + bg,
+          "color:" + color,
+          "font:" + font,
+          "z-index:6",
+          "pointer-events:none",
+        ].join(";");
+        panel.appendChild(div);
+      }
+    } catch (e) {
+      console.warn("[dash-shot] onclone filter labels", e);
+    }
   }
 
   function onCloneFixFormValues(doc) {
     try {
-      // только синхронизация value у input — без подмены select/ComboBox белым блоком
       var inputs = doc.querySelectorAll("input, textarea");
       for (var j = 0; j < inputs.length; j++) {
         var inp = inputs[j];
@@ -1042,6 +1138,7 @@
           if (inp.tagName === "TEXTAREA") inp.textContent = inp.value || "";
         } catch (e) {}
       }
+      onClonePaintFilterLabels(doc);
     } catch (e) {
       console.warn("[dash-shot] onclone values", e);
     }
@@ -1064,8 +1161,8 @@
 
       setStatus("карты из iframe…");
       restoreMaps = (await bakeMaps(root, report)) || function () {};
-      // ComboBox не печём — дизайн как в viewer
-      restoreFilters = bakeFilterValues() || function () {};
+      // живой ComboBox не перекрашиваем — только метка для текста в клоне снимка
+      restoreFilters = markFilterLabels(root) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
