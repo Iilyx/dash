@@ -1023,215 +1023,163 @@
     return String(label || "").trim();
   }
 
-  /** Stimulsoft Color / строка → CSS. Transparent → "". */
-  function stiColorToCss(c) {
-    if (c == null || c === "") return "";
-    if (typeof c === "string") {
-      if (/^transparent$/i.test(c.trim())) return "";
-      return c;
-    }
-    try {
-      var Helper =
-        window.Stimulsoft &&
-        Stimulsoft.Report &&
-        Stimulsoft.Report.Helpers &&
-        Stimulsoft.Report.Helpers.StiReportHelper;
-      if (Helper && typeof Helper.getHtmlColor === "function") {
-        var html = Helper.getHtmlColor(c);
-        if (html && !/^transparent$/i.test(String(html))) return String(html);
-        return "";
-      }
-    } catch (e) {}
-    try {
-      if (c.r != null && c.g != null && c.b != null) {
-        var a = c.a != null ? Number(c.a) : 255;
-        if (a === 0) return "";
-        if (a < 255) return "rgba(" + c.r + "," + c.g + "," + c.b + "," + a / 255 + ")";
-        return "rgb(" + c.r + "," + c.g + "," + c.b + ")";
-      }
-    } catch (e) {}
-    try {
-      var s = String(c);
-      if (s && /#|[rgb(]/i.test(s) && !/transparent/i.test(s)) return s;
-    } catch (e) {}
-    return "";
-  }
-
   /**
-   * Цвет подписи ComboBox = ForeColor (как в элементе).
-   * Viewer кладёт его в contentAttributes.settings.foreColor / elementAttributes.foreColor.
+   * html2canvas плохо рисует Stimulsoft ComboBox caption.
+   * Печём текст фильтра поверх contentPanel.
    */
-  function readFilterTextStyle(host) {
-    var color = "";
-    var font = "";
-    var bg = "";
-    var attrs = host.elementAttributes || {};
-    var ca = attrs.contentAttributes || {};
-    var settings = ca.settings || {};
+  function bakeFilterValues(root) {
+    var restorers = [];
+    var hosts = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      if (isFilterHost(nodes[i])) hosts.push(nodes[i]);
+    }
+    var selects = root.querySelectorAll("select");
+    console.log("[dash-shot] filter hosts", hosts.length, "selects", selects.length);
 
-    // 1) ForeColor, который реально красит SmallButton (CreateComboBoxElementContent)
-    color =
-      stiColorToCss(settings.foreColor) ||
-      stiColorToCss(settings.ForeColor) ||
-      stiColorToCss(attrs.foreColor) ||
-      stiColorToCss(attrs.ForeColor) ||
-      stiColorToCss(attrs.actionColors && attrs.actionColors.foreColor) ||
-      "";
-
-    // 2) с компонента отчёта по имени
-    if (!color) {
+    function placeLabel(target, text, host) {
+      if (!text || !target) return;
+      var ir = target.getBoundingClientRect();
+      var hr = host.getBoundingClientRect();
+      if (ir.width < 2 || ir.height < 2) return;
+      if (getComputedStyle(host).position === "static") {
+        restorers.push({ el: host, position: host.style.position });
+        host.style.position = "relative";
+      }
+      var div = document.createElement("div");
+      div.setAttribute("data-sti-filter-bake", "1");
+      div.textContent = text;
+      var cs = window.getComputedStyle(target);
+      var bg = cs.backgroundColor;
+      if (!bg || bg === "rgba(0, 0, 0, 0)" || bg === "transparent") bg = "#ffffff";
+      var color = cs.color || "#111111";
+      // если текст почти белый на белом — форсим тёмный
+      if (color === "rgb(255, 255, 255)" || color === "#ffffff") color = "#111111";
+      div.style.cssText = [
+        "position:absolute",
+        "left:" + Math.round(ir.left - hr.left) + "px",
+        "top:" + Math.round(ir.top - hr.top) + "px",
+        "width:" + Math.round(ir.width) + "px",
+        "height:" + Math.round(ir.height) + "px",
+        "box-sizing:border-box",
+        "display:flex",
+        "align-items:center",
+        "padding:0 8px",
+        "overflow:hidden",
+        "white-space:nowrap",
+        "background:" + bg,
+        "color:" + color,
+        "font:" + (cs.font || "12px sans-serif"),
+        "border-radius:" + (cs.borderRadius || "0"),
+        "z-index:5",
+        "pointer-events:none",
+      ].join(";");
+      host.appendChild(div);
+      restorers.push({ div: div });
+      // не visibility:hidden на весь contentPanel — только прячем детей-кнопок
       try {
-        var report = findReport();
-        var name = attrName(host);
-        if (report && name) {
-          var comps = collectAll(report);
-          for (var c = 0; c < comps.length; c++) {
-            var el = comps[c];
-            if (!el || el.name !== name) continue;
-            color =
-              stiColorToCss(el.foreColor) ||
-              stiColorToCss(el.ForeColor) ||
-              "";
-            if (!font && el.font) {
-              try {
-                font =
-                  (el.font.size != null ? el.font.size + "pt " : "") +
-                  (el.font.name || "Arial");
-                if (el.font.bold) font = "bold " + font;
-              } catch (e) {}
-            }
-            break;
+        for (var c = 0; c < target.childNodes.length; c++) {
+          var ch = target.childNodes[c];
+          if (ch && ch.nodeType === 1 && ch.getAttribute("data-sti-filter-bake") !== "1") {
+            restorers.push({ el: ch, visibility: ch.style.visibility });
+            ch.style.visibility = "hidden";
           }
         }
       } catch (e) {}
     }
 
-    // 3) шрифт из elementAttributes.font (ApplyAttributesToObject)
-    if (!font && attrs.font) {
-      try {
-        font =
-          (attrs.font.size != null ? attrs.font.size + "pt " : "") +
-          (attrs.font.name || "Arial");
-        if (attrs.font.bold) font = "bold " + font;
-      } catch (e) {}
-    }
-
-    bg =
-      stiColorToCss(settings.backColor) ||
-      stiColorToCss(attrs.backColor) ||
-      stiColorToCss(attrs.BackColor) ||
-      "";
-
-    // 4) только если ForeColor пустой — цвет с кнопки/caption (как нарисовано)
-    if (!color) {
-      try {
-        var cp = host.contentPanel;
-        var btn = cp && cp.childNodes && cp.childNodes[0];
-        var sample = (btn && btn.caption) || btn || cp || host;
-        var cs = window.getComputedStyle(sample);
-        if (cs && cs.color) color = cs.color;
-        if (!font && cs && cs.font) font = cs.font;
-        if (!bg && cs && cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)")
-          bg = cs.backgroundColor;
-      } catch (e) {}
-    }
-
-    console.log("[dash-shot] filter ForeColor", attrName(host), color, settings.foreColor || attrs.foreColor);
-    return { color: color, font: font, bg: bg };
-  }
-
-  /**
-   * Живой ComboBox не меняем.
-   * Метка для onclone: текст + цвет/шрифт как заданы в контроле.
-   */
-  function markFilterLabels(root) {
-    var marked = [];
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      var host = nodes[i];
-      if (!isFilterHost(host)) continue;
+    for (var h = 0; h < hosts.length; h++) {
+      var host = hosts[h];
       var label = readFilterLabel(host);
-      if (!label) continue;
-      var panel = host.contentPanel || host;
-      var st = readFilterTextStyle(host);
-      try {
-        panel.setAttribute("data-dash-filter-label", label);
-        if (st.color) panel.setAttribute("data-dash-filter-color", st.color);
-        if (st.font) panel.setAttribute("data-dash-filter-font", st.font);
-        if (st.bg) panel.setAttribute("data-dash-filter-bg", st.bg);
-        marked.push(panel);
-      } catch (e) {}
-      console.log("[dash-shot] mark filter", attrName(host), label, st.color);
-    }
-    return function restore() {
-      for (var m = 0; m < marked.length; m++) {
-        try {
-          marked[m].removeAttribute("data-dash-filter-label");
-          marked[m].removeAttribute("data-dash-filter-color");
-          marked[m].removeAttribute("data-dash-filter-font");
-          marked[m].removeAttribute("data-dash-filter-bg");
-        } catch (e) {}
-      }
-    };
-  }
-
-  /** В клоне: подпись ComboBox цветом/шрифтом контрола. */
-  function onClonePaintFilterLabels(doc) {
-    try {
-      var panels = doc.querySelectorAll("[data-dash-filter-label]");
-      for (var i = 0; i < panels.length; i++) {
-        var panel = panels[i];
-        var label = panel.getAttribute("data-dash-filter-label") || "";
-        if (!label) continue;
-        var color = panel.getAttribute("data-dash-filter-color") || "";
-        var font = panel.getAttribute("data-dash-filter-font") || "";
-        var bg = panel.getAttribute("data-dash-filter-bg") || "transparent";
-        try {
-          var texts = panel.querySelectorAll("text, tspan");
-          for (var t = 0; t < texts.length; t++) {
-            if (color) texts[t].setAttribute("fill", color);
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      console.log("[dash-shot] filter", {
+        name: attrName(host),
+        type: attrType(host),
+        label: label,
+        selectionMode: ca && ca.selectionMode,
+        filters: ca && ca.filters,
+        items: ca && ca.items && ca.items.length,
+        hasContentPanel: !!host.contentPanel,
+        captionProbe: (function () {
+          try {
+            var cp = host.contentPanel;
+            if (!cp || !cp.childNodes.length) return null;
+            var b = cp.childNodes[0];
+            return b && b.caption
+              ? String(b.caption.innerText || "").slice(0, 80)
+              : String(cp.innerText || "").slice(0, 80);
+          } catch (e) {
+            return String(e);
           }
-        } catch (e) {}
-        var pos = "static";
-        try {
-          pos = doc.defaultView
-            ? doc.defaultView.getComputedStyle(panel).position
-            : "static";
-        } catch (e) {}
-        if (pos === "static") panel.style.position = "relative";
-        var tip = panel.querySelector("[data-dash-filter-tip]");
-        if (tip && tip.parentNode) tip.parentNode.removeChild(tip);
-        var div = doc.createElement("div");
-        div.setAttribute("data-dash-filter-tip", "1");
-        div.textContent = label;
-        var css = [
-          "position:absolute",
-          "left:0",
-          "top:0",
-          "right:0",
-          "bottom:0",
-          "box-sizing:border-box",
-          "display:flex",
-          "align-items:center",
-          "padding:0 28px 0 8px",
-          "overflow:hidden",
-          "white-space:nowrap",
-          "background:" + bg,
-          "z-index:6",
-          "pointer-events:none",
-        ];
-        if (color) css.push("color:" + color);
-        if (font) css.push("font:" + font);
-        div.style.cssText = css.join(";");
-        panel.appendChild(div);
+        })(),
+      });
+      if (!label) continue;
+      var paintTarget = host.contentPanel || host;
+      // не красить поверх title
+      if (host.titlePanel && paintTarget === host) {
+        paintTarget = host.contentPanel || host;
       }
-    } catch (e) {
-      console.warn("[dash-shot] onclone filter labels", e);
+      placeLabel(paintTarget, label, host);
     }
+
+    for (var s = 0; s < selects.length; s++) {
+      var sel = selects[s];
+      if (sel.closest && hosts.some(function (hh) { return hh.contains(sel); }))
+        continue;
+      var text = "";
+      if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+        text =
+          sel.options[sel.selectedIndex].textContent ||
+          sel.options[sel.selectedIndex].text ||
+          "";
+      }
+      if (!text) continue;
+      var parent = sel.parentElement || root;
+      placeLabel(sel, text, parent);
+    }
+
+    return function restore() {
+      restorers.forEach(function (x) {
+        try {
+          if (x.div && x.div.parentNode) x.div.parentNode.removeChild(x.div);
+        } catch (e) {}
+        try {
+          if (x.el && x.visibility != null) x.el.style.visibility = x.visibility;
+        } catch (e) {}
+        try {
+          if (x.el && x.position != null) x.el.style.position = x.position;
+        } catch (e) {}
+      });
+    };
   }
 
   function onCloneFixFormValues(doc) {
     try {
+      var selects = doc.querySelectorAll("select");
+      for (var i = 0; i < selects.length; i++) {
+        var sel = selects[i];
+        if (sel.getAttribute("data-sti-filter-bake")) continue;
+        var text = "";
+        if (sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+          text =
+            sel.options[sel.selectedIndex].textContent ||
+            sel.options[sel.selectedIndex].text ||
+            "";
+        }
+        if (!text) continue;
+        var div = doc.createElement("div");
+        div.textContent = text;
+        div.setAttribute("style", sel.getAttribute("style") || "");
+        div.style.display = "flex";
+        div.style.alignItems = "center";
+        div.style.paddingLeft = "8px";
+        div.style.overflow = "hidden";
+        div.style.whiteSpace = "nowrap";
+        div.style.background = "#fff";
+        div.style.color = "#111";
+        if (sel.parentNode) sel.parentNode.replaceChild(div, sel);
+      }
       var inputs = doc.querySelectorAll("input, textarea");
       for (var j = 0; j < inputs.length; j++) {
         var inp = inputs[j];
@@ -1240,9 +1188,8 @@
           if (inp.tagName === "TEXTAREA") inp.textContent = inp.value || "";
         } catch (e) {}
       }
-      onClonePaintFilterLabels(doc);
     } catch (e) {
-      console.warn("[dash-shot] onclone values", e);
+      console.warn("[dash-shot] onclone filters", e);
     }
   }
 
@@ -1263,8 +1210,9 @@
 
       setStatus("карты из iframe…");
       restoreMaps = (await bakeMaps(root, report)) || function () {};
-      // живой ComboBox не перекрашиваем — только метка для текста в клоне снимка
-      restoreFilters = markFilterLabels(root) || function () {};
+
+      setStatus("фильтры…");
+      restoreFilters = bakeFilterValues(root) || function () {};
 
       await new Promise(function (res) {
         requestAnimationFrame(function () {
