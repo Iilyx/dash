@@ -1400,6 +1400,191 @@
     return out;
   }
 
+  /**
+   * Яркая рамка + плашка «КЛИК → …».
+   * Fixed — видно вживую; inset на host — попадает в html2canvas скрин.
+   */
+  function highlightClickTarget(host, label, stepText) {
+    clearClickHighlight();
+    if (!host) return function () {};
+    try {
+      host.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+    } catch (e) {
+      try {
+        host.scrollIntoView(true);
+      } catch (e2) {}
+    }
+    var r = host.getBoundingClientRect();
+    var pad = 6;
+    var caption =
+      (stepText ? stepText + " " : "") + "КЛИК → " + (label || "?");
+    if (!document.getElementById("dashShotPulseStyle")) {
+      var st = document.createElement("style");
+      st.id = "dashShotPulseStyle";
+      st.textContent =
+        "@keyframes dashShotPulse{from{opacity:1}to{opacity:.55}}";
+      document.head.appendChild(st);
+    }
+
+    // live overlay (вне root — только для глаз)
+    var ring = document.createElement("div");
+    ring.id = "dashShotClickRing";
+    ring.setAttribute("data-dash-shot-hl", "1");
+    ring.style.cssText = [
+      "position:fixed",
+      "left:" + Math.round(r.left - pad) + "px",
+      "top:" + Math.round(r.top - pad) + "px",
+      "width:" + Math.round(r.width + pad * 2) + "px",
+      "height:" + Math.round(r.height + pad * 2) + "px",
+      "box-sizing:border-box",
+      "border:4px solid #ef4444",
+      "border-radius:8px",
+      "background:rgba(239,68,68,0.18)",
+      "box-shadow:0 0 0 3px #fff,0 0 0 6px #ef4444,0 8px 24px rgba(0,0,0,.35)",
+      "z-index:2147483645",
+      "pointer-events:none",
+      "animation:dashShotPulse 0.7s ease-in-out infinite alternate",
+    ].join(";");
+    var tag = document.createElement("div");
+    tag.id = "dashShotClickTag";
+    tag.setAttribute("data-dash-shot-hl", "1");
+    tag.textContent = caption;
+    var tagTop = Math.max(8, Math.round(r.top - pad - 36));
+    if (r.top < 48) tagTop = Math.round(r.bottom + pad + 8);
+    tag.style.cssText = [
+      "position:fixed",
+      "left:" + Math.round(r.left - pad) + "px",
+      "top:" + tagTop + "px",
+      "max-width:min(480px,90vw)",
+      "padding:8px 12px",
+      "background:#ef4444",
+      "color:#fff",
+      "font:bold 14px/1.2 ui-sans-serif,system-ui,sans-serif",
+      "border-radius:6px",
+      "box-shadow:0 4px 16px rgba(0,0,0,.35)",
+      "z-index:2147483645",
+      "pointer-events:none",
+      "white-space:nowrap",
+      "overflow:hidden",
+      "text-overflow:ellipsis",
+    ].join(";");
+    document.body.appendChild(ring);
+    document.body.appendChild(tag);
+
+    // inset на host — попадёт в скриншот root
+    var prevPos = host.style.position;
+    if (getComputedStyle(host).position === "static") {
+      host.style.position = "relative";
+      host.setAttribute("data-dash-shot-pos", prevPos == null ? "" : prevPos);
+    }
+    var inset = document.createElement("div");
+    inset.id = "dashShotClickInset";
+    inset.setAttribute("data-dash-shot-hl", "1");
+    inset.style.cssText = [
+      "position:absolute",
+      "left:-4px",
+      "top:-4px",
+      "right:-4px",
+      "bottom:-4px",
+      "box-sizing:border-box",
+      "border:4px solid #ef4444",
+      "border-radius:6px",
+      "background:rgba(239,68,68,0.22)",
+      "box-shadow:inset 0 0 0 2px #fff",
+      "z-index:9999",
+      "pointer-events:none",
+    ].join(";");
+    var insetTag = document.createElement("div");
+    insetTag.id = "dashShotClickInsetTag";
+    insetTag.setAttribute("data-dash-shot-hl", "1");
+    insetTag.textContent = caption;
+    insetTag.style.cssText = [
+      "position:absolute",
+      "left:0",
+      "top:-28px",
+      "padding:4px 8px",
+      "background:#ef4444",
+      "color:#fff",
+      "font:bold 12px/1.2 ui-sans-serif,system-ui,sans-serif",
+      "border-radius:4px",
+      "white-space:nowrap",
+      "z-index:10000",
+      "pointer-events:none",
+      "max-width:280px",
+      "overflow:hidden",
+      "text-overflow:ellipsis",
+    ].join(";");
+    host.appendChild(inset);
+    host.appendChild(insetTag);
+
+    return clearClickHighlight;
+  }
+
+  function clearClickHighlight() {
+    [
+      "dashShotClickRing",
+      "dashShotClickTag",
+      "dashShotClickInset",
+      "dashShotClickInsetTag",
+    ].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    });
+    try {
+      var marked = document.querySelectorAll("[data-dash-shot-pos]");
+      for (var i = 0; i < marked.length; i++) {
+        var h = marked[i];
+        h.style.position = h.getAttribute("data-dash-shot-pos") || "";
+        h.removeAttribute("data-dash-shot-pos");
+      }
+    } catch (e) {}
+  }
+
+  /** Реалистичный клик по центру (Stimulsoft часто слушает mousedown на child). */
+  function clickDashButton(host) {
+    var target =
+      (host.contentPanel && host.contentPanel.firstElementChild) ||
+      host.querySelector("svg, button, [role=button], canvas") ||
+      host;
+    var r = target.getBoundingClientRect();
+    var x = r.left + r.width / 2;
+    var y = r.top + r.height / 2;
+    var opts = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+    };
+    try {
+      target.dispatchEvent(new PointerEvent("pointerdown", opts));
+    } catch (e) {}
+    try {
+      target.dispatchEvent(new MouseEvent("mousedown", opts));
+    } catch (e) {}
+    try {
+      target.dispatchEvent(new PointerEvent("pointerup", opts));
+    } catch (e) {}
+    try {
+      target.dispatchEvent(new MouseEvent("mouseup", opts));
+    } catch (e) {}
+    try {
+      target.dispatchEvent(new MouseEvent("click", opts));
+    } catch (e) {}
+    try {
+      if (typeof target.click === "function") target.click();
+    } catch (e) {}
+    try {
+      if (target !== host && typeof host.click === "function") host.click();
+    } catch (e) {}
+    console.log("[dash-shot] clicked at", Math.round(x), Math.round(y), {
+      name: attrName(host),
+      label: buttonLabel(host),
+      targetTag: target && target.tagName,
+    });
+  }
+
   /** Клик по каждой кнопке → скрин+PDF с меткой «Нажато: …». */
   async function scanButtons() {
     var root = captureRoot();
@@ -1414,6 +1599,7 @@
 
     var logLines = [];
     var scanId = stamp();
+    var clearHl = function () {};
     try {
       await loadScript(HTML2CANVAS);
       var buttons = collectDashButtons(root);
@@ -1421,6 +1607,16 @@
         setStatus("кнопок не найдено");
         return;
       }
+
+      // список найденных — в статус и в лог
+      var foundList = buttons
+        .map(function (b, idx) {
+          return idx + 1 + ") " + buttonLabel(b);
+        })
+        .join("; ");
+      console.log("[dash-shot] scan targets:", foundList);
+      setStatus("найдено " + buttons.length + ": " + foundList);
+      await sleep(900);
 
       // 0) исходное состояние
       setStatus("0/" + buttons.length + " исходное…");
@@ -1435,36 +1631,50 @@
           " | pdf=" +
           ((base && base.pdfs) || []).join(",")
       );
+      logLines.push("targets: " + foundList);
 
       for (var i = 0; i < buttons.length; i++) {
         var host = buttons[i];
         var label = buttonLabel(host);
+        var step = i + 1 + "/" + buttons.length;
         var slug =
           String(i + 1).padStart(2, "0") + "_" + safeSlug(label);
-        setStatus(i + 1 + "/" + buttons.length + " клик: " + label);
-        console.log("[dash-shot] click button", slug, label);
+        setStatus(step + " подсветка: " + label);
+        clearHl = highlightClickTarget(host, label, step);
+        // пауза: видно куда кликнет
+        await sleep(1200);
 
+        setStatus(step + " клик: " + label);
+        console.log("[dash-shot] click button", slug, label);
         try {
-          host.click();
+          clickDashButton(host);
         } catch (e) {
           console.warn("[dash-shot] click failed", label, e);
           logLines.push(slug + " | CLICK FAIL " + label);
+          clearHl();
+          clearHl = function () {};
           continue;
         }
 
-        // ждём ApplyFilters / перерисовку дашборда
+        // ждём ApplyFilters / перерисовку; подсветку держим
+        setStatus(step + " ждём: " + label);
         await sleep(2200);
         await new Promise(function (res) {
           requestAnimationFrame(function () {
             setTimeout(res, 200);
           });
         });
+        // обновить рамку после возможного сдвига layout
+        clearHl = highlightClickTarget(host, label, step + " нажато");
+        await sleep(400);
 
         var shot = await takeScreenshot({
           label: slug,
-          banner: "Нажато: " + label,
+          banner: step + " Нажато: " + label,
           quiet: true,
         });
+        clearHl();
+        clearHl = function () {};
         logLines.push(
           slug +
             " | Нажато: " +
@@ -1500,6 +1710,10 @@
       console.error(err);
       setStatus(String((err && err.message) || err));
     } finally {
+      try {
+        clearHl();
+      } catch (e) {}
+      clearClickHighlight();
       if (btn) btn.disabled = false;
       if (scanBtn) scanBtn.disabled = false;
     }
