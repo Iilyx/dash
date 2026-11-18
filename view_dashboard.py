@@ -211,6 +211,31 @@ def screenshot_dashboard_js():
     return resp
 
 
+def build_interactive_plan() -> dict:
+    """План кликов из .mrt (filters/maps/buttons/OnClick)."""
+    try:
+        from interactive_mrt import extract_interactive
+
+        return extract_interactive(MRT_PATH)
+    except Exception as exc:
+        return {"mrt": str(MRT_PATH.name), "error": str(exc), "pages": [], "items": [], "counts": {}}
+
+
+@app.get("/api/interactive")
+def api_interactive():
+    """Интерактивные элементы .mrt для «Скан кликов»."""
+    plan = build_interactive_plan()
+    # кэш на диск — удобно смотреть глазами
+    try:
+        out = ROOT / "interactive.json"
+        out.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    resp = jsonify(plan)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.post("/api/screenshot")
 def api_screenshot():
     """Сохраняет PNG/CSV (и др.) из viewer в EXPORT_DIR."""

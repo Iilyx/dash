@@ -1414,9 +1414,9 @@
     }
   }
 
-  var LIST_CLICK_CAP = 8; // макс. пунктов ListBox
-  var COMBO_CLICK_CAP = 10; // макс. значений ComboBox
-  var DRILL_CLICK_CAP = 8; // макс. проваливаний в карту
+  var LIST_CLICK_CAP = 5; // макс. пунктов ListBox на один фильтр из плана
+  var COMBO_CLICK_CAP = 5; // макс. значений ComboBox на один фильтр из плана
+  var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ)
   /** Коды областей РБ из map-region-click.md */
   var MAP_REGION_ALIASES = [
     { label: "Брестская", codes: ["brestskaia", "brest", "by-br", "брест"] },
@@ -2267,102 +2267,201 @@
     return collectMapRegionGeoms(host);
   }
 
+  async function fetchInteractivePlan() {
+    try {
+      var res = await fetch("/api/interactive", { cache: "no-store" });
+      if (!res.ok) throw new Error(String(res.status));
+      var plan = await res.json();
+      console.log("[dash-shot] MRT interactive plan", plan.counts, plan.items && plan.items.length);
+      return plan;
+    } catch (e) {
+      console.warn("[dash-shot] /api/interactive", e);
+      return null;
+    }
+  }
+
+  /** Живой отчёт Stimulsoft — имена/типы, если в .mrt Ident был пустой. */
+  function planFromReport() {
+    var report = findReport();
+    if (!report) return [];
+    var items = [];
+    var comps = collectAll(report);
+    for (var i = 0; i < comps.length; i++) {
+      var c = comps[i];
+      if (!c) continue;
+      var tn = typeName(c) || "";
+      var name = c.name || "";
+      var kind = null;
+      if (/RegionMap/i.test(tn)) kind = "map";
+      else if (/ComboBox|TreeViewBox/i.test(tn)) kind = "filter_combo";
+      else if (/ListBox|TreeViewElement|DatePicker|NumberBox/i.test(tn))
+        kind = "filter_list";
+      else if (/ButtonElement/i.test(tn)) kind = "button";
+      else if (/ImageElement/i.test(tn) || /TextElement/i.test(tn)) {
+        try {
+          var di = c.dashboardInteraction || c.interaction;
+          var oc = di && (di.onClick || di.OnClick);
+          if (oc && String(oc) !== "None" && String(oc) !== "OpenHyperlink")
+            kind = /Image/i.test(tn) ? "image" : "text";
+        } catch (e) {}
+      }
+      if (!kind) continue;
+      items.push({
+        kind: kind,
+        type: tn,
+        name: name || null,
+        title: null,
+        actions:
+          kind === "map"
+            ? ["region_drill"]
+            : kind === "filter_combo"
+              ? ["combo_pick"]
+              : kind === "filter_list"
+                ? ["list_pick"]
+                : ["click"],
+      });
+    }
+    console.log("[dash-shot] report plan", items.length, items);
+    return items;
+  }
+
+  function findDomByPlanItem(root, item) {
+    var nodes = root.querySelectorAll("*");
+    var wantName = item.name || item.alias || item.title;
+    var wantType = item.type || "";
+    var kind = item.kind;
+    var candidates = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = attrType(el);
+      if (!t) continue;
+      var ok = false;
+      if (kind === "map" && /RegionMap/i.test(t)) ok = true;
+      else if (kind === "filter_combo" && /ComboBox|TreeViewBox/i.test(t)) ok = true;
+      else if (
+        kind === "filter_list" &&
+        /ListBox|TreeViewElement|DatePicker|NumberBox/i.test(t)
+      )
+        ok = true;
+      else if (kind === "button" && /ButtonElement/i.test(t)) ok = true;
+      else if (kind === "image" && /ImageElement/i.test(t)) ok = true;
+      else if (kind === "text" && /TextElement/i.test(t)) ok = true;
+      else if (kind === "chart" && /ChartElement/i.test(t)) ok = true;
+      if (!ok) continue;
+      if (wantType && t !== wantType && t.indexOf(wantType.replace(/^Sti/, "")) < 0) {
+        // type mismatch soft — still ok if kind matched
+      }
+      var n = attrName(el);
+      if (wantName && n && n === wantName) return el;
+      candidates.push(el);
+    }
+    // по имени среди кандидатов
+    if (wantName) {
+      for (var c = 0; c < candidates.length; c++) {
+        if (attrName(candidates[c]) === wantName) return candidates[c];
+      }
+    }
+    return candidates[0] || null;
+  }
+
   /**
-   * Цели: ComboBox (открытие меню), ListBox (лимит), Button,
-   * Image interaction, RegionMap/Chart только DrillDown/ShowDashboard.
+   * Цели только из плана MRT/report — не кликаем всё подряд в DOM.
    */
-  function collectClickTargets(root) {
+  function collectClickTargets(root, planItems) {
     var out = [];
     var seen = [];
     function add(t) {
       if (!t || !t.el) return;
       var key = t.kind + "|" + t.label;
       if (seen.indexOf(key) >= 0) return;
-      // combo/geom могут подсвечивать host даже если «лицо» мелкое
       if (t.kind !== "combo" && t.kind !== "geom" && !isVisibleBox(t.el)) return;
       seen.push(key);
       out.push(t);
     }
 
-    var nodes = root.querySelectorAll("*");
-
-    // 1) ComboBox — сначала (открытие меню + выбор), лимит значений
-    for (var cbi = 0; cbi < nodes.length; cbi++) {
-      var combo = nodes[cbi];
-      if (!isComboHost(combo)) continue;
-      if (!isVisibleBox(combo)) continue;
-      var cname = attrName(combo) || "Combo";
-      var ca =
-        combo.elementAttributes && combo.elementAttributes.contentAttributes;
-      var items = (ca && ca.items) || [];
-      var useItems = items.slice(0, COMBO_CLICK_CAP);
-      if (!useItems.length && ca && ca.showAllValue) {
-        useItems = [{ value: null, label: "All", isAllValue: true }];
-      }
-      for (var ui = 0; ui < useItems.length; ui++) {
-        (function (hst, it, fname) {
-          var lab = listItemLabel(it);
-          var spec = {
-            value: it.value,
-            label: it.label != null ? it.label : lab,
-            isAllValue: !!it.isAllValue,
-          };
-          add({
-            kind: "combo",
-            host: hst,
-            item: spec,
-            el: hst,
-            label: fname + ": " + lab,
-            activate: function () {
-              return activateComboValue(hst, spec);
-            },
-          });
-        })(combo, useItems[ui], cname);
-      }
+    var items = planItems || [];
+    if (!items.length) {
+      console.warn("[dash-shot] empty plan — no clicks");
+      return out;
     }
 
-    // 2) ListBox — лимит, без дублей «лишних»
-    for (var i = 0; i < nodes.length; i++) {
-      var host = nodes[i];
-      if (!isListBoxHost(host)) continue;
-      var filterName = attrName(host) || "List";
-      var panel =
-        host.itemsPanel ||
-        (host.contentPanel &&
-          host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
-        host.contentPanel;
-      var listAdded = 0;
-      var pools = [];
-      if (panel) pools.push(panel);
-      if (host.contentPanel && host.contentPanel.horTable) {
-        try {
-          var cells = host.contentPanel.horTable.querySelectorAll("td");
-          for (var c = 0; c < cells.length && listAdded < LIST_CLICK_CAP; c++) {
-            var child = cells[c].firstElementChild || cells[c];
-            if (typeof child.action !== "function" && child.value == null && child.label == null)
-              continue;
-            (function (it, hst, fname) {
-              add({
-                kind: "listbox",
-                host: hst,
-                item: it,
-                el: it.button || it,
-                label: fname + ": " + listItemLabel(it),
-                activate: function () {
-                  return activateListItem(it, hst);
-                },
-              });
-            })(child, host, filterName);
-            listAdded++;
-          }
-        } catch (e) {}
+    // дедуп DOM hosts по kind+name
+    var usedHosts = [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var host = findDomByPlanItem(root, item);
+      if (!host || usedHosts.indexOf(host) >= 0) continue;
+      usedHosts.push(host);
+      var labelBase =
+        item.name || item.title || item.alias || attrName(host) || item.kind;
+
+      if (item.kind === "map" || (item.actions || []).indexOf("region_drill") >= 0) {
+        var regions = pickRegionGeoms(host);
+        for (var r = 0; r < regions.length; r++) {
+          (function (hst, reg, fname) {
+            add({
+              kind: "geom",
+              host: hst,
+              el: hst,
+              label: fname + " ↓ " + reg.label,
+              needReturnCountry: true,
+              activate: function () {
+                return activateGeom(hst, reg.geom);
+              },
+            });
+          })(host, regions[r], labelBase);
+        }
+        continue;
       }
-      for (var p = 0; p < pools.length; p++) {
-        var kids = pools[p].childNodes || [];
+
+      if (item.kind === "filter_combo" || (item.actions || []).indexOf("combo_pick") >= 0) {
+        var ca =
+          host.elementAttributes && host.elementAttributes.contentAttributes;
+        var rawItems = (ca && ca.items) || [];
+        var picked = 0;
+        for (var ui = 0; ui < rawItems.length && picked < COMBO_CLICK_CAP; ui++) {
+          var it = rawItems[ui];
+          if (!it || it.isAllValue) continue;
+          var lab = listItemLabel(it);
+          if (!lab || /^all$/i.test(lab)) continue;
+          (function (hst, spec, fname, lab2) {
+            add({
+              kind: "combo",
+              host: hst,
+              item: spec,
+              el: hst,
+              label: fname + ": " + lab2,
+              activate: function () {
+                return activateComboValue(hst, spec);
+              },
+            });
+          })(
+            host,
+            {
+              value: it.value,
+              label: it.label != null ? it.label : lab,
+              isAllValue: false,
+            },
+            labelBase,
+            lab
+          );
+          picked++;
+        }
+        continue;
+      }
+
+      if (item.kind === "filter_list" || (item.actions || []).indexOf("list_pick") >= 0) {
+        var panel =
+          host.itemsPanel ||
+          (host.contentPanel &&
+            host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
+          host.contentPanel;
+        var listAdded = 0;
+        var kids = (panel && panel.childNodes) || [];
         for (var k = 0; k < kids.length && listAdded < LIST_CLICK_CAP; k++) {
-          var item = kids[k];
-          if (!item || item.nodeType !== 1) continue;
-          if (!(typeof item.action === "function" || item.value != null || item.label != null))
+          var li = kids[k];
+          if (!li || li.nodeType !== 1) continue;
+          if (!(typeof li.action === "function" || li.value != null || li.label != null))
             continue;
           (function (it, hst, fname) {
             add({
@@ -2375,101 +2474,52 @@
                 return activateListItem(it, hst);
               },
             });
-          })(item, host, filterName);
+          })(li, host, labelBase);
           listAdded++;
         }
+        continue;
       }
-    }
 
-    // 3) StiButtonElement
-    for (var b = 0; b < nodes.length; b++) {
-      var btn = nodes[b];
-      if (!isButtonHost(btn)) continue;
-      (function (h) {
-        var face = buttonFace(h);
-        add({
-          kind: "button",
-          host: h,
-          el: face || h,
-          label: buttonLabel(h),
-          activate: function () {
-            return activateDashButton(h);
-          },
-        });
-      })(btn);
-    }
-
-    // 4) Image / Text с ShowDashboard (не OpenHyperlink)
-    for (var ii = 0; ii < nodes.length; ii++) {
-      var ihost = nodes[ii];
-      if (!isInteractionHost(ihost)) continue;
-      (function (h) {
-        var ca =
-          h.elementAttributes && h.elementAttributes.contentAttributes;
-        var onClick =
-          ca && ca.interaction && ca.interaction.onClick
-            ? ca.interaction.onClick
-            : "?";
-        if (onClick === "OpenHyperlink") return;
-        add({
-          kind: "interaction",
-          host: h,
-          el: h,
-          label: attrName(h) + " [" + onClick + "]",
-          activate: function () {
-            return activateInteractionHost(h);
-          },
-        });
-      })(ihost);
-    }
-
-    // 5) RegionMap — области по map-region-click.md (onclick.call + возврат на страну)
-    for (var gi = 0; gi < nodes.length; gi++) {
-      var ghost = nodes[gi];
-      if (!/RegionMap/i.test(attrType(ghost))) continue;
-      if (!isVisibleBox(ghost)) continue;
-      var gname = attrName(ghost) || "Map";
-      var regions = pickRegionGeoms(ghost);
-      for (var gj = 0; gj < regions.length; gj++) {
-        (function (hst, reg, fname) {
+      if (item.kind === "button") {
+        (function (h, lab) {
           add({
-            kind: "geom",
-            host: hst,
-            el: hst,
-            label: fname + " ↓ " + reg.label,
-            needReturnCountry: true,
+            kind: "button",
+            host: h,
+            el: buttonFace(h) || h,
+            label: lab,
             activate: function () {
-              return activateGeom(hst, reg.geom);
+              return activateDashButton(h);
             },
           });
-        })(ghost, regions[gj], gname);
+        })(host, buttonLabel(host) || labelBase);
+        continue;
+      }
+
+      if (item.kind === "image" || item.kind === "text") {
+        (function (h, lab) {
+          add({
+            kind: "interaction",
+            host: h,
+            el: h,
+            label: lab,
+            activate: function () {
+              return activateInteractionHost(h);
+            },
+          });
+        })(host, labelBase);
       }
     }
 
-    // сверху вниз, слева направо
     out.sort(function (a, b) {
       var ra = a.el.getBoundingClientRect();
       var rb = b.el.getBoundingClientRect();
       if (Math.abs(ra.top - rb.top) > 12) return ra.top - rb.top;
       return ra.left - rb.left;
     });
-
     console.log(
-      "[dash-shot] click targets",
+      "[dash-shot] plan→targets",
       out.map(function (t) {
-        var r = t.el.getBoundingClientRect();
-        return {
-          kind: t.kind,
-          label: t.label,
-          box:
-            Math.round(r.left) +
-            "," +
-            Math.round(r.top) +
-            " " +
-            Math.round(r.width) +
-            "x" +
-            Math.round(r.height),
-        };
+        return t.kind + ":" + t.label;
       })
     );
     return out;
@@ -2703,8 +2753,7 @@
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
   /**
-   * Скан по страницам: инвентарь → baseline → клики
-   * (ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms).
+   * Скан: план из .mrt (/api/interactive) + report → только интерактив → протыкать.
    */
   async function scanButtons() {
     var btn = document.getElementById("dashShotBtn");
@@ -2719,14 +2768,57 @@
     var totalClicks = 0;
     try {
       await loadScript(HTML2CANVAS);
-      var pages = collectDashboardPages();
-      setStatus("страниц: " + pages.length + " — инвентарь…");
-      inventoryLines.push("PAGES (" + pages.length + "):");
-      pages.forEach(function (p, i) {
+
+      setStatus("читаем interactive из .mrt…");
+      var mrtPlan = await fetchInteractivePlan();
+      var reportItems = planFromReport();
+      var planItems = (mrtPlan && mrtPlan.items) || [];
+      // если в mrt пустые имена — дополняем/заменяем планом из живого report
+      if (reportItems.length) {
+        var hasNames = planItems.some(function (it) {
+          return it.name;
+        });
+        if (!hasNames || !planItems.length) planItems = reportItems;
+        else {
+          // merge: report types with names win for matching
+          var byKey = {};
+          planItems.forEach(function (it, idx) {
+            byKey[(it.kind || "") + "|" + (it.name || it.path || idx)] = it;
+          });
+          reportItems.forEach(function (it) {
+            var k = (it.kind || "") + "|" + (it.name || "");
+            if (it.name) byKey[k] = it;
+          });
+          planItems = Object.keys(byKey).map(function (k) {
+            return byKey[k];
+          });
+        }
+      }
+      inventoryLines.push(
+        "MRT plan: " +
+          JSON.stringify((mrtPlan && mrtPlan.counts) || {}) +
+          " items=" +
+          (((mrtPlan && mrtPlan.items) || []).length)
+      );
+      inventoryLines.push("report plan items=" + reportItems.length);
+      inventoryLines.push("using items=" + planItems.length);
+      planItems.forEach(function (it, idx) {
         inventoryLines.push(
-          "  " + (i + 1) + ") [" + p.index + "] " + p.label
+          "  " +
+            (idx + 1) +
+            ") p" +
+            (it.page_index != null ? it.page_index : "?") +
+            " [" +
+            it.kind +
+            "] " +
+            (it.name || it.title || it.path || "")
         );
       });
+
+      var pages = collectDashboardPages();
+      setStatus(
+        "план: " + planItems.length + " интерактив, стр: " + pages.length
+      );
 
       for (var pi = 0; pi < pages.length; pi++) {
         var page = pages[pi];
@@ -2757,25 +2849,21 @@
           continue;
         }
 
-        var inv = inventoryPageElements(root);
-        inventoryLines.push("");
-        inventoryLines.push("PAGE " + page.label + " elements:");
-        Object.keys(inv.counts)
-          .sort()
-          .forEach(function (t) {
-            inventoryLines.push("  " + t + ": " + inv.counts[t]);
-          });
-        inv.elements.forEach(function (e) {
-          inventoryLines.push(
-            "  - " +
-              e.type +
-              " / " +
-              (e.name || "?") +
-              (e.interaction ? " interaction=" + e.interaction : "") +
-              (e.items ? " items=" + e.items : "")
-          );
+        var pagePlan = planItems.filter(function (it) {
+          if (it.page_index == null && it.page_name == null) return true;
+          if (it.page_index != null && Number(it.page_index) === Number(page.index))
+            return true;
+          if (it.page_name && String(it.page_name) === String(page.label))
+            return true;
+          return false;
         });
-        console.log("[dash-shot] inventory", page.label, inv);
+        // если в плане нет page_index — на первой странице берём всё
+        if (!pagePlan.length && pi === 0) pagePlan = planItems;
+
+        inventoryLines.push("");
+        inventoryLines.push(
+          "PAGE " + page.label + " plan items: " + pagePlan.length
+        );
 
         setStatus(page.label + " — baseline…");
         var base = await takeScreenshot({
@@ -2790,7 +2878,7 @@
             ((base && base.pdfs) || []).join(",")
         );
 
-        var targets = collectClickTargets(root);
+        var targets = collectClickTargets(root, pagePlan);
         logLines.push("targets: " + targets.length);
         targets.forEach(function (t, idx) {
           logLines.push(
