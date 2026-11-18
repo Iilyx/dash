@@ -152,7 +152,6 @@ def inject_screenshot_ui(html: str) -> str:
     repl = (
         "viewer.report = report;\n"
         "window.__dashViewer = viewer;\n"
-        "window.__dashViewerJs = viewer.jsObject;\n"
         "window.__dashReport = report;\n"
         "viewer.renderHtml('viewerContent');"
     )
