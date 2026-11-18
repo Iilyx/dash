@@ -1023,73 +1023,120 @@
     return String(label || "").trim();
   }
 
-  /** Цвет/шрифт подписи — как заданы у caption/контрола, без подмены. */
+  /** Stimulsoft Color / строка → CSS. Transparent → "". */
+  function stiColorToCss(c) {
+    if (c == null || c === "") return "";
+    if (typeof c === "string") {
+      if (/^transparent$/i.test(c.trim())) return "";
+      return c;
+    }
+    try {
+      var Helper =
+        window.Stimulsoft &&
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Helpers &&
+        Stimulsoft.Report.Helpers.StiReportHelper;
+      if (Helper && typeof Helper.getHtmlColor === "function") {
+        var html = Helper.getHtmlColor(c);
+        if (html && !/^transparent$/i.test(String(html))) return String(html);
+        return "";
+      }
+    } catch (e) {}
+    try {
+      if (c.r != null && c.g != null && c.b != null) {
+        var a = c.a != null ? Number(c.a) : 255;
+        if (a === 0) return "";
+        if (a < 255) return "rgba(" + c.r + "," + c.g + "," + c.b + "," + a / 255 + ")";
+        return "rgb(" + c.r + "," + c.g + "," + c.b + ")";
+      }
+    } catch (e) {}
+    try {
+      var s = String(c);
+      if (s && /#|[rgb(]/i.test(s) && !/transparent/i.test(s)) return s;
+    } catch (e) {}
+    return "";
+  }
+
+  /**
+   * Цвет подписи ComboBox = ForeColor (как в элементе).
+   * Viewer кладёт его в contentAttributes.settings.foreColor / elementAttributes.foreColor.
+   */
   function readFilterTextStyle(host) {
     var color = "";
     var font = "";
     var bg = "";
-    function fromEl(el) {
-      if (!el || !el.getBoundingClientRect) return;
+    var attrs = host.elementAttributes || {};
+    var ca = attrs.contentAttributes || {};
+    var settings = ca.settings || {};
+
+    // 1) ForeColor, который реально красит SmallButton (CreateComboBoxElementContent)
+    color =
+      stiColorToCss(settings.foreColor) ||
+      stiColorToCss(settings.ForeColor) ||
+      stiColorToCss(attrs.foreColor) ||
+      stiColorToCss(attrs.ForeColor) ||
+      stiColorToCss(attrs.actionColors && attrs.actionColors.foreColor) ||
+      "";
+
+    // 2) с компонента отчёта по имени
+    if (!color) {
       try {
-        var cs = window.getComputedStyle(el);
-        if (!color && cs.color) color = cs.color;
-        if (!font && cs.font) font = cs.font;
-        if (
-          !bg &&
-          cs.backgroundColor &&
-          cs.backgroundColor !== "transparent" &&
-          cs.backgroundColor !== "rgba(0, 0, 0, 0)"
-        )
+        var report = findReport();
+        var name = attrName(host);
+        if (report && name) {
+          var comps = collectAll(report);
+          for (var c = 0; c < comps.length; c++) {
+            var el = comps[c];
+            if (!el || el.name !== name) continue;
+            color =
+              stiColorToCss(el.foreColor) ||
+              stiColorToCss(el.ForeColor) ||
+              "";
+            if (!font && el.font) {
+              try {
+                font =
+                  (el.font.size != null ? el.font.size + "pt " : "") +
+                  (el.font.name || "Arial");
+                if (el.font.bold) font = "bold " + font;
+              } catch (e) {}
+            }
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 3) шрифт из elementAttributes.font (ApplyAttributesToObject)
+    if (!font && attrs.font) {
+      try {
+        font =
+          (attrs.font.size != null ? attrs.font.size + "pt " : "") +
+          (attrs.font.name || "Arial");
+        if (attrs.font.bold) font = "bold " + font;
+      } catch (e) {}
+    }
+
+    bg =
+      stiColorToCss(settings.backColor) ||
+      stiColorToCss(attrs.backColor) ||
+      stiColorToCss(attrs.BackColor) ||
+      "";
+
+    // 4) только если ForeColor пустой — цвет с кнопки/caption (как нарисовано)
+    if (!color) {
+      try {
+        var cp = host.contentPanel;
+        var btn = cp && cp.childNodes && cp.childNodes[0];
+        var sample = (btn && btn.caption) || btn || cp || host;
+        var cs = window.getComputedStyle(sample);
+        if (cs && cs.color) color = cs.color;
+        if (!font && cs && cs.font) font = cs.font;
+        if (!bg && cs && cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)")
           bg = cs.backgroundColor;
       } catch (e) {}
     }
-    try {
-      var cp = host.contentPanel;
-      if (cp) {
-        for (var i = 0; i < cp.childNodes.length; i++) {
-          var btn = cp.childNodes[i];
-          if (!btn) continue;
-          if (btn.caption) {
-            fromEl(btn.caption);
-            try {
-              var svgText = btn.caption.querySelector && btn.caption.querySelector("text, tspan");
-              if (svgText) {
-                var fill = svgText.getAttribute("fill") || svgText.style.fill;
-                if (fill && fill !== "none") color = fill;
-              }
-            } catch (e) {}
-          }
-          fromEl(btn);
-        }
-        fromEl(cp);
-      }
-    } catch (e) {}
-    fromEl(host);
-    // brush / foreColor из атрибутов Stimulsoft, если есть
-    try {
-      var ca =
-        host.elementAttributes && host.elementAttributes.contentAttributes;
-      var style = (ca && ca.style) || (host.elementAttributes && host.elementAttributes.style);
-      var brush =
-        (style && (style.textBrush || style.brush || style.foreColor)) ||
-        (ca && (ca.foreColor || ca.color || ca.fontColor));
-      if (brush && !color) {
-        if (typeof brush === "string") color = brush;
-        else if (brush.color) color = String(brush.color);
-        else if (brush.toString) {
-          var s = String(brush.toString());
-          if (/#|[rgb]/i.test(s)) color = s;
-        }
-      }
-      var fnt = ca && ca.font;
-      if (fnt && !font) {
-        try {
-          font =
-            (fnt.size != null ? fnt.size + "px " : "") +
-            (fnt.name || fnt.fontFamily || "sans-serif");
-        } catch (e) {}
-      }
-    } catch (e) {}
+
+    console.log("[dash-shot] filter ForeColor", attrName(host), color, settings.foreColor || attrs.foreColor);
     return { color: color, font: font, bg: bg };
   }
 
