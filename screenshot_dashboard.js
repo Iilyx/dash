@@ -1355,7 +1355,23 @@
   }
 
   function isButtonHost(el) {
-    return /StiButtonElement|ButtonElement/i.test(attrType(el));
+    return /^StiButtonElement$/i.test(attrType(el));
+  }
+
+  function isListBoxHost(el) {
+    return /StiListBoxElement|StiTreeViewElement/i.test(attrType(el));
+  }
+
+  function isVisibleBox(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return false;
+    try {
+      var cs = getComputedStyle(el);
+      if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) === 0)
+        return false;
+    } catch (e) {}
+    return true;
   }
 
   function buttonLabel(host) {
@@ -1377,44 +1393,189 @@
         if (t2) return t2;
       }
     } catch (e) {}
+    try {
+      var raw = (host.innerText || host.textContent || "").trim().replace(/\s+/g, " ");
+      if (raw) return raw.slice(0, 80);
+    } catch (e) {}
     return attrName(host) || "button";
   }
 
-  function collectDashButtons(root) {
+  function listItemLabel(item) {
+    if (!item) return "item";
+    if (item.label != null && String(item.label).trim()) return String(item.label).trim();
+    if (item.value != null && String(item.value).trim()) return String(item.value).trim();
+    try {
+      var t = (item.innerText || item.textContent || "").trim().replace(/\s+/g, " ");
+      if (t) return t.slice(0, 80);
+    } catch (e) {}
+    return "item";
+  }
+
+  /** Лицо кнопки: contentPanel/svg, не огромная пустая ячейка. */
+  function buttonFace(host) {
+    if (!host) return host;
+    var face =
+      host.mainSvg ||
+      (host.contentPanel &&
+        (host.contentPanel.querySelector("svg") || host.contentPanel)) ||
+      host.querySelector("svg") ||
+      host;
+    if (!isVisibleBox(face)) return host;
+    return face;
+  }
+
+  /**
+   * Цели клика: сначала пункты ListBox/TreeView (часто выглядят как «кнопки»),
+   * потом StiButtonElement. У каждой — el (куда рамка/клик) + activate().
+   */
+  function collectClickTargets(root) {
     var out = [];
     var seen = [];
-    var nodes = root.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      if (!isButtonHost(el)) continue;
-      if (seen.indexOf(el) >= 0) continue;
-      seen.push(el);
-      out.push(el);
+    function add(t) {
+      if (!t || !t.el || seen.indexOf(t.el) >= 0) return;
+      if (!isVisibleBox(t.el)) return;
+      seen.push(t.el);
+      out.push(t);
     }
+
+    var nodes = root.querySelectorAll("*");
+    // 1) ListBox / TreeView items
+    for (var i = 0; i < nodes.length; i++) {
+      var host = nodes[i];
+      if (!isListBoxHost(host)) continue;
+      var filterName = attrName(host) || "List";
+      var panel =
+        host.itemsPanel ||
+        (host.contentPanel && host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
+        host.contentPanel;
+      var pools = [];
+      if (panel) pools.push(panel);
+      if (host.contentPanel && host.contentPanel !== panel) pools.push(host.contentPanel);
+      for (var p = 0; p < pools.length; p++) {
+        var kids = pools[p].childNodes || [];
+        for (var k = 0; k < kids.length; k++) {
+          var item = kids[k];
+          if (!item || item.nodeType !== 1) continue;
+          if (item.getAttribute && item.getAttribute("data-dash-shot-hl")) continue;
+          var hasAction = typeof item.action === "function";
+          var hasVal = item.value != null || item.label != null;
+          if (!hasAction && !hasVal) continue;
+          (function (it, fname) {
+            add({
+              kind: "listbox",
+              host: host,
+              el: it,
+              label: fname + ": " + listItemLabel(it),
+              activate: function () {
+                if (typeof it.action === "function") it.action();
+                else if (typeof it.click === "function") it.click();
+                else
+                  it.dispatchEvent(
+                    new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
+                  );
+              },
+            });
+          })(item, filterName);
+        }
+      }
+      // horizontal table cells
+      try {
+        if (host.contentPanel && host.contentPanel.horTable) {
+          var cells = host.contentPanel.horTable.querySelectorAll("td");
+          for (var c = 0; c < cells.length; c++) {
+            var cell = cells[c];
+            var child = cell.firstElementChild || cell;
+            if (typeof child.action !== "function" && child.value == null && child.label == null)
+              continue;
+            (function (it, fname) {
+              add({
+                kind: "listbox",
+                host: host,
+                el: it,
+                label: fname + ": " + listItemLabel(it),
+                activate: function () {
+                  if (typeof it.action === "function") it.action();
+                  else if (typeof it.click === "function") it.click();
+                },
+              });
+            })(child, filterName);
+          }
+        }
+      } catch (e) {}
+    }
+
+    // 2) StiButtonElement — клик по самому host (там SubscribeToButtonElementActionEvents)
+    for (var b = 0; b < nodes.length; b++) {
+      var btn = nodes[b];
+      if (!isButtonHost(btn)) continue;
+      (function (h) {
+        var face = buttonFace(h);
+        add({
+          kind: "button",
+          host: h,
+          el: face || h,
+          label: buttonLabel(h),
+          activate: function () {
+            // Stimulsoft слушает click на host, не на svg
+            var evOpts = { bubbles: true, cancelable: true, view: window };
+            try {
+              h.dispatchEvent(new MouseEvent("mouseover", evOpts));
+              h.dispatchEvent(new MouseEvent("mousedown", evOpts));
+              h.dispatchEvent(new MouseEvent("mouseup", evOpts));
+              h.dispatchEvent(new MouseEvent("click", evOpts));
+            } catch (e) {}
+            try {
+              if (typeof h.click === "function") h.click();
+            } catch (e2) {}
+          },
+        });
+      })(btn);
+    }
+
+    // сверху вниз, слева направо
+    out.sort(function (a, b) {
+      var ra = a.el.getBoundingClientRect();
+      var rb = b.el.getBoundingClientRect();
+      if (Math.abs(ra.top - rb.top) > 12) return ra.top - rb.top;
+      return ra.left - rb.left;
+    });
+
     console.log(
-      "[dash-shot] buttons",
-      out.map(function (b) {
-        return { name: attrName(b), label: buttonLabel(b) };
+      "[dash-shot] click targets",
+      out.map(function (t) {
+        var r = t.el.getBoundingClientRect();
+        return {
+          kind: t.kind,
+          label: t.label,
+          box: Math.round(r.left) + "," + Math.round(r.top) + " " + Math.round(r.width) + "x" + Math.round(r.height),
+        };
       })
     );
     return out;
   }
 
+  /** @deprecated use collectClickTargets */
+  function collectDashButtons(root) {
+    return collectClickTargets(root).map(function (t) {
+      return t.host || t.el;
+    });
+  }
+
   /**
-   * Яркая рамка + плашка «КЛИК → …».
-   * Fixed — видно вживую; inset на host — попадает в html2canvas скрин.
+   * Яркая рамка + плашка «КЛИК → …» по реальному el (пункт списка / лицо кнопки).
+   * Fixed — видно вживую; inset на HTML-родителе — попадает в скрин.
    */
-  function highlightClickTarget(host, label, stepText) {
+  function highlightClickTarget(el, label, stepText) {
     clearClickHighlight();
-    if (!host) return function () {};
+    if (!el) return function () {};
     try {
-      host.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
     } catch (e) {
       try {
-        host.scrollIntoView(true);
+        el.scrollIntoView(true);
       } catch (e2) {}
     }
-    var r = host.getBoundingClientRect();
+    var r = el.getBoundingClientRect();
     var pad = 6;
     var caption =
       (stepText ? stepText + " " : "") + "КЛИК → " + (label || "?");
@@ -1426,9 +1587,7 @@
       document.head.appendChild(st);
     }
 
-    // live overlay (вне root — только для глаз)
     var ring = document.createElement("div");
-    ring.id = "dashShotClickRing";
     ring.setAttribute("data-dash-shot-hl", "1");
     ring.style.cssText = [
       "position:fixed",
@@ -1446,7 +1605,6 @@
       "animation:dashShotPulse 0.7s ease-in-out infinite alternate",
     ].join(";");
     var tag = document.createElement("div");
-    tag.id = "dashShotClickTag";
     tag.setAttribute("data-dash-shot-hl", "1");
     tag.textContent = caption;
     var tagTop = Math.max(8, Math.round(r.top - pad - 36));
@@ -1471,121 +1629,149 @@
     document.body.appendChild(ring);
     document.body.appendChild(tag);
 
-    // inset на host — попадёт в скриншот root
-    var prevPos = host.style.position;
-    if (getComputedStyle(host).position === "static") {
-      host.style.position = "relative";
-      host.setAttribute("data-dash-shot-pos", prevPos == null ? "" : prevPos);
+    // inset только на HTMLElement (не SVG) — иначе html2canvas/DOM ломается
+    var mount = el;
+    if (!mount.tagName || mount.tagName.toLowerCase() === "svg" || mount.namespaceURI === "http://www.w3.org/2000/svg") {
+      mount = el.parentElement || el;
     }
-    var inset = document.createElement("div");
-    inset.id = "dashShotClickInset";
-    inset.setAttribute("data-dash-shot-hl", "1");
-    inset.style.cssText = [
-      "position:absolute",
-      "left:-4px",
-      "top:-4px",
-      "right:-4px",
-      "bottom:-4px",
-      "box-sizing:border-box",
-      "border:4px solid #ef4444",
-      "border-radius:6px",
-      "background:rgba(239,68,68,0.22)",
-      "box-shadow:inset 0 0 0 2px #fff",
-      "z-index:9999",
-      "pointer-events:none",
-    ].join(";");
-    var insetTag = document.createElement("div");
-    insetTag.id = "dashShotClickInsetTag";
-    insetTag.setAttribute("data-dash-shot-hl", "1");
-    insetTag.textContent = caption;
-    insetTag.style.cssText = [
-      "position:absolute",
-      "left:0",
-      "top:-28px",
-      "padding:4px 8px",
-      "background:#ef4444",
-      "color:#fff",
-      "font:bold 12px/1.2 ui-sans-serif,system-ui,sans-serif",
-      "border-radius:4px",
-      "white-space:nowrap",
-      "z-index:10000",
-      "pointer-events:none",
-      "max-width:280px",
-      "overflow:hidden",
-      "text-overflow:ellipsis",
-    ].join(";");
-    host.appendChild(inset);
-    host.appendChild(insetTag);
+    if (mount && mount.tagName && mount.tagName.toLowerCase() !== "svg") {
+      if (getComputedStyle(mount).position === "static") {
+        mount.setAttribute("data-dash-shot-pos", mount.style.position || "");
+        mount.style.position = "relative";
+      }
+      var ir = el.getBoundingClientRect();
+      var mr = mount.getBoundingClientRect();
+      var inset = document.createElement("div");
+      inset.setAttribute("data-dash-shot-hl", "1");
+      inset.style.cssText = [
+        "position:absolute",
+        "left:" + Math.round(ir.left - mr.left - 4) + "px",
+        "top:" + Math.round(ir.top - mr.top - 4) + "px",
+        "width:" + Math.round(ir.width + 8) + "px",
+        "height:" + Math.round(ir.height + 8) + "px",
+        "box-sizing:border-box",
+        "border:4px solid #ef4444",
+        "border-radius:6px",
+        "background:rgba(239,68,68,0.22)",
+        "box-shadow:inset 0 0 0 2px #fff",
+        "z-index:9999",
+        "pointer-events:none",
+      ].join(";");
+      var insetTag = document.createElement("div");
+      insetTag.setAttribute("data-dash-shot-hl", "1");
+      insetTag.textContent = caption;
+      insetTag.style.cssText = [
+        "position:absolute",
+        "left:" + Math.round(ir.left - mr.left) + "px",
+        "top:" + Math.round(ir.top - mr.top - 28) + "px",
+        "padding:4px 8px",
+        "background:#ef4444",
+        "color:#fff",
+        "font:bold 12px/1.2 ui-sans-serif,system-ui,sans-serif",
+        "border-radius:4px",
+        "white-space:nowrap",
+        "z-index:10000",
+        "pointer-events:none",
+        "max-width:280px",
+        "overflow:hidden",
+        "text-overflow:ellipsis",
+      ].join(";");
+      mount.appendChild(inset);
+      mount.appendChild(insetTag);
+    }
 
     return clearClickHighlight;
   }
 
   function clearClickHighlight() {
-    [
-      "dashShotClickRing",
-      "dashShotClickTag",
-      "dashShotClickInset",
-      "dashShotClickInsetTag",
-    ].forEach(function (id) {
-      var el = document.getElementById(id);
-      if (el && el.parentNode) el.parentNode.removeChild(el);
-    });
+    try {
+      var nodes = document.querySelectorAll("[data-dash-shot-hl]");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+      }
+    } catch (e) {}
     try {
       var marked = document.querySelectorAll("[data-dash-shot-pos]");
-      for (var i = 0; i < marked.length; i++) {
-        var h = marked[i];
+      for (var j = 0; j < marked.length; j++) {
+        var h = marked[j];
         h.style.position = h.getAttribute("data-dash-shot-pos") || "";
         h.removeAttribute("data-dash-shot-pos");
       }
     } catch (e) {}
   }
 
-  /** Реалистичный клик по центру (Stimulsoft часто слушает mousedown на child). */
-  function clickDashButton(host) {
-    var target =
-      (host.contentPanel && host.contentPanel.firstElementChild) ||
-      host.querySelector("svg, button, [role=button], canvas") ||
-      host;
-    var r = target.getBoundingClientRect();
-    var x = r.left + r.width / 2;
-    var y = r.top + r.height / 2;
-    var opts = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: x,
-      clientY: y,
-      button: 0,
-    };
-    try {
-      target.dispatchEvent(new PointerEvent("pointerdown", opts));
-    } catch (e) {}
-    try {
-      target.dispatchEvent(new MouseEvent("mousedown", opts));
-    } catch (e) {}
-    try {
-      target.dispatchEvent(new PointerEvent("pointerup", opts));
-    } catch (e) {}
-    try {
-      target.dispatchEvent(new MouseEvent("mouseup", opts));
-    } catch (e) {}
-    try {
-      target.dispatchEvent(new MouseEvent("click", opts));
-    } catch (e) {}
-    try {
-      if (typeof target.click === "function") target.click();
-    } catch (e) {}
-    try {
-      if (target !== host && typeof host.click === "function") host.click();
-    } catch (e) {}
-    console.log("[dash-shot] clicked at", Math.round(x), Math.round(y), {
-      name: attrName(host),
-      label: buttonLabel(host),
-      targetTag: target && target.tagName,
-    });
+  /** Пронумеровать все цели сразу (превью перед сканом). */
+  function previewAllTargets(targets) {
+    clearClickHighlight();
+    if (!document.getElementById("dashShotPulseStyle")) {
+      var st = document.createElement("style");
+      st.id = "dashShotPulseStyle";
+      st.textContent =
+        "@keyframes dashShotPulse{from{opacity:1}to{opacity:.55}}";
+      document.head.appendChild(st);
+    }
+    for (var i = 0; i < targets.length; i++) {
+      var el = targets[i].el;
+      if (!el || !el.getBoundingClientRect) continue;
+      var r = el.getBoundingClientRect();
+      var ring = document.createElement("div");
+      ring.setAttribute("data-dash-shot-hl", "1");
+      ring.style.cssText = [
+        "position:fixed",
+        "left:" + Math.round(r.left) + "px",
+        "top:" + Math.round(r.top) + "px",
+        "width:" + Math.round(r.width) + "px",
+        "height:" + Math.round(r.height) + "px",
+        "box-sizing:border-box",
+        "border:3px solid #ef4444",
+        "border-radius:6px",
+        "background:rgba(239,68,68,0.12)",
+        "z-index:2147483644",
+        "pointer-events:none",
+      ].join(";");
+      var badge = document.createElement("div");
+      badge.setAttribute("data-dash-shot-hl", "1");
+      badge.textContent = String(i + 1);
+      badge.title = targets[i].label || "";
+      badge.style.cssText = [
+        "position:fixed",
+        "left:" + Math.round(r.left) + "px",
+        "top:" + Math.max(0, Math.round(r.top) - 22) + "px",
+        "min-width:20px",
+        "padding:2px 6px",
+        "background:#ef4444",
+        "color:#fff",
+        "font:bold 12px/1.2 ui-sans-serif,system-ui,sans-serif",
+        "border-radius:4px",
+        "z-index:2147483645",
+        "pointer-events:none",
+        "text-align:center",
+      ].join(";");
+      document.body.appendChild(ring);
+      document.body.appendChild(badge);
+    }
   }
 
-  /** Клик по каждой кнопке → скрин+PDF с меткой «Нажато: …». */
+  function activateClickTarget(target) {
+    if (!target) return;
+    console.log("[dash-shot] activate", target.kind, target.label);
+    if (typeof target.activate === "function") {
+      target.activate();
+      return;
+    }
+    var el = target.el;
+    try {
+      el.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
+      );
+    } catch (e) {}
+    try {
+      if (typeof el.click === "function") el.click();
+    } catch (e2) {}
+  }
+
+  /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
   async function scanButtons() {
     var root = captureRoot();
     if (!root) {
@@ -1602,24 +1788,25 @@
     var clearHl = function () {};
     try {
       await loadScript(HTML2CANVAS);
-      var buttons = collectDashButtons(root);
-      if (!buttons.length) {
-        setStatus("кнопок не найдено");
+      var targets = collectClickTargets(root);
+      if (!targets.length) {
+        setStatus("целей клика не найдено (ListBox/Button)");
         return;
       }
 
-      // список найденных — в статус и в лог
-      var foundList = buttons
-        .map(function (b, idx) {
-          return idx + 1 + ") " + buttonLabel(b);
+      var foundList = targets
+        .map(function (t, idx) {
+          return idx + 1 + ") [" + t.kind + "] " + t.label;
         })
         .join("; ");
       console.log("[dash-shot] scan targets:", foundList);
-      setStatus("найдено " + buttons.length + ": " + foundList);
-      await sleep(900);
+      setStatus("найдено " + targets.length + " — смотри красные номера…");
+      previewAllTargets(targets);
+      await sleep(2500);
+      clearClickHighlight();
 
       // 0) исходное состояние
-      setStatus("0/" + buttons.length + " исходное…");
+      setStatus("0/" + targets.length + " исходное…");
       var base = await takeScreenshot({
         label: "00_baseline",
         banner: "Без клика (исходное)",
@@ -1633,21 +1820,23 @@
       );
       logLines.push("targets: " + foundList);
 
-      for (var i = 0; i < buttons.length; i++) {
-        var host = buttons[i];
-        var label = buttonLabel(host);
-        var step = i + 1 + "/" + buttons.length;
+      for (var i = 0; i < targets.length; i++) {
+        var target = targets[i];
+        var label = target.label;
+        var step = i + 1 + "/" + targets.length;
         var slug =
-          String(i + 1).padStart(2, "0") + "_" + safeSlug(label);
+          String(i + 1).padStart(2, "0") +
+          "_" +
+          target.kind +
+          "_" +
+          safeSlug(label);
         setStatus(step + " подсветка: " + label);
-        clearHl = highlightClickTarget(host, label, step);
-        // пауза: видно куда кликнет
-        await sleep(1200);
+        clearHl = highlightClickTarget(target.el, label, step);
+        await sleep(1000);
 
         setStatus(step + " клик: " + label);
-        console.log("[dash-shot] click button", slug, label);
         try {
-          clickDashButton(host);
+          activateClickTarget(target);
         } catch (e) {
           console.warn("[dash-shot] click failed", label, e);
           logLines.push(slug + " | CLICK FAIL " + label);
@@ -1656,7 +1845,6 @@
           continue;
         }
 
-        // ждём ApplyFilters / перерисовку; подсветку держим
         setStatus(step + " ждём: " + label);
         await sleep(2200);
         await new Promise(function (res) {
@@ -1664,9 +1852,22 @@
             setTimeout(res, 200);
           });
         });
-        // обновить рамку после возможного сдвига layout
-        clearHl = highlightClickTarget(host, label, step + " нажато");
-        await sleep(400);
+        // DOM мог перерисоваться — ищем цель заново по label/kind если элемент отвалился
+        var el = target.el;
+        if (!el || !el.isConnected) {
+          var again = collectClickTargets(captureRoot() || root);
+          var match = again.filter(function (t) {
+            return t.kind === target.kind && t.label === label;
+          })[0];
+          if (match) {
+            target = match;
+            el = match.el;
+          }
+        }
+        if (el && el.isConnected) {
+          clearHl = highlightClickTarget(el, label, step + " нажато");
+          await sleep(350);
+        }
 
         var shot = await takeScreenshot({
           label: slug,
@@ -1679,6 +1880,8 @@
           slug +
             " | Нажато: " +
             label +
+            " | kind=" +
+            target.kind +
             " | png=" +
             (shot && shot.png) +
             " | pdf=" +
@@ -1688,9 +1891,10 @@
 
       var logName = "buttons_scan_" + scanId + ".txt";
       var logBody =
-        "Скан кнопок " +
+        "Скан кликов " +
         scanId +
         "\n" +
+        "Сначала ListBox/TreeView пункты, потом StiButton\n" +
         "Каждая строка: slug | что нажато | файлы\n\n" +
         logLines.join("\n") +
         "\n";
@@ -1704,7 +1908,7 @@
       } catch (e) {
         console.warn("[dash-shot] scan log", e);
       }
-      setStatus("скан готов: " + buttons.length + " кн. | " + logName);
+      setStatus("скан готов: " + targets.length + " | " + logName);
       console.log("[dash-shot] scan log\n" + logBody);
     } catch (err) {
       console.error(err);
@@ -1740,9 +1944,9 @@
     var scanBtn = document.createElement("button");
     scanBtn.id = "dashScanBtn";
     scanBtn.type = "button";
-    scanBtn.textContent = "Скан кнопок";
+    scanBtn.textContent = "Скан кликов";
     scanBtn.title =
-      "Клик по каждой кнопке дашборда → скрин+PDF таблицы, в имени и баннере написано что нажато";
+      "ListBox-пункты и StiButton: клик по каждому → скрин+PDF, на PNG написано что нажато";
     scanBtn.style.cssText = btnStyle;
     scanBtn.onclick = function () {
       scanButtons();
