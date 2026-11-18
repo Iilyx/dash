@@ -1414,9 +1414,10 @@
     }
   }
 
-  var LIST_CLICK_CAP = 5; // макс. пунктов ListBox на один фильтр из плана
-  var COMBO_CLICK_CAP = 5; // макс. значений ComboBox на один фильтр из плана
-  var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ)
+  // Lean-скан: только карта (области) + немного ComboBox. Без ListBox/кнопок/image.
+  var COMBO_HOST_CAP = 2; // сколько ComboBox на странице
+  var COMBO_CLICK_CAP = 3; // значений в каждом
+  var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ ≤7)
   /** Коды областей РБ из map-region-click.md */
   var MAP_REGION_ALIASES = [
     { label: "Брестская", codes: ["brestskaia", "brest", "by-br", "брест"] },
@@ -2267,107 +2268,11 @@
     return collectMapRegionGeoms(host);
   }
 
-  async function fetchInteractivePlan() {
-    try {
-      var res = await fetch("/api/interactive", { cache: "no-store" });
-      if (!res.ok) throw new Error(String(res.status));
-      var plan = await res.json();
-      console.log("[dash-shot] MRT interactive plan", plan.counts, plan.items && plan.items.length);
-      return plan;
-    } catch (e) {
-      console.warn("[dash-shot] /api/interactive", e);
-      return null;
-    }
-  }
-
-  /** Живой отчёт Stimulsoft — имена/типы, если в .mrt Ident был пустой. */
-  function planFromReport() {
-    var report = findReport();
-    if (!report) return [];
-    var items = [];
-    var comps = collectAll(report);
-    for (var i = 0; i < comps.length; i++) {
-      var c = comps[i];
-      if (!c) continue;
-      var tn = typeName(c) || "";
-      var name = c.name || "";
-      var kind = null;
-      if (/RegionMap/i.test(tn)) kind = "map";
-      else if (/ComboBox|TreeViewBox/i.test(tn)) kind = "filter_combo";
-      else if (/ListBox|TreeViewElement|DatePicker|NumberBox/i.test(tn))
-        kind = "filter_list";
-      else if (/ButtonElement/i.test(tn)) kind = "button";
-      else if (/ImageElement/i.test(tn) || /TextElement/i.test(tn)) {
-        try {
-          var di = c.dashboardInteraction || c.interaction;
-          var oc = di && (di.onClick || di.OnClick);
-          if (oc && String(oc) !== "None" && String(oc) !== "OpenHyperlink")
-            kind = /Image/i.test(tn) ? "image" : "text";
-        } catch (e) {}
-      }
-      if (!kind) continue;
-      items.push({
-        kind: kind,
-        type: tn,
-        name: name || null,
-        title: null,
-        actions:
-          kind === "map"
-            ? ["region_drill"]
-            : kind === "filter_combo"
-              ? ["combo_pick"]
-              : kind === "filter_list"
-                ? ["list_pick"]
-                : ["click"],
-      });
-    }
-    console.log("[dash-shot] report plan", items.length, items);
-    return items;
-  }
-
-  function findDomByPlanItem(root, item) {
-    var nodes = root.querySelectorAll("*");
-    var wantName = item.name || item.alias || item.title;
-    var wantType = item.type || "";
-    var kind = item.kind;
-    var candidates = [];
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      var t = attrType(el);
-      if (!t) continue;
-      var ok = false;
-      if (kind === "map" && /RegionMap/i.test(t)) ok = true;
-      else if (kind === "filter_combo" && /ComboBox|TreeViewBox/i.test(t)) ok = true;
-      else if (
-        kind === "filter_list" &&
-        /ListBox|TreeViewElement|DatePicker|NumberBox/i.test(t)
-      )
-        ok = true;
-      else if (kind === "button" && /ButtonElement/i.test(t)) ok = true;
-      else if (kind === "image" && /ImageElement/i.test(t)) ok = true;
-      else if (kind === "text" && /TextElement/i.test(t)) ok = true;
-      else if (kind === "chart" && /ChartElement/i.test(t)) ok = true;
-      if (!ok) continue;
-      if (wantType && t !== wantType && t.indexOf(wantType.replace(/^Sti/, "")) < 0) {
-        // type mismatch soft — still ok if kind matched
-      }
-      var n = attrName(el);
-      if (wantName && n && n === wantName) return el;
-      candidates.push(el);
-    }
-    // по имени среди кандидатов
-    if (wantName) {
-      for (var c = 0; c < candidates.length; c++) {
-        if (attrName(candidates[c]) === wantName) return candidates[c];
-      }
-    }
-    return candidates[0] || null;
-  }
-
   /**
-   * Цели только из плана MRT/report — не кликаем всё подряд в DOM.
+   * Lean: только RegionMap (области) + до COMBO_HOST_CAP×COMBO_CLICK_CAP ComboBox.
+   * ListBox / Button / Image — не кликаем (лишний шум).
    */
-  function collectClickTargets(root, planItems) {
+  function collectClickTargets(root) {
     var out = [];
     var seen = [];
     function add(t) {
@@ -2379,147 +2284,100 @@
       out.push(t);
     }
 
-    var items = planItems || [];
-    if (!items.length) {
-      console.warn("[dash-shot] empty plan — no clicks");
-      return out;
+    var nodes = root.querySelectorAll("*");
+
+    // 1) RegionMap — области РБ (главное)
+    for (var gi = 0; gi < nodes.length; gi++) {
+      var ghost = nodes[gi];
+      if (!/RegionMap/i.test(attrType(ghost))) continue;
+      if (!isVisibleBox(ghost)) continue;
+      var gname = attrName(ghost) || "Map";
+      var regions = pickRegionGeoms(ghost);
+      for (var gj = 0; gj < regions.length; gj++) {
+        (function (hst, reg, fname) {
+          add({
+            kind: "geom",
+            host: hst,
+            el: hst,
+            label: fname + " ↓ " + reg.label,
+            needReturnCountry: true,
+            activate: function () {
+              return activateGeom(hst, reg.geom);
+            },
+          });
+        })(ghost, regions[gj], gname);
+      }
     }
 
-    // дедуп DOM hosts по kind+name
-    var usedHosts = [];
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
-      var host = findDomByPlanItem(root, item);
-      if (!host || usedHosts.indexOf(host) >= 0) continue;
-      usedHosts.push(host);
-      var labelBase =
-        item.name || item.title || item.alias || attrName(host) || item.kind;
-
-      if (item.kind === "map" || (item.actions || []).indexOf("region_drill") >= 0) {
-        var regions = pickRegionGeoms(host);
-        for (var r = 0; r < regions.length; r++) {
-          (function (hst, reg, fname) {
-            add({
-              kind: "geom",
-              host: hst,
-              el: hst,
-              label: fname + " ↓ " + reg.label,
-              needReturnCountry: true,
-              activate: function () {
-                return activateGeom(hst, reg.geom);
-              },
-            });
-          })(host, regions[r], labelBase);
-        }
-        continue;
+    // 2) ComboBox — мало: 2 фильтра × 3 значения
+    var comboHosts = 0;
+    for (var cbi = 0; cbi < nodes.length; cbi++) {
+      if (comboHosts >= COMBO_HOST_CAP) break;
+      var combo = nodes[cbi];
+      if (!isComboHost(combo)) continue;
+      if (!isVisibleBox(combo)) continue;
+      comboHosts++;
+      var cname = attrName(combo) || "Combo";
+      var ca =
+        combo.elementAttributes && combo.elementAttributes.contentAttributes;
+      var items = (ca && ca.items) || [];
+      // пропуск пустых / All-only если есть нормальные
+      var filtered = [];
+      for (var fi = 0; fi < items.length; fi++) {
+        var it0 = items[fi];
+        if (!it0) continue;
+        if (it0.isAllValue) continue;
+        var lab0 = listItemLabel(it0);
+        if (!lab0 || /^all$/i.test(lab0)) continue;
+        filtered.push(it0);
       }
-
-      if (item.kind === "filter_combo" || (item.actions || []).indexOf("combo_pick") >= 0) {
-        var ca =
-          host.elementAttributes && host.elementAttributes.contentAttributes;
-        var rawItems = (ca && ca.items) || [];
-        var picked = 0;
-        for (var ui = 0; ui < rawItems.length && picked < COMBO_CLICK_CAP; ui++) {
-          var it = rawItems[ui];
-          if (!it || it.isAllValue) continue;
+      var useItems = filtered.slice(0, COMBO_CLICK_CAP);
+      for (var ui = 0; ui < useItems.length; ui++) {
+        (function (hst, it, fname) {
           var lab = listItemLabel(it);
-          if (!lab || /^all$/i.test(lab)) continue;
-          (function (hst, spec, fname, lab2) {
-            add({
-              kind: "combo",
-              host: hst,
-              item: spec,
-              el: hst,
-              label: fname + ": " + lab2,
-              activate: function () {
-                return activateComboValue(hst, spec);
-              },
-            });
-          })(
-            host,
-            {
-              value: it.value,
-              label: it.label != null ? it.label : lab,
-              isAllValue: false,
-            },
-            labelBase,
-            lab
-          );
-          picked++;
-        }
-        continue;
-      }
-
-      if (item.kind === "filter_list" || (item.actions || []).indexOf("list_pick") >= 0) {
-        var panel =
-          host.itemsPanel ||
-          (host.contentPanel &&
-            host.contentPanel.querySelector(".stiJsViewerScrollContainer")) ||
-          host.contentPanel;
-        var listAdded = 0;
-        var kids = (panel && panel.childNodes) || [];
-        for (var k = 0; k < kids.length && listAdded < LIST_CLICK_CAP; k++) {
-          var li = kids[k];
-          if (!li || li.nodeType !== 1) continue;
-          if (!(typeof li.action === "function" || li.value != null || li.label != null))
-            continue;
-          (function (it, hst, fname) {
-            add({
-              kind: "listbox",
-              host: hst,
-              item: it,
-              el: it.button || it,
-              label: fname + ": " + listItemLabel(it),
-              activate: function () {
-                return activateListItem(it, hst);
-              },
-            });
-          })(li, host, labelBase);
-          listAdded++;
-        }
-        continue;
-      }
-
-      if (item.kind === "button") {
-        (function (h, lab) {
+          var spec = {
+            value: it.value,
+            label: it.label != null ? it.label : lab,
+            isAllValue: false,
+          };
           add({
-            kind: "button",
-            host: h,
-            el: buttonFace(h) || h,
-            label: lab,
+            kind: "combo",
+            host: hst,
+            item: spec,
+            el: hst,
+            label: fname + ": " + lab,
             activate: function () {
-              return activateDashButton(h);
+              return activateComboValue(hst, spec);
             },
           });
-        })(host, buttonLabel(host) || labelBase);
-        continue;
-      }
-
-      if (item.kind === "image" || item.kind === "text") {
-        (function (h, lab) {
-          add({
-            kind: "interaction",
-            host: h,
-            el: h,
-            label: lab,
-            activate: function () {
-              return activateInteractionHost(h);
-            },
-          });
-        })(host, labelBase);
+        })(combo, useItems[ui], cname);
       }
     }
 
+    // сверху вниз, слева направо
     out.sort(function (a, b) {
       var ra = a.el.getBoundingClientRect();
       var rb = b.el.getBoundingClientRect();
       if (Math.abs(ra.top - rb.top) > 12) return ra.top - rb.top;
       return ra.left - rb.left;
     });
+
     console.log(
-      "[dash-shot] plan→targets",
+      "[dash-shot] click targets",
       out.map(function (t) {
-        return t.kind + ":" + t.label;
+        var r = t.el.getBoundingClientRect();
+        return {
+          kind: t.kind,
+          label: t.label,
+          box:
+            Math.round(r.left) +
+            "," +
+            Math.round(r.top) +
+            " " +
+            Math.round(r.width) +
+            "x" +
+            Math.round(r.height),
+        };
       })
     );
     return out;
@@ -2753,7 +2611,8 @@
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
   /**
-   * Скан: план из .mrt (/api/interactive) + report → только интерактив → протыкать.
+   * Скан по страницам: инвентарь → baseline → клики
+   * (ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms).
    */
   async function scanButtons() {
     var btn = document.getElementById("dashShotBtn");
@@ -2768,57 +2627,32 @@
     var totalClicks = 0;
     try {
       await loadScript(HTML2CANVAS);
-
-      setStatus("читаем interactive из .mrt…");
-      var mrtPlan = await fetchInteractivePlan();
-      var reportItems = planFromReport();
-      var planItems = (mrtPlan && mrtPlan.items) || [];
-      // если в mrt пустые имена — дополняем/заменяем планом из живого report
-      if (reportItems.length) {
-        var hasNames = planItems.some(function (it) {
-          return it.name;
-        });
-        if (!hasNames || !planItems.length) planItems = reportItems;
-        else {
-          // merge: report types with names win for matching
-          var byKey = {};
-          planItems.forEach(function (it, idx) {
-            byKey[(it.kind || "") + "|" + (it.name || it.path || idx)] = it;
-          });
-          reportItems.forEach(function (it) {
-            var k = (it.kind || "") + "|" + (it.name || "");
-            if (it.name) byKey[k] = it;
-          });
-          planItems = Object.keys(byKey).map(function (k) {
-            return byKey[k];
-          });
+      var allPages = collectDashboardPages();
+      // lean: только текущая вкладка, не бегать по всем страницам
+      var pages = allPages;
+      var selected = null;
+      for (var spi = 0; spi < allPages.length; spi++) {
+        var pb = allPages[spi].el;
+        if (pb && (pb.isSelected || pb.className && /Selected/i.test(pb.className))) {
+          selected = allPages[spi];
+          break;
         }
       }
-      inventoryLines.push(
-        "MRT plan: " +
-          JSON.stringify((mrtPlan && mrtPlan.counts) || {}) +
-          " items=" +
-          (((mrtPlan && mrtPlan.items) || []).length)
-      );
-      inventoryLines.push("report plan items=" + reportItems.length);
-      inventoryLines.push("using items=" + planItems.length);
-      planItems.forEach(function (it, idx) {
+      pages = selected ? [selected] : allPages.slice(0, 1);
+      setStatus("скан: " + pages[0].label + " (lean)…");
+      inventoryLines.push("LEAN: только текущая страница + карта/combo");
+      inventoryLines.push("PAGES all (" + allPages.length + "):");
+      allPages.forEach(function (p, i) {
         inventoryLines.push(
           "  " +
-            (idx + 1) +
-            ") p" +
-            (it.page_index != null ? it.page_index : "?") +
-            " [" +
-            it.kind +
+            (i + 1) +
+            ") [" +
+            p.index +
             "] " +
-            (it.name || it.title || it.path || "")
+            p.label +
+            (pages[0] === p ? " ← SCAN" : "")
         );
       });
-
-      var pages = collectDashboardPages();
-      setStatus(
-        "план: " + planItems.length + " интерактив, стр: " + pages.length
-      );
 
       for (var pi = 0; pi < pages.length; pi++) {
         var page = pages[pi];
@@ -2849,21 +2683,25 @@
           continue;
         }
 
-        var pagePlan = planItems.filter(function (it) {
-          if (it.page_index == null && it.page_name == null) return true;
-          if (it.page_index != null && Number(it.page_index) === Number(page.index))
-            return true;
-          if (it.page_name && String(it.page_name) === String(page.label))
-            return true;
-          return false;
-        });
-        // если в плане нет page_index — на первой странице берём всё
-        if (!pagePlan.length && pi === 0) pagePlan = planItems;
-
+        var inv = inventoryPageElements(root);
         inventoryLines.push("");
-        inventoryLines.push(
-          "PAGE " + page.label + " plan items: " + pagePlan.length
-        );
+        inventoryLines.push("PAGE " + page.label + " elements:");
+        Object.keys(inv.counts)
+          .sort()
+          .forEach(function (t) {
+            inventoryLines.push("  " + t + ": " + inv.counts[t]);
+          });
+        inv.elements.forEach(function (e) {
+          inventoryLines.push(
+            "  - " +
+              e.type +
+              " / " +
+              (e.name || "?") +
+              (e.interaction ? " interaction=" + e.interaction : "") +
+              (e.items ? " items=" + e.items : "")
+          );
+        });
+        console.log("[dash-shot] inventory", page.label, inv);
 
         setStatus(page.label + " — baseline…");
         var base = await takeScreenshot({
@@ -2878,7 +2716,7 @@
             ((base && base.pdfs) || []).join(",")
         );
 
-        var targets = collectClickTargets(root, pagePlan);
+        var targets = collectClickTargets(root);
         logLines.push("targets: " + targets.length);
         targets.forEach(function (t, idx) {
           logLines.push(
@@ -2893,10 +2731,10 @@
         }
 
         setStatus(
-          page.label + ": " + targets.length + " целей — номера…"
+          page.label + ": " + targets.length + " целей (карта+combo)…"
         );
         previewAllTargets(targets);
-        await sleep(2200);
+        await sleep(900);
         clearClickHighlight();
 
         for (var i = 0; i < targets.length; i++) {
@@ -3004,10 +2842,10 @@
         "\n";
       var logName = "buttons_scan_" + scanId + ".txt";
       var logBody =
-        "Скан кликов " +
+        "Скан кликов (LEAN) " +
         scanId +
         "\n" +
-        "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms\n" +
+        "Только: RegionMap области + ComboBox (≤2×3). Без ListBox/Button/Image.\n" +
         "Кликов: " +
         totalClicks +
         "\n\n" +
@@ -3081,7 +2919,7 @@
     scanBtn.type = "button";
     scanBtn.textContent = "Скан кликов";
     scanBtn.title =
-      "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart → скрин+PDF";
+      "Lean: текущая страница → области карты + до 2 ComboBox×3 значения → скрин+PDF";
     scanBtn.style.cssText = btnStyle;
     scanBtn.onclick = function () {
       scanButtons();
