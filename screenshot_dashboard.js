@@ -72,6 +72,24 @@
     );
   }
 
+  function sleep(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  /** Имя файла без пробелов/спецсимволов. */
+  function safeSlug(text, maxLen) {
+    var s = String(text || "")
+      .trim()
+      .replace(/\s+/g, "_")
+      .replace(/[^\w\-а-яА-ЯёЁ]+/gi, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "");
+    if (!s) s = "item";
+    return s.slice(0, maxLen || 60);
+  }
+
   function downloadBlob(blob, name) {
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
@@ -531,15 +549,15 @@
    * Save на Table/Pivot → Image/Excel/Data; PDF — через export API (все строки).
    * Скачивает PDF + кладёт в exports/.
    */
-  async function exportTablesToPdf(report, root) {
-    if (!report) return 0;
+  async function exportTablesToPdf(report, root, labelPrefix) {
+    if (!report) return { saved: 0, names: [] };
     var Pdf =
       Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
         ? Stimulsoft.Report.StiExportFormat.Pdf
         : null;
     if (Pdf == null) {
       console.warn("[dash-shot] StiExportFormat.Pdf нет");
-      return 0;
+      return { saved: 0, names: [] };
     }
     var visible = visibleTableNames(root || document);
     var comps = collectAll(report).filter(isExportableTable);
@@ -549,7 +567,9 @@
         return c.name || typeName(c);
       }),
       "visible",
-      Object.keys(visible)
+      Object.keys(visible),
+      "prefix",
+      labelPrefix || ""
     );
     if (Object.keys(visible).length) {
       var onPage = comps.filter(function (c) {
@@ -559,12 +579,15 @@
     }
     if (!comps.length) {
       console.warn("[dash-shot] Table/Pivot не найден");
-      return 0;
+      return { saved: 0, names: [] };
     }
+    var prefix = labelPrefix ? safeSlug(labelPrefix) + "__" : "";
     var saved = 0;
+    var names = [];
     for (var i = 0; i < comps.length; i++) {
       var el = comps[i];
       var base =
+        prefix +
         String(el.name || "Table" + (i + 1)).replace(/\s+/g, "_") +
         "_" +
         stamp();
@@ -596,12 +619,33 @@
           console.warn("[dash-shot] pdf upload", e);
         }
         saved++;
+        names.push(pdfName);
         console.log("[dash-shot] table pdf", pdfName);
       } catch (err) {
         console.warn("[dash-shot] table pdf failed", el.name, err);
       }
     }
-    return saved;
+    return { saved: saved, names: names };
+  }
+
+  function paintBanner(canvas, text) {
+    if (!text || !canvas) return;
+    var ctx = canvas.getContext("2d");
+    var pad = 10 * SCALE;
+    var fontPx = 16 * SCALE;
+    ctx.save();
+    ctx.font = "bold " + fontPx + "px ui-sans-serif,system-ui,sans-serif";
+    var metrics = ctx.measureText(text);
+    var barH = fontPx + pad * 2;
+    ctx.fillStyle = "rgba(20,20,20,0.88)";
+    ctx.fillRect(0, 0, canvas.width, barH);
+    ctx.fillStyle = "#ffffff";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, pad, barH / 2);
+    // тонкая цветная полоска чтобы сразу видно «метка»
+    ctx.fillStyle = "#3b82f6";
+    ctx.fillRect(0, barH - 3 * SCALE, Math.min(canvas.width, metrics.width + pad * 2), 3 * SCALE);
+    ctx.restore();
   }
 
   function normalizeExportBytes(data) {
@@ -1193,17 +1237,31 @@
     }
   }
 
-  async function takeScreenshot() {
+  /**
+   * @param {object} [opts]
+   * @param {string} [opts.label] — slug в имени файла
+   * @param {string} [opts.banner] — текст «Нажато: …» на PNG
+   * @param {boolean} [opts.quiet] — не трогать disabled на кнопках бара
+   */
+  async function takeScreenshot(opts) {
+    opts = opts || {};
+    var label = opts.label ? safeSlug(opts.label) : "";
+    var banner = opts.banner || (label ? "Нажато: " + opts.label : "");
     var root = captureRoot();
     if (!root) {
       setStatus("панель не найдена");
-      return;
+      return null;
     }
     var btn = document.getElementById("dashShotBtn");
-    if (btn) btn.disabled = true;
+    var scanBtn = document.getElementById("dashScanBtn");
+    if (!opts.quiet) {
+      if (btn) btn.disabled = true;
+      if (scanBtn) scanBtn.disabled = true;
+    }
     var restoreMaps = function () {};
     var restoreFilters = function () {};
-    setStatus("снимок…");
+    setStatus(banner ? banner + "…" : "снимок…");
+    var result = { png: null, pdfs: [], label: opts.label || "", banner: banner };
     try {
       await loadScript(HTML2CANVAS);
       var report = findReport();
@@ -1241,40 +1299,47 @@
       restoreFilters = function () {};
       restoreMaps = function () {};
 
+      if (banner) paintBanner(canvas, banner);
+
       var blob = await new Promise(function (resolve, reject) {
         canvas.toBlob(function (b) {
           if (b) resolve(b);
           else reject(new Error("toBlob failed"));
         }, "image/png");
       });
-      var name = "dashboard_" + stamp() + ".png";
+      var name =
+        (label ? label + "__" : "") + "dashboard_" + stamp() + ".png";
       downloadBlob(blob, name);
-      var pngOk = false;
+      result.png = name;
       try {
         var b64 = await blobToBase64(blob);
         var body = await postExportFile(name, b64, "png");
-        pngOk = true;
-        setStatus("saved " + (body.name || name));
+        result.png = body.name || name;
+        setStatus("saved " + result.png);
       } catch (err) {
         setStatus("download ok");
         console.warn(err);
       }
 
-      // дополнительно: Table/Pivot → PDF (все строки, как Save→но PDF)
-      setStatus("таблица → PDF…");
-      var nPdf = 0;
+      setStatus((banner || "таблица") + " → PDF…");
       try {
-        nPdf = await exportTablesToPdf(report, root);
+        var pdfResult = await exportTablesToPdf(report, root, label);
+        result.pdfs = (pdfResult && pdfResult.names) || [];
+        var nPdf = (pdfResult && pdfResult.saved) || 0;
+        setStatus(
+          "saved " +
+            result.png +
+            (nPdf ? " | +" + nPdf + " pdf" : " | pdf нет") +
+            (banner ? " | " + banner : "")
+        );
       } catch (err) {
         console.warn("[dash-shot] tables pdf", err);
       }
-      setStatus(
-        (pngOk ? "saved " + name : "png download") +
-          (nPdf ? " | +" + nPdf + " pdf" : " | pdf нет")
-      );
+      return result;
     } catch (err) {
       console.error(err);
       setStatus(String((err && err.message) || err));
+      return result;
     } finally {
       try {
         restoreFilters();
@@ -1282,7 +1347,161 @@
       try {
         restoreMaps();
       } catch (e) {}
+      if (!opts.quiet) {
+        if (btn) btn.disabled = false;
+        if (scanBtn) scanBtn.disabled = false;
+      }
+    }
+  }
+
+  function isButtonHost(el) {
+    return /StiButtonElement|ButtonElement/i.test(attrType(el));
+  }
+
+  function buttonLabel(host) {
+    try {
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      if (ca && ca.buttonText != null && String(ca.buttonText).trim())
+        return String(ca.buttonText).trim();
+    } catch (e) {}
+    try {
+      var texts = host.querySelectorAll("text");
+      for (var i = 0; i < texts.length; i++) {
+        var t = (texts[i].textContent || "").trim();
+        // иконки Stimulsoft часто 1 символ из icon font — берём длиннее
+        if (t && t.length > 1) return t;
+      }
+      for (var j = 0; j < texts.length; j++) {
+        var t2 = (texts[j].textContent || "").trim();
+        if (t2) return t2;
+      }
+    } catch (e) {}
+    return attrName(host) || "button";
+  }
+
+  function collectDashButtons(root) {
+    var out = [];
+    var seen = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!isButtonHost(el)) continue;
+      if (seen.indexOf(el) >= 0) continue;
+      seen.push(el);
+      out.push(el);
+    }
+    console.log(
+      "[dash-shot] buttons",
+      out.map(function (b) {
+        return { name: attrName(b), label: buttonLabel(b) };
+      })
+    );
+    return out;
+  }
+
+  /** Клик по каждой кнопке → скрин+PDF с меткой «Нажато: …». */
+  async function scanButtons() {
+    var root = captureRoot();
+    if (!root) {
+      setStatus("панель не найдена");
+      return;
+    }
+    var btn = document.getElementById("dashShotBtn");
+    var scanBtn = document.getElementById("dashScanBtn");
+    if (btn) btn.disabled = true;
+    if (scanBtn) scanBtn.disabled = true;
+
+    var logLines = [];
+    var scanId = stamp();
+    try {
+      await loadScript(HTML2CANVAS);
+      var buttons = collectDashButtons(root);
+      if (!buttons.length) {
+        setStatus("кнопок не найдено");
+        return;
+      }
+
+      // 0) исходное состояние
+      setStatus("0/" + buttons.length + " исходное…");
+      var base = await takeScreenshot({
+        label: "00_baseline",
+        banner: "Без клика (исходное)",
+        quiet: true,
+      });
+      logLines.push(
+        "00 | Без клика (исходное) | png=" +
+          (base && base.png) +
+          " | pdf=" +
+          ((base && base.pdfs) || []).join(",")
+      );
+
+      for (var i = 0; i < buttons.length; i++) {
+        var host = buttons[i];
+        var label = buttonLabel(host);
+        var slug =
+          String(i + 1).padStart(2, "0") + "_" + safeSlug(label);
+        setStatus(i + 1 + "/" + buttons.length + " клик: " + label);
+        console.log("[dash-shot] click button", slug, label);
+
+        try {
+          host.click();
+        } catch (e) {
+          console.warn("[dash-shot] click failed", label, e);
+          logLines.push(slug + " | CLICK FAIL " + label);
+          continue;
+        }
+
+        // ждём ApplyFilters / перерисовку дашборда
+        await sleep(2200);
+        await new Promise(function (res) {
+          requestAnimationFrame(function () {
+            setTimeout(res, 200);
+          });
+        });
+
+        var shot = await takeScreenshot({
+          label: slug,
+          banner: "Нажато: " + label,
+          quiet: true,
+        });
+        logLines.push(
+          slug +
+            " | Нажато: " +
+            label +
+            " | png=" +
+            (shot && shot.png) +
+            " | pdf=" +
+            ((shot && shot.pdfs) || []).join(",")
+        );
+      }
+
+      var logName = "buttons_scan_" + scanId + ".txt";
+      var logBody =
+        "Скан кнопок " +
+        scanId +
+        "\n" +
+        "Каждая строка: slug | что нажато | файлы\n\n" +
+        logLines.join("\n") +
+        "\n";
+      try {
+        var logB64 = btoa(unescape(encodeURIComponent(logBody)));
+        await postExportFile(logName, logB64, "txt");
+        downloadBlob(
+          new Blob([logBody], { type: "text/plain;charset=utf-8" }),
+          logName
+        );
+      } catch (e) {
+        console.warn("[dash-shot] scan log", e);
+      }
+      setStatus("скан готов: " + buttons.length + " кн. | " + logName);
+      console.log("[dash-shot] scan log\n" + logBody);
+    } catch (err) {
+      console.error(err);
+      setStatus(String((err && err.message) || err));
+    } finally {
       if (btn) btn.disabled = false;
+      if (scanBtn) scanBtn.disabled = false;
     }
   }
 
@@ -1294,20 +1513,32 @@
       "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
       "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
       "padding:6px 10px;border-radius:6px;";
+    var btnStyle =
+      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
     var btn = document.createElement("button");
     btn.id = "dashShotBtn";
     btn.type = "button";
     btn.textContent = "Скрин";
-    btn.style.cssText =
-      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
+    btn.style.cssText = btnStyle;
     btn.onclick = function () {
       takeScreenshot();
+    };
+    var scanBtn = document.createElement("button");
+    scanBtn.id = "dashScanBtn";
+    scanBtn.type = "button";
+    scanBtn.textContent = "Скан кнопок";
+    scanBtn.title =
+      "Клик по каждой кнопке дашборда → скрин+PDF таблицы, в имени и баннере написано что нажато";
+    scanBtn.style.cssText = btnStyle;
+    scanBtn.onclick = function () {
+      scanButtons();
     };
     var status = document.createElement("span");
     status.id = "dashShotStatus";
     status.style.cssText =
-      "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
+      "max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
     bar.appendChild(btn);
+    bar.appendChild(scanBtn);
     bar.appendChild(status);
     document.body.appendChild(bar);
   }
@@ -1319,6 +1550,7 @@
   }
 
   window.__dashTakeScreenshot = takeScreenshot;
+  window.__dashScanButtons = scanButtons;
   window.__dashExportTablesPdf = function () {
     return exportTablesToPdf(findReport(), captureRoot());
   };
