@@ -1414,12 +1414,35 @@
     }
   }
 
+  var GEOM_CLICK_CAP = 40; // макс. регионов/точек на одну карту/чарт
+
   function isButtonHost(el) {
     return /^StiButtonElement$/i.test(attrType(el));
   }
 
   function isListBoxHost(el) {
     return /StiListBoxElement|StiTreeViewElement/i.test(attrType(el));
+  }
+
+  function isComboHost(el) {
+    return /StiComboBoxElement|StiTreeViewBoxElement/i.test(attrType(el));
+  }
+
+  function isGeomHost(el) {
+    return /StiRegionMapElement|StiChartElement/i.test(attrType(el));
+  }
+
+  function isInteractionHost(el) {
+    var t = attrType(el);
+    if (!/StiImageElement|StiTextElement|StiIndicatorElement|StiCardsElement/i.test(t))
+      return false;
+    try {
+      var ca = el.elementAttributes && el.elementAttributes.contentAttributes;
+      var ix = ca && ca.interaction;
+      return !!(ix && ix.onClick && ix.onClick !== "None");
+    } catch (e) {
+      return false;
+    }
   }
 
   function isVisibleBox(el) {
@@ -1606,6 +1629,271 @@
     }
   }
 
+  /** ComboBox / TreeViewBox: выбрать значение → ApplyFilters. */
+  function activateComboValue(host, item) {
+    if (!host || !item) return false;
+    try {
+      if (item.button && typeof item.button.action === "function") {
+        item.button.action();
+        return true;
+      }
+      if (typeof item.action === "function") {
+        item.action();
+        return true;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] combo item.action", e);
+    }
+    try {
+      var js = getViewerJs();
+      if (!js || typeof js.ApplyFiltersToDashboardElement !== "function") return false;
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      var path = (ca && ca.columnPath) || "";
+      var val = item.value != null ? item.value : item;
+      var isAll =
+        item.isAllValue ||
+        val === "StiAllValue" ||
+        val === "StiUnCheckAll" ||
+        String(item.label || "").toLowerCase() === "all";
+      var filters = isAll
+        ? []
+        : [{ condition: "equalTo", value: val, path: path }];
+      var params =
+        typeof host.getFilterParameters === "function"
+          ? host.getFilterParameters()
+          : null;
+      js.ApplyFiltersToDashboardElement(host, filters, true, params);
+      console.log("[dash-shot] combo ApplyFilters", attrName(host), filters);
+      return true;
+    } catch (e) {
+      console.warn("[dash-shot] combo ApplyFilters", e);
+      return false;
+    }
+  }
+
+  /** RegionMap / Chart geom в iframe → onclick (ApplyFilter / DrillDown). */
+  function activateGeom(host, geom) {
+    if (!geom) return false;
+    try {
+      if (typeof geom.onclick === "function") {
+        geom.onclick();
+        console.log(
+          "[dash-shot] geom.onclick",
+          geom.getAttribute &&
+            (geom.getAttribute("elementargument") ||
+              geom.getAttribute("elementvalue") ||
+              geom.getAttribute("elementident"))
+        );
+        return true;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] geom.onclick", e);
+    }
+    try {
+      var js = getViewerJs();
+      if (host && typeof host.selectGeom === "function") {
+        host.selectGeom(geom, false);
+        var filters =
+          typeof host.getFilters === "function" ? host.getFilters() : [];
+        var params =
+          typeof geom.getFilterParameters === "function"
+            ? geom.getFilterParameters(
+                host.elementAttributes &&
+                  host.elementAttributes.contentAttributes &&
+                  host.elementAttributes.contentAttributes.interaction &&
+                  host.elementAttributes.contentAttributes.interaction
+                    .drillDownParameters
+              )
+            : null;
+        if (js && typeof js.ApplyFiltersToDashboardElement === "function") {
+          js.ApplyFiltersToDashboardElement(host, filters, null, params);
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn("[dash-shot] geom ApplyFilters", e);
+    }
+    return false;
+  }
+
+  /** Image/Text с interaction.onClick. */
+  function activateInteractionHost(host) {
+    if (!host) return false;
+    try {
+      if (typeof host.onclick === "function") {
+        host.onclick();
+        console.log("[dash-shot] interaction onclick", attrName(host));
+        return true;
+      }
+    } catch (e) {}
+    try {
+      var js = getViewerJs();
+      var ca =
+        host.elementAttributes && host.elementAttributes.contentAttributes;
+      var ix = ca && ca.interaction;
+      if (!js || !ix) return false;
+      if (ix.onClick === "ShowDashboard" && ix.drillDownPageKey) {
+        js.postInteraction({
+          action: "DashboardDrillDown",
+          drillDownParameters: {
+            drillDownPageKey: ix.drillDownPageKey,
+            value: "",
+            parameters: [],
+          },
+          pageNumber: 0,
+        });
+        return true;
+      }
+      if (ix.onClick === "OpenHyperlink" && ix.hyperlink) {
+        // не уводим со страницы — только логируем
+        console.log("[dash-shot] skip OpenHyperlink", ix.hyperlink);
+        return false;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] interaction", e);
+    }
+    return false;
+  }
+
+  /** Вкладки дашбордов (страницы верхнего уровня). */
+  function collectDashboardPages() {
+    var js = getViewerJs();
+    var panel = js && js.controls && js.controls.dashboardsPanel;
+    var buttons = (panel && panel.buttons) || [];
+    var pages = [];
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i];
+      if (!b || b.closeButtonAction || b.isNestedPage) continue;
+      if (!b.reportParams && typeof b.action !== "function") continue;
+      var label = "";
+      try {
+        label =
+          (b.caption && (b.caption.innerText || b.caption.textContent)) ||
+          b.name ||
+          "";
+      } catch (e) {}
+      label = String(label || "").trim() || "page" + (i + 1);
+      var idx =
+        b.reportParams && b.reportParams.originalPageNumber != null
+          ? b.reportParams.originalPageNumber
+          : i;
+      pages.push({
+        kind: "page",
+        el: b,
+        label: label,
+        index: idx,
+        activate: function (btn) {
+          return function () {
+            try {
+              if (typeof btn.action === "function") {
+                btn.action();
+                return true;
+              }
+            } catch (e) {
+              console.warn("[dash-shot] page.action", e);
+            }
+            return false;
+          };
+        }(b),
+      });
+    }
+    if (!pages.length) {
+      pages.push({
+        kind: "page",
+        el: null,
+        label: "page1",
+        index: 0,
+        activate: function () {
+          return true;
+        },
+      });
+    }
+    console.log(
+      "[dash-shot] pages",
+      pages.map(function (p) {
+        return p.index + ":" + p.label;
+      })
+    );
+    return pages;
+  }
+
+  /** Верхнеуровневый инвентарь элементов на текущей странице. */
+  function inventoryPageElements(root) {
+    var counts = {};
+    var list = [];
+    var nodes = root.querySelectorAll("*");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = attrType(el);
+      if (!t || !/^Sti\w+Element$/i.test(t)) continue;
+      if (!counts[t]) counts[t] = 0;
+      counts[t]++;
+      var ca =
+        el.elementAttributes && el.elementAttributes.contentAttributes;
+      var ix = ca && ca.interaction;
+      var nItems = (ca && ca.items && ca.items.length) || 0;
+      list.push({
+        type: t,
+        name: attrName(el),
+        interaction: ix && ix.onClick ? ix.onClick : null,
+        items: nItems,
+      });
+    }
+    return { counts: counts, elements: list };
+  }
+
+  function geomLabel(geom) {
+    try {
+      return String(
+        geom.getAttribute("elementargument") ||
+          geom.getAttribute("elementvalue") ||
+          geom.getAttribute("elementident") ||
+          geom.getAttribute("elementseries") ||
+          "geom"
+      );
+    } catch (e) {
+      return "geom";
+    }
+  }
+
+  function collectGeoms(host) {
+    var out = [];
+    var seen = [];
+    function addGeom(g) {
+      if (!g || seen.indexOf(g) >= 0) return;
+      try {
+        if (
+          g.getAttribute("elementargument") == null &&
+          g.getAttribute("elementvalue") == null &&
+          g.getAttribute("elementident") == null &&
+          g.getAttribute("elementseries") == null
+        )
+          return;
+      } catch (e) {
+        return;
+      }
+      seen.push(g);
+      out.push(g);
+    }
+    function walk(node) {
+      if (!node) return;
+      addGeom(node);
+      var kids = node.childNodes || [];
+      for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    }
+    try {
+      var iframe = host.frame || host.querySelector("iframe");
+      var doc = iframe ? iframeDoc(iframe) : null;
+      if (doc && doc.body) walk(doc.body);
+      else if (host.contentPanel) walk(host.contentPanel);
+      else walk(host);
+    } catch (e) {
+      console.warn("[dash-shot] collectGeoms", e);
+    }
+    return out;
+  }
+
   /**
    * Цели клика: сначала пункты ListBox/TreeView (часто выглядят как «кнопки»),
    * потом StiButtonElement. У каждой — el (куда рамка/клик) + activate().
@@ -1682,7 +1970,49 @@
       } catch (e) {}
     }
 
-    // 2) StiButtonElement → DashboardButtonElementApplyEvents (перерисовка)
+    // 2) ComboBox / TreeViewBox — значения из items / меню
+    for (var cbi = 0; cbi < nodes.length; cbi++) {
+      var combo = nodes[cbi];
+      if (!isComboHost(combo)) continue;
+      var cname = attrName(combo) || "Combo";
+      var ca =
+        combo.elementAttributes && combo.elementAttributes.contentAttributes;
+      var items = (ca && ca.items) || [];
+      var menuItems = [];
+      try {
+        if (combo.menu && combo.menu.innerContent) {
+          var kids = combo.menu.innerContent.querySelectorAll
+            ? combo.menu.innerContent.querySelectorAll("*")
+            : combo.menu.innerContent.childNodes;
+          for (var mi = 0; mi < kids.length; mi++) {
+            var m = kids[mi];
+            if (m && (m.value != null || m.label != null || typeof m.action === "function"))
+              menuItems.push(m);
+          }
+        }
+      } catch (e) {}
+      var useItems = menuItems.length ? menuItems : items;
+      if (!useItems.length && ca && ca.showAllValue) {
+        useItems = [{ value: null, label: "All", isAllValue: true }];
+      }
+      for (var ui = 0; ui < useItems.length; ui++) {
+        (function (hst, it, fname, idx) {
+          var lab = listItemLabel(it);
+          add({
+            kind: "combo",
+            host: hst,
+            item: it,
+            el: hst,
+            label: fname + ": " + lab,
+            activate: function () {
+              return activateComboValue(hst, it);
+            },
+          });
+        })(combo, useItems[ui], cname, ui);
+      }
+    }
+
+    // 3) StiButtonElement
     for (var b = 0; b < nodes.length; b++) {
       var btn = nodes[b];
       if (!isButtonHost(btn)) continue;
@@ -1700,6 +2030,61 @@
       })(btn);
     }
 
+    // 4) Image / Text / Indicator с interaction.onClick
+    for (var ii = 0; ii < nodes.length; ii++) {
+      var ihost = nodes[ii];
+      if (!isInteractionHost(ihost)) continue;
+      (function (h) {
+        var ca =
+          h.elementAttributes && h.elementAttributes.contentAttributes;
+        var onClick =
+          ca && ca.interaction && ca.interaction.onClick
+            ? ca.interaction.onClick
+            : "?";
+        add({
+          kind: "interaction",
+          host: h,
+          el: h,
+          label: attrName(h) + " [" + onClick + "]",
+          activate: function () {
+            return activateInteractionHost(h);
+          },
+        });
+      })(ihost);
+    }
+
+    // 5) RegionMap / Chart — кликабельные geom в iframe
+    for (var gi = 0; gi < nodes.length; gi++) {
+      var ghost = nodes[gi];
+      if (!isGeomHost(ghost)) continue;
+      var gname = attrName(ghost) || attrType(ghost) || "Map";
+      var geoms = collectGeoms(ghost);
+      var cap = Math.min(geoms.length, GEOM_CLICK_CAP);
+      if (geoms.length > GEOM_CLICK_CAP) {
+        console.warn(
+          "[dash-shot] geoms capped",
+          gname,
+          geoms.length,
+          "→",
+          GEOM_CLICK_CAP
+        );
+      }
+      for (var gj = 0; gj < cap; gj++) {
+        (function (hst, geom, fname, idx) {
+          var gl = geomLabel(geom);
+          add({
+            kind: "geom",
+            host: hst,
+            el: hst, // рамка на карте/чарте целиком (geom в iframe)
+            label: fname + ": " + gl,
+            activate: function () {
+              return activateGeom(hst, geom);
+            },
+          });
+        })(ghost, geoms[gj], gname, gj);
+      }
+    }
+
     // сверху вниз, слева направо
     out.sort(function (a, b) {
       var ra = a.el.getBoundingClientRect();
@@ -1715,7 +2100,14 @@
         return {
           kind: t.kind,
           label: t.label,
-          box: Math.round(r.left) + "," + Math.round(r.top) + " " + Math.round(r.width) + "x" + Math.round(r.height),
+          box:
+            Math.round(r.left) +
+            "," +
+            Math.round(r.top) +
+            " " +
+            Math.round(r.width) +
+            "x" +
+            Math.round(r.height),
         };
       })
     );
@@ -1931,151 +2323,242 @@
         console.warn("[dash-shot] activate threw", e);
       }
     }
-    if (target.kind === "button" && target.host) return activateDashButton(target.host);
+    if (target.kind === "button" && target.host)
+      return activateDashButton(target.host);
     if (target.kind === "listbox" && target.item)
       return activateListItem(target.item, target.host);
+    if (target.kind === "combo" && target.item)
+      return activateComboValue(target.host, target.item);
+    if (target.kind === "interaction" && target.host)
+      return activateInteractionHost(target.host);
     return false;
   }
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
+  /**
+   * Скан по страницам: инвентарь → baseline → клики
+   * (ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms).
+   */
   async function scanButtons() {
-    var root = captureRoot();
-    if (!root) {
-      setStatus("панель не найдена");
-      return;
-    }
     var btn = document.getElementById("dashShotBtn");
     var scanBtn = document.getElementById("dashScanBtn");
     if (btn) btn.disabled = true;
     if (scanBtn) scanBtn.disabled = true;
 
     var logLines = [];
+    var inventoryLines = [];
     var scanId = stamp();
     var clearHl = function () {};
+    var totalClicks = 0;
     try {
       await loadScript(HTML2CANVAS);
-      var targets = collectClickTargets(root);
-      if (!targets.length) {
-        setStatus("целей клика не найдено (ListBox/Button)");
-        return;
-      }
-
-      var foundList = targets
-        .map(function (t, idx) {
-          return idx + 1 + ") [" + t.kind + "] " + t.label;
-        })
-        .join("; ");
-      console.log("[dash-shot] scan targets:", foundList);
-      setStatus("найдено " + targets.length + " — смотри красные номера…");
-      previewAllTargets(targets);
-      await sleep(2500);
-      clearClickHighlight();
-
-      // 0) исходное состояние
-      setStatus("0/" + targets.length + " исходное…");
-      var base = await takeScreenshot({
-        label: "00_baseline",
-        banner: "Без клика (исходное)",
-        quiet: true,
+      var pages = collectDashboardPages();
+      setStatus("страниц: " + pages.length + " — инвентарь…");
+      inventoryLines.push("PAGES (" + pages.length + "):");
+      pages.forEach(function (p, i) {
+        inventoryLines.push(
+          "  " + (i + 1) + ") [" + p.index + "] " + p.label
+        );
       });
-      logLines.push(
-        "00 | Без клика (исходное) | png=" +
-          (base && base.png) +
-          " | pdf=" +
-          ((base && base.pdfs) || []).join(",")
-      );
-      logLines.push("targets: " + foundList);
 
-      for (var i = 0; i < targets.length; i++) {
-        var target = targets[i];
-        var label = target.label;
-        var step = i + 1 + "/" + targets.length;
-        var slug =
-          String(i + 1).padStart(2, "0") +
+      for (var pi = 0; pi < pages.length; pi++) {
+        var page = pages[pi];
+        var pageSlug =
+          "p" +
+          String(page.index).padStart(2, "0") +
           "_" +
-          target.kind +
-          "_" +
-          safeSlug(label);
-        setStatus(step + " подсветка: " + label);
-        clearHl = highlightClickTarget(target.el, label, step);
-        await sleep(1000);
+          safeSlug(page.label);
+        setStatus(
+          "стр. " + (pi + 1) + "/" + pages.length + ": " + page.label
+        );
+        logLines.push("");
+        logLines.push("=== PAGE " + page.label + " (index " + page.index + ") ===");
 
-        setStatus(step + " клик: " + label);
-        var clicked = false;
-        try {
-          clicked = activateClickTarget(target);
-        } catch (e) {
-          console.warn("[dash-shot] click failed", label, e);
-          logLines.push(slug + " | CLICK FAIL " + label);
-          clearHl();
-          clearHl = function () {};
+        if (typeof page.activate === "function") {
+          try {
+            page.activate();
+          } catch (e) {
+            console.warn("[dash-shot] page switch", e);
+          }
+          await waitDashboardIdle(1000, 14000);
+          await sleep(500);
+        }
+
+        var root = captureRoot();
+        if (!root) {
+          logLines.push("page root missing");
           continue;
         }
-        if (!clicked) {
-          console.warn("[dash-shot] activate returned false", label);
-        }
 
-        // ждём ApplyFilters / DashboardButtonElementApplyEvents → перерисовку
-        setStatus(step + " ждём перерисовку: " + label);
-        clearHl();
-        clearHl = function () {};
-        var redrawn = await waitDashboardIdle(800, 14000);
-        console.log(
-          "[dash-shot] idle after",
-          label,
-          redrawn ? "saw redraw" : "no busy flag (still waited)"
-        );
-        await sleep(400);
+        var inv = inventoryPageElements(root);
+        inventoryLines.push("");
+        inventoryLines.push("PAGE " + page.label + " elements:");
+        Object.keys(inv.counts)
+          .sort()
+          .forEach(function (t) {
+            inventoryLines.push("  " + t + ": " + inv.counts[t]);
+          });
+        inv.elements.forEach(function (e) {
+          inventoryLines.push(
+            "  - " +
+              e.type +
+              " / " +
+              (e.name || "?") +
+              (e.interaction ? " interaction=" + e.interaction : "") +
+              (e.items ? " items=" + e.items : "")
+          );
+        });
+        console.log("[dash-shot] inventory", page.label, inv);
 
-        // DOM после filter часто пересоздаётся — подсветку ставим заново если нашли
-        var el = null;
-        try {
-          var again = collectClickTargets(captureRoot() || root);
-          var match = again.filter(function (t) {
-            return t.kind === target.kind && t.label === label;
-          })[0];
-          if (match) {
-            target = match;
-            el = match.el;
-          }
-        } catch (e) {}
-        if (el && el.isConnected) {
-          clearHl = highlightClickTarget(el, label, step + " нажато");
-          await sleep(300);
-        }
-
-        var shot = await takeScreenshot({
-          label: slug,
-          banner: step + " Нажато: " + label,
+        setStatus(page.label + " — baseline…");
+        var base = await takeScreenshot({
+          label: pageSlug + "__00_baseline",
+          banner: "Страница: " + page.label + " (без клика)",
           quiet: true,
         });
-        clearHl();
-        clearHl = function () {};
         logLines.push(
-          slug +
-            " | Нажато: " +
-            label +
-            " | kind=" +
-            target.kind +
-            " | png=" +
-            (shot && shot.png) +
+          "baseline | png=" +
+            (base && base.png) +
             " | pdf=" +
-            ((shot && shot.pdfs) || []).join(",")
+            ((base && base.pdfs) || []).join(",")
         );
+
+        var targets = collectClickTargets(root);
+        logLines.push("targets: " + targets.length);
+        targets.forEach(function (t, idx) {
+          logLines.push(
+            "  " + (idx + 1) + ") [" + t.kind + "] " + t.label
+          );
+        });
+
+        if (!targets.length) {
+          setStatus(page.label + " — нет кликабельных целей");
+          await sleep(600);
+          continue;
+        }
+
+        setStatus(
+          page.label + ": " + targets.length + " целей — номера…"
+        );
+        previewAllTargets(targets);
+        await sleep(2200);
+        clearClickHighlight();
+
+        for (var i = 0; i < targets.length; i++) {
+          var target = targets[i];
+          var label = target.label;
+          var step = i + 1 + "/" + targets.length;
+          var slug =
+            pageSlug +
+            "__" +
+            String(i + 1).padStart(2, "0") +
+            "_" +
+            target.kind +
+            "_" +
+            safeSlug(label);
+          setStatus(page.label + " " + step + " → " + label);
+          clearHl = highlightClickTarget(target.el, label, step);
+          await sleep(700);
+
+          var clicked = false;
+          try {
+            clicked = activateClickTarget(target);
+          } catch (e) {
+            console.warn("[dash-shot] click failed", label, e);
+            logLines.push(slug + " | CLICK FAIL " + label);
+            clearHl();
+            clearHl = function () {};
+            continue;
+          }
+          if (!clicked) {
+            logLines.push(slug + " | ACTIVATE FALSE " + label);
+            console.warn("[dash-shot] activate false", label);
+          }
+
+          setStatus(page.label + " " + step + " ждём перерисовку…");
+          clearHl();
+          clearHl = function () {};
+          var redrawn = await waitDashboardIdle(800, 14000);
+          console.log(
+            "[dash-shot] idle",
+            label,
+            redrawn ? "redraw" : "no-busy"
+          );
+          await sleep(350);
+
+          var el = null;
+          try {
+            root = captureRoot() || root;
+            var again = collectClickTargets(root);
+            var match = again.filter(function (t) {
+              return t.kind === target.kind && t.label === label;
+            })[0];
+            if (match) {
+              target = match;
+              el = match.el;
+            }
+          } catch (e) {}
+          if (el && el.isConnected) {
+            clearHl = highlightClickTarget(el, label, step + " нажато");
+            await sleep(250);
+          }
+
+          var shot = await takeScreenshot({
+            label: slug,
+            banner:
+              "Стр. " + page.label + " | " + step + " Нажато: " + label,
+            quiet: true,
+          });
+          clearHl();
+          clearHl = function () {};
+          totalClicks++;
+          logLines.push(
+            slug +
+              " | Нажато: " +
+              label +
+              " | kind=" +
+              target.kind +
+              " | png=" +
+              (shot && shot.png) +
+              " | pdf=" +
+              ((shot && shot.pdfs) || []).join(",")
+          );
+        }
       }
 
+      var invName = "inventory_" + scanId + ".txt";
+      var invBody =
+        "Инвентарь дашборда " +
+        scanId +
+        "\n\n" +
+        inventoryLines.join("\n") +
+        "\n";
       var logName = "buttons_scan_" + scanId + ".txt";
       var logBody =
         "Скан кликов " +
         scanId +
         "\n" +
-        "Сначала ListBox/TreeView пункты, потом StiButton\n" +
-        "Каждая строка: slug | что нажато | файлы\n\n" +
+        "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart geoms\n" +
+        "Кликов: " +
+        totalClicks +
+        "\n\n" +
         logLines.join("\n") +
         "\n";
       try {
-        var logB64 = btoa(unescape(encodeURIComponent(logBody)));
-        await postExportFile(logName, logB64, "txt");
+        await postExportFile(
+          invName,
+          btoa(unescape(encodeURIComponent(invBody))),
+          "txt"
+        );
+        downloadBlob(
+          new Blob([invBody], { type: "text/plain;charset=utf-8" }),
+          invName
+        );
+        await postExportFile(
+          logName,
+          btoa(unescape(encodeURIComponent(logBody))),
+          "txt"
+        );
         downloadBlob(
           new Blob([logBody], { type: "text/plain;charset=utf-8" }),
           logName
@@ -2083,7 +2566,15 @@
       } catch (e) {
         console.warn("[dash-shot] scan log", e);
       }
-      setStatus("скан готов: " + targets.length + " | " + logName);
+      setStatus(
+        "скан готов: " +
+          pages.length +
+          " стр., " +
+          totalClicks +
+          " кликов | " +
+          logName
+      );
+      console.log("[dash-shot] inventory\n" + invBody);
       console.log("[dash-shot] scan log\n" + logBody);
     } catch (err) {
       console.error(err);
@@ -2121,7 +2612,7 @@
     scanBtn.type = "button";
     scanBtn.textContent = "Скан кликов";
     scanBtn.title =
-      "ListBox-пункты и StiButton: клик по каждому → скрин+PDF, на PNG написано что нажато";
+      "По страницам: ListBox, ComboBox, Button, Image/Text interaction, RegionMap/Chart → скрин+PDF";
     scanBtn.style.cssText = btnStyle;
     scanBtn.onclick = function () {
       scanButtons();
