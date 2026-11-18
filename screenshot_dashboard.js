@@ -1414,9 +1414,10 @@
     }
   }
 
-  // Lean-скан: только карта (области) + немного ComboBox. Без ListBox/кнопок/image.
+  // Скан: карта (области) + Combo + Button + Image/Text с OnClick. Без ListBox-спама.
   var COMBO_HOST_CAP = 2; // сколько ComboBox на странице
   var COMBO_CLICK_CAP = 3; // значений в каждом
+  var MAP_HOST_CAP = 1; // сколько карт на странице (иначе 4×7 кликов)
   var DRILL_CLICK_CAP = 8; // областей карты (алиасы РБ ≤7)
   /** Коды областей РБ из map-region-click.md */
   var MAP_REGION_ALIASES = [
@@ -1455,17 +1456,33 @@
     return /StiRegionMapElement|StiChartElement/i.test(attrType(el));
   }
 
+  function readElementInteraction(el) {
+    try {
+      var ca = el.elementAttributes && el.elementAttributes.contentAttributes;
+      var ix =
+        (ca && (ca.interaction || ca.dashboardInteraction)) ||
+        el.dashboardInteraction ||
+        el.interaction ||
+        null;
+      if (!ix) return null;
+      var onClick = ix.onClick != null ? ix.onClick : ix.OnClick;
+      if (onClick == null || onClick === "None" || onClick === "") return null;
+      return {
+        onClick: String(onClick),
+        drillDownPageKey: ix.drillDownPageKey || ix.DrillDownPageKey || null,
+        hyperlink: ix.hyperlink || ix.Hyperlink || null,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   function isInteractionHost(el) {
     var t = attrType(el);
     if (!/StiImageElement|StiTextElement|StiIndicatorElement|StiCardsElement/i.test(t))
       return false;
-    try {
-      var ca = el.elementAttributes && el.elementAttributes.contentAttributes;
-      var ix = ca && ca.interaction;
-      return !!(ix && ix.onClick && ix.onClick !== "None");
-    } catch (e) {
-      return false;
-    }
+    var ix = readElementInteraction(el);
+    return !!(ix && ix.onClick && ix.onClick !== "OpenHyperlink");
   }
 
   function isVisibleBox(el) {
@@ -2120,16 +2137,22 @@
       console.warn("[dash-shot] no onclick on geom", geomLabel(geom));
       return { ok: false, needReturnCountry: false };
     }
+    var unflash = flashGeom(clickNode);
+    await sleep(450);
     var before = dashboardScreenKey();
     console.log("[dash-shot] map onclick.call", geomLabel(clickNode), "key~", before.slice(0, 80));
     try {
       clickNode.onclick.call(clickNode);
     } catch (e) {
       console.warn("[dash-shot] onclick.call", e);
+      unflash();
       return { ok: false, needReturnCountry: false };
     }
     var changed = await waitScreenKeyChange(before, 8000);
     console.log("[dash-shot] map drill", changed ? "OK screen changed" : "FAIL key same");
+    try {
+      unflash();
+    } catch (e) {}
     return { ok: changed, needReturnCountry: true };
   }
 
@@ -2141,20 +2164,18 @@
   /** Image/Text с interaction.onClick. */
   function activateInteractionHost(host) {
     if (!host) return false;
+    var ix = readElementInteraction(host);
     try {
       if (typeof host.onclick === "function") {
         host.onclick();
-        console.log("[dash-shot] interaction onclick", attrName(host));
+        console.log("[dash-shot] interaction onclick", attrName(host), ix && ix.onClick);
         return true;
       }
     } catch (e) {}
     try {
       var js = getViewerJs();
-      var ca =
-        host.elementAttributes && host.elementAttributes.contentAttributes;
-      var ix = ca && ca.interaction;
       if (!js || !ix) return false;
-      if (ix.onClick === "ShowDashboard" && ix.drillDownPageKey) {
+      if (/ShowDashboard|DrillDown/i.test(ix.onClick) && ix.drillDownPageKey) {
         js.postInteraction({
           action: "DashboardDrillDown",
           drillDownParameters: {
@@ -2164,17 +2185,99 @@
           },
           pageNumber: 0,
         });
+        console.log("[dash-shot] interaction drill", attrName(host), ix.drillDownPageKey);
         return true;
       }
-      if (ix.onClick === "OpenHyperlink" && ix.hyperlink) {
-        // не уводим со страницы — только логируем
+      if (ix.onClick === "OpenHyperlink") {
         console.log("[dash-shot] skip OpenHyperlink", ix.hyperlink);
         return false;
       }
+      // ApplyFilter / ApplyFilters / свой OnClick — DOM click по лицу
+      host.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
+      );
+      if (typeof host.click === "function") host.click();
+      console.log("[dash-shot] interaction DOM click", attrName(host), ix.onClick);
+      return true;
     } catch (e) {
       console.warn("[dash-shot] interaction", e);
     }
     return false;
+  }
+
+  /** Rect элемента в координатах окна (карта часто в iframe). */
+  function screenRectOf(el, host) {
+    if (!el || !el.getBoundingClientRect) return null;
+    try {
+      var r = el.getBoundingClientRect();
+      if (el.ownerDocument && el.ownerDocument !== document) {
+        var iframe =
+          (host && (host.frame || (host.querySelector && host.querySelector("iframe")))) ||
+          null;
+        if (!iframe && el.ownerDocument.defaultView) {
+          try {
+            iframe = el.ownerDocument.defaultView.frameElement;
+          } catch (e) {}
+        }
+        if (iframe) {
+          var ir = iframe.getBoundingClientRect();
+          return {
+            left: ir.left + r.left,
+            top: ir.top + r.top,
+            width: r.width,
+            height: r.height,
+            right: ir.left + r.left + r.width,
+            bottom: ir.top + r.top + r.height,
+          };
+        }
+      }
+      return {
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height,
+        right: r.right,
+        bottom: r.bottom,
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Подсветить SVG-регион перед кликом (видно на карте). */
+  function flashGeom(geom) {
+    if (!geom) return function () {};
+    var prev = {
+      fill: geom.style && geom.style.fill,
+      stroke: geom.style && geom.style.stroke,
+      sw: geom.style && geom.style.strokeWidth,
+      opacity: geom.style && geom.style.opacity,
+      attrFill: null,
+    };
+    try {
+      prev.attrFill = geom.getAttribute("fill");
+    } catch (e) {}
+    try {
+      if (geom.style) {
+        geom.style.fill = "#ef4444";
+        geom.style.stroke = "#ffffff";
+        geom.style.strokeWidth = "3px";
+        geom.style.opacity = "0.9";
+      }
+      geom.setAttribute("fill", "#ef4444");
+    } catch (e) {}
+    return function () {
+      try {
+        if (geom.style) {
+          geom.style.fill = prev.fill || "";
+          geom.style.stroke = prev.stroke || "";
+          geom.style.strokeWidth = prev.sw || "";
+          geom.style.opacity = prev.opacity || "";
+        }
+        if (prev.attrFill != null) geom.setAttribute("fill", prev.attrFill);
+        else geom.removeAttribute("fill");
+      } catch (e) {}
+    };
   }
 
   /** Вкладки дашбордов (страницы верхнего уровня). */
@@ -2252,12 +2355,18 @@
       counts[t]++;
       var ca =
         el.elementAttributes && el.elementAttributes.contentAttributes;
-      var ix = ca && ca.interaction;
+      var ix = readElementInteraction(el);
       var nItems = (ca && ca.items && ca.items.length) || 0;
+      var role = null;
+      if (/ButtonElement/i.test(t)) role = "button";
+      else if (/RegionMap/i.test(t)) role = "map";
+      else if (/ComboBox|TreeViewBox/i.test(t)) role = "filter_combo";
+      else if (/ImageElement|TextElement/i.test(t) && ix) role = "interaction";
       list.push({
         type: t,
         name: attrName(el),
-        interaction: ix && ix.onClick ? ix.onClick : null,
+        role: role,
+        interaction: ix ? ix.onClick : null,
         items: nItems,
       });
     }
@@ -2269,8 +2378,8 @@
   }
 
   /**
-   * Lean: только RegionMap (области) + до COMBO_HOST_CAP×COMBO_CLICK_CAP ComboBox.
-   * ListBox / Button / Image — не кликаем (лишний шум).
+   * Цели: RegionMap (области) + Combo + Button + Image/Text OnClick.
+   * ListBox не трогаем (шум).
    */
   function collectClickTargets(root) {
     var out = [];
@@ -2286,21 +2395,29 @@
 
     var nodes = root.querySelectorAll("*");
 
-    // 1) RegionMap — области РБ (главное)
+    // 1) RegionMap — области (подсветка по SVG-геоме, не по всей карте)
+    var mapHosts = 0;
     for (var gi = 0; gi < nodes.length; gi++) {
+      if (mapHosts >= MAP_HOST_CAP) break;
       var ghost = nodes[gi];
       if (!/RegionMap/i.test(attrType(ghost))) continue;
       if (!isVisibleBox(ghost)) continue;
+      mapHosts++;
       var gname = attrName(ghost) || "Map";
       var regions = pickRegionGeoms(ghost);
+      console.log("[dash-shot] map", gname, "regions", regions.length);
       for (var gj = 0; gj < regions.length; gj++) {
         (function (hst, reg, fname) {
           add({
             kind: "geom",
             host: hst,
+            geom: reg.geom,
             el: hst,
             label: fname + " ↓ " + reg.label,
             needReturnCountry: true,
+            screenRect: function () {
+              return screenRectOf(reg.geom, hst) || screenRectOf(hst, null);
+            },
             activate: function () {
               return activateGeom(hst, reg.geom);
             },
@@ -2321,7 +2438,6 @@
       var ca =
         combo.elementAttributes && combo.elementAttributes.contentAttributes;
       var items = (ca && ca.items) || [];
-      // пропуск пустых / All-only если есть нормальные
       var filtered = [];
       for (var fi = 0; fi < items.length; fi++) {
         var it0 = items[fi];
@@ -2354,10 +2470,57 @@
       }
     }
 
-    // сверху вниз, слева направо
+    // 3) StiButtonElement
+    for (var b = 0; b < nodes.length; b++) {
+      var btn = nodes[b];
+      if (!isButtonHost(btn)) continue;
+      if (!isVisibleBox(btn)) continue;
+      (function (h) {
+        var face = buttonFace(h);
+        add({
+          kind: "button",
+          host: h,
+          el: face || h,
+          label: buttonLabel(h),
+          activate: function () {
+            return activateDashButton(h);
+          },
+        });
+      })(btn);
+    }
+
+    // 4) Image / Text с OnClick (не OpenHyperlink)
+    for (var ii = 0; ii < nodes.length; ii++) {
+      var ihost = nodes[ii];
+      if (!isInteractionHost(ihost)) continue;
+      if (!isVisibleBox(ihost)) continue;
+      (function (h) {
+        var ix = readElementInteraction(h);
+        add({
+          kind: "interaction",
+          host: h,
+          el: h,
+          label:
+            (attrName(h) || attrType(h) || "img") +
+            " [" +
+            (ix && ix.onClick ? ix.onClick : "?") +
+            "]",
+          activate: function () {
+            return activateInteractionHost(h);
+          },
+        });
+      })(ihost);
+    }
+
     out.sort(function (a, b) {
-      var ra = a.el.getBoundingClientRect();
-      var rb = b.el.getBoundingClientRect();
+      var ra =
+        (a.screenRect && a.screenRect()) ||
+        (a.el && a.el.getBoundingClientRect && a.el.getBoundingClientRect()) ||
+        { top: 0, left: 0 };
+      var rb =
+        (b.screenRect && b.screenRect()) ||
+        (b.el && b.el.getBoundingClientRect && b.el.getBoundingClientRect()) ||
+        { top: 0, left: 0 };
       if (Math.abs(ra.top - rb.top) > 12) return ra.top - rb.top;
       return ra.left - rb.left;
     });
@@ -2365,18 +2528,21 @@
     console.log(
       "[dash-shot] click targets",
       out.map(function (t) {
-        var r = t.el.getBoundingClientRect();
+        var r =
+          (t.screenRect && t.screenRect()) ||
+          (t.el && t.el.getBoundingClientRect && t.el.getBoundingClientRect());
         return {
           kind: t.kind,
           label: t.label,
-          box:
-            Math.round(r.left) +
-            "," +
-            Math.round(r.top) +
-            " " +
-            Math.round(r.width) +
-            "x" +
-            Math.round(r.height),
+          box: r
+            ? Math.round(r.left) +
+              "," +
+              Math.round(r.top) +
+              " " +
+              Math.round(r.width) +
+              "x" +
+              Math.round(r.height)
+            : "?",
         };
       })
     );
@@ -2392,19 +2558,25 @@
 
   /**
    * Яркая рамка + плашка «КЛИК → …» по реальному el (пункт списка / лицо кнопки).
-   * Fixed — видно вживую; inset на HTML-родителе — попадает в скрин.
+   * optRect — экранные координаты (для геома внутри iframe карты).
    */
-  function highlightClickTarget(el, label, stepText) {
+  function highlightClickTarget(el, label, stepText, optRect) {
     clearClickHighlight();
-    if (!el) return function () {};
+    if (!el && !optRect) return function () {};
     try {
-      el.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+      if (el && el.scrollIntoView) {
+        el.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+      }
     } catch (e) {
       try {
-        el.scrollIntoView(true);
+        if (el) el.scrollIntoView(true);
       } catch (e2) {}
     }
-    var r = el.getBoundingClientRect();
+    var r = optRect || (el && el.getBoundingClientRect && el.getBoundingClientRect());
+    if (!r || !(r.width > 0 || r.height > 0)) {
+      if (el && el.getBoundingClientRect) r = el.getBoundingClientRect();
+    }
+    if (!r) return function () {};
     var pad = 6;
     var caption =
       (stepText ? stepText + " " : "") + "КЛИК → " + (label || "?");
@@ -2458,12 +2630,18 @@
     document.body.appendChild(ring);
     document.body.appendChild(tag);
 
-    // inset только на HTMLElement (не SVG) — иначе html2canvas/DOM ломается
+    // inset только на HTMLElement в том же document — SVG/iframe пропускаем
     var mount = el;
-    if (!mount.tagName || mount.tagName.toLowerCase() === "svg" || mount.namespaceURI === "http://www.w3.org/2000/svg") {
-      mount = el.parentElement || el;
+    if (
+      !mount ||
+      !mount.tagName ||
+      (mount.ownerDocument && mount.ownerDocument !== document) ||
+      mount.tagName.toLowerCase() === "svg" ||
+      mount.namespaceURI === "http://www.w3.org/2000/svg"
+    ) {
+      mount = el && el.ownerDocument === document ? el.parentElement : null;
     }
-    if (mount && mount.tagName && mount.tagName.toLowerCase() !== "svg") {
+    if (mount && mount.tagName && mount.tagName.toLowerCase() !== "svg" && mount.ownerDocument === document) {
       if (getComputedStyle(mount).position === "static") {
         mount.setAttribute("data-dash-shot-pos", mount.style.position || "");
         mount.style.position = "relative";
@@ -2541,9 +2719,17 @@
       document.head.appendChild(st);
     }
     for (var i = 0; i < targets.length; i++) {
-      var el = targets[i].el;
-      if (!el || !el.getBoundingClientRect) continue;
-      var r = el.getBoundingClientRect();
+      var t = targets[i];
+      var el = t.el;
+      var r =
+        (typeof t.screenRect === "function" && t.screenRect()) ||
+        (el && el.getBoundingClientRect && el.getBoundingClientRect());
+      if (!r || !(r.width > 2 || r.height > 2)) continue;
+      if (t.kind === "geom" && t.geom) {
+        try {
+          flashGeom(t.geom);
+        } catch (e) {}
+      }
       var ring = document.createElement("div");
       ring.setAttribute("data-dash-shot-hl", "1");
       ring.style.cssText = [
@@ -2697,6 +2883,7 @@
               e.type +
               " / " +
               (e.name || "?") +
+              (e.role ? " role=" + e.role : "") +
               (e.interaction ? " interaction=" + e.interaction : "") +
               (e.items ? " items=" + e.items : "")
           );
@@ -2731,7 +2918,10 @@
         }
 
         setStatus(
-          page.label + ": " + targets.length + " целей (карта+combo)…"
+          page.label +
+            ": " +
+            targets.length +
+            " целей (карта/combo/button/image)…"
         );
         previewAllTargets(targets);
         await sleep(900);
@@ -2750,8 +2940,14 @@
             "_" +
             safeSlug(label);
           setStatus(page.label + " " + step + " → " + label);
-          clearHl = highlightClickTarget(target.el, label, step);
-          await sleep(700);
+          var preRect =
+            typeof target.screenRect === "function" ? target.screenRect() : null;
+          var unflash = function () {};
+          if (target.kind === "geom" && target.geom) {
+            unflash = flashGeom(target.geom);
+          }
+          clearHl = highlightClickTarget(target.el, label, step, preRect);
+          await sleep(900);
 
           var act = { ok: false, needReturnCountry: false };
           try {
@@ -2759,16 +2955,21 @@
           } catch (e) {
             console.warn("[dash-shot] click failed", label, e);
             logLines.push(slug + " | CLICK FAIL " + label);
+            try {
+              unflash();
+            } catch (e2) {}
             clearHl();
             clearHl = function () {};
             continue;
           }
+          try {
+            unflash();
+          } catch (e3) {}
           if (!act.ok) {
             logLines.push(slug + " | ACTIVATE FALSE " + label);
             console.warn("[dash-shot] activate false", label);
             clearHl();
             clearHl = function () {};
-            // после неудачного провала всё равно сбросим карту
             if (target.kind === "geom") {
               await returnToCountryMap();
             }
@@ -2788,10 +2989,15 @@
 
           var el = target.el;
           if (el && el.isConnected) {
+            var postRect =
+              typeof target.screenRect === "function"
+                ? target.screenRect()
+                : null;
             clearHl = highlightClickTarget(
               el,
               label,
-              step + (act.needReturnCountry ? " ↓ регион" : " нажато")
+              step + (act.needReturnCountry ? " ↓ регион" : " нажато"),
+              postRect
             );
             await sleep(250);
           }
