@@ -78,6 +78,66 @@
     });
   }
 
+  /** StiJsViewer — postInteraction / ApplyFilters. */
+  function getViewerJs() {
+    try {
+      if (window.__dashViewerJs && window.__dashViewerJs.postInteraction)
+        return window.__dashViewerJs;
+    } catch (e) {}
+    try {
+      var v = window.__dashViewer;
+      if (v && v.jsObject && v.jsObject.postInteraction) {
+        window.__dashViewerJs = v.jsObject;
+        return v.jsObject;
+      }
+    } catch (e) {}
+    try {
+      var root = document.getElementById("viewerContent") || document.body;
+      var all = root.getElementsByTagName("*");
+      for (var i = 0; i < all.length; i++) {
+        var jo = all[i].jsObject;
+        if (jo && typeof jo.postInteraction === "function") {
+          window.__dashViewerJs = jo;
+          return jo;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  /** Ждём ApplyFilters / перерисовку дашборда после клика. */
+  async function waitDashboardIdle(minMs, maxMs) {
+    var js = getViewerJs();
+    await sleep(minMs != null ? minMs : 700);
+    var t0 = Date.now();
+    maxMs = maxMs != null ? maxMs : 12000;
+    var sawBusy = false;
+    while (Date.now() - t0 < maxMs) {
+      var busy = false;
+      try {
+        if (js && js.options) {
+          if (js.options.interactionInProgress || js.options.refreshInProgress)
+            busy = true;
+        }
+        var pi = js && js.controls && js.controls.processImage;
+        if (pi && pi.style && pi.style.display !== "none" && pi.style.display !== "")
+          busy = true;
+      } catch (e) {}
+      if (busy) sawBusy = true;
+      if (sawBusy && !busy) {
+        await sleep(600);
+        return true;
+      }
+      // фильтр с debounce 500ms — даём шанс стартовать
+      if (!sawBusy && Date.now() - t0 > 3500) {
+        await sleep(900);
+        return false;
+      }
+      await sleep(200);
+    }
+    return false;
+  }
+
   /** Имя файла без пробелов/спецсимволов. */
   function safeSlug(text, maxLen) {
     var s = String(text || "")
@@ -1425,6 +1485,128 @@
   }
 
   /**
+   * Пункт ListBox: как живой клик Stimulsoft → ApplyFilters → перерисовка.
+   * CheckBox: button.action() сам тоглит isChecked и зовёт item.action/itemAction.
+   */
+  function activateListItem(item, host) {
+    if (!item) return false;
+    try {
+      if (item.button && typeof item.button.action === "function") {
+        item.button.action();
+        console.log("[dash-shot] listbox via button.action", listItemLabel(item));
+        return true;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] button.action", e);
+    }
+    try {
+      if (typeof item.setChecked === "function") {
+        item.setChecked(!item.isChecked);
+      }
+    } catch (e) {}
+    try {
+      if (typeof item.action === "function") {
+        item.action();
+        console.log("[dash-shot] listbox via item.action", listItemLabel(item));
+        return true;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] item.action", e);
+    }
+    try {
+      if (typeof item.onclick === "function") {
+        item.onclick();
+        console.log("[dash-shot] listbox via onclick", listItemLabel(item));
+        return true;
+      }
+    } catch (e) {}
+
+    // прямой ApplyFilters
+    try {
+      var js = getViewerJs();
+      if (js && host && typeof js.ApplyFiltersToDashboardElement === "function") {
+        var ca =
+          host.elementAttributes && host.elementAttributes.contentAttributes;
+        var path = (ca && ca.columnPath) || "";
+        var mode = ca && ca.selectionMode;
+        var filters;
+        if (mode === "Multi") {
+          if (typeof host.getFilters === "function") filters = host.getFilters();
+          else
+            filters = [
+              {
+                condition: "EqualTo",
+                value: item.value,
+                path: path,
+              },
+            ];
+        } else {
+          filters = item.isAllValue
+            ? []
+            : [{ condition: "equalTo", value: item.value, path: path }];
+        }
+        var params =
+          typeof host.getFilterParameters === "function"
+            ? host.getFilterParameters()
+            : null;
+        js.ApplyFiltersToDashboardElement(host, filters, null, params);
+        console.log("[dash-shot] listbox via ApplyFilters", listItemLabel(item), filters);
+        return true;
+      }
+    } catch (e) {
+      console.warn("[dash-shot] ApplyFilters", e);
+    }
+    return false;
+  }
+
+  /** StiButton → postInteraction(DashboardButtonElementApplyEvents) + перерисовка. */
+  function activateDashButton(host) {
+    if (!host) return false;
+    var attrs = host.elementAttributes || {};
+    var ca = attrs.contentAttributes || {};
+    var name = attrs.name;
+    try {
+      // как в SubscribeToButtonElementActionEvents
+      if (ca.buttonType !== "Button") {
+        host.isChecked = !host.isChecked;
+        try {
+          if (typeof host.repaint === "function") host.repaint();
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    var js = getViewerJs();
+    if (js && name && typeof js.postInteraction === "function") {
+      try {
+        js.postInteraction({
+          action: "DashboardButtonElementApplyEvents",
+          dashboardFilteringParameters: {
+            elementName: name,
+            isChecked: !!host.isChecked,
+          },
+        });
+        console.log("[dash-shot] button postInteraction", name, !!host.isChecked);
+        return true;
+      } catch (e) {
+        console.warn("[dash-shot] postInteraction", e);
+      }
+    }
+
+    // fallback: нативный click (addEventListener на host)
+    try {
+      host.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
+      );
+      if (typeof host.click === "function") host.click();
+      console.log("[dash-shot] button DOM click fallback", name);
+      return true;
+    } catch (e) {
+      console.warn("[dash-shot] button click fail", e);
+      return false;
+    }
+  }
+
+  /**
    * Цели клика: сначала пункты ListBox/TreeView (часто выглядят как «кнопки»),
    * потом StiButtonElement. У каждой — el (куда рамка/клик) + activate().
    */
@@ -1460,22 +1642,18 @@
           var hasAction = typeof item.action === "function";
           var hasVal = item.value != null || item.label != null;
           if (!hasAction && !hasVal) continue;
-          (function (it, fname) {
+          (function (it, hst, fname) {
             add({
               kind: "listbox",
-              host: host,
-              el: it,
+              host: hst,
+              item: it,
+              el: it.button || it,
               label: fname + ": " + listItemLabel(it),
               activate: function () {
-                if (typeof it.action === "function") it.action();
-                else if (typeof it.click === "function") it.click();
-                else
-                  it.dispatchEvent(
-                    new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
-                  );
+                return activateListItem(it, hst);
               },
             });
-          })(item, filterName);
+          })(item, host, filterName);
         }
       }
       // horizontal table cells
@@ -1487,24 +1665,24 @@
             var child = cell.firstElementChild || cell;
             if (typeof child.action !== "function" && child.value == null && child.label == null)
               continue;
-            (function (it, fname) {
+            (function (it, hst, fname) {
               add({
                 kind: "listbox",
-                host: host,
-                el: it,
+                host: hst,
+                item: it,
+                el: it.button || it,
                 label: fname + ": " + listItemLabel(it),
                 activate: function () {
-                  if (typeof it.action === "function") it.action();
-                  else if (typeof it.click === "function") it.click();
+                  return activateListItem(it, hst);
                 },
               });
-            })(child, filterName);
+            })(child, host, filterName);
           }
         }
       } catch (e) {}
     }
 
-    // 2) StiButtonElement — клик по самому host (там SubscribeToButtonElementActionEvents)
+    // 2) StiButtonElement → DashboardButtonElementApplyEvents (перерисовка)
     for (var b = 0; b < nodes.length; b++) {
       var btn = nodes[b];
       if (!isButtonHost(btn)) continue;
@@ -1516,17 +1694,7 @@
           el: face || h,
           label: buttonLabel(h),
           activate: function () {
-            // Stimulsoft слушает click на host, не на svg
-            var evOpts = { bubbles: true, cancelable: true, view: window };
-            try {
-              h.dispatchEvent(new MouseEvent("mouseover", evOpts));
-              h.dispatchEvent(new MouseEvent("mousedown", evOpts));
-              h.dispatchEvent(new MouseEvent("mouseup", evOpts));
-              h.dispatchEvent(new MouseEvent("click", evOpts));
-            } catch (e) {}
-            try {
-              if (typeof h.click === "function") h.click();
-            } catch (e2) {}
+            return activateDashButton(h);
           },
         });
       })(btn);
@@ -1754,21 +1922,19 @@
   }
 
   function activateClickTarget(target) {
-    if (!target) return;
+    if (!target) return false;
     console.log("[dash-shot] activate", target.kind, target.label);
     if (typeof target.activate === "function") {
-      target.activate();
-      return;
+      try {
+        return !!target.activate();
+      } catch (e) {
+        console.warn("[dash-shot] activate threw", e);
+      }
     }
-    var el = target.el;
-    try {
-      el.dispatchEvent(
-        new MouseEvent("click", { bubbles: true, cancelable: true, view: window })
-      );
-    } catch (e) {}
-    try {
-      if (typeof el.click === "function") el.click();
-    } catch (e2) {}
+    if (target.kind === "button" && target.host) return activateDashButton(target.host);
+    if (target.kind === "listbox" && target.item)
+      return activateListItem(target.item, target.host);
+    return false;
   }
 
   /** Клик по каждой цели (ListBox-пункты + StiButton) → скрин+PDF. */
@@ -1835,8 +2001,9 @@
         await sleep(1000);
 
         setStatus(step + " клик: " + label);
+        var clicked = false;
         try {
-          activateClickTarget(target);
+          clicked = activateClickTarget(target);
         } catch (e) {
           console.warn("[dash-shot] click failed", label, e);
           logLines.push(slug + " | CLICK FAIL " + label);
@@ -1844,17 +2011,25 @@
           clearHl = function () {};
           continue;
         }
+        if (!clicked) {
+          console.warn("[dash-shot] activate returned false", label);
+        }
 
-        setStatus(step + " ждём: " + label);
-        await sleep(2200);
-        await new Promise(function (res) {
-          requestAnimationFrame(function () {
-            setTimeout(res, 200);
-          });
-        });
-        // DOM мог перерисоваться — ищем цель заново по label/kind если элемент отвалился
-        var el = target.el;
-        if (!el || !el.isConnected) {
+        // ждём ApplyFilters / DashboardButtonElementApplyEvents → перерисовку
+        setStatus(step + " ждём перерисовку: " + label);
+        clearHl();
+        clearHl = function () {};
+        var redrawn = await waitDashboardIdle(800, 14000);
+        console.log(
+          "[dash-shot] idle after",
+          label,
+          redrawn ? "saw redraw" : "no busy flag (still waited)"
+        );
+        await sleep(400);
+
+        // DOM после filter часто пересоздаётся — подсветку ставим заново если нашли
+        var el = null;
+        try {
           var again = collectClickTargets(captureRoot() || root);
           var match = again.filter(function (t) {
             return t.kind === target.kind && t.label === label;
@@ -1863,10 +2038,10 @@
             target = match;
             el = match.el;
           }
-        }
+        } catch (e) {}
         if (el && el.isConnected) {
           clearHl = highlightClickTarget(el, label, step + " нажато");
-          await sleep(350);
+          await sleep(300);
         }
 
         var shot = await takeScreenshot({
