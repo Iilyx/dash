@@ -344,12 +344,17 @@ def build_viewer(
         # клиентский хук как дополнительный канал
         viewer.onPrepareVariables += "dashApplyFilters"
     # token в URL handler'а — PrepareVariables/BeginProcessData без cookie
+    # StiHandler.url — property без setter, только __init__; пишем private field
     if filter_token:
-        viewer.handler.url = f"/render?rf={filter_token}"
+        handler_url = f"/render?rf={filter_token}"
+        try:
+            viewer.handler._StiBaseHandler__url = handler_url  # noqa: SLF001
+        except Exception:
+            pass
 
     # handler/GetResource — без inject: иначе JS ломается (в файле есть «StiViewer»)
     if sti_process(viewer):
-        return sti_response(viewer, inject_screenshot=False)
+        return sti_response(viewer, inject_screenshot=False, filter_token=filter_token)
 
     report = StiReport()
     report.loadFile("/mrt")
@@ -358,6 +363,7 @@ def build_viewer(
         viewer,
         inject_screenshot=inject_screenshot,
         filters=filters,
+        filter_token=filter_token,
     )
 
 
@@ -413,10 +419,42 @@ def inject_screenshot_ui(html: str) -> str:
     return html
 
 
+def inject_handler_url(html: str, filter_token: str | None) -> str:
+    """Прописать Stimulsoft.handler.url с rf=token (на случай если private set не сработал)."""
+    if not filter_token or not isinstance(html, str):
+        return html
+    url = f"/render?rf={filter_token}"
+    script = (
+        "<script>(function(){\n"
+        f"  var u = {json.dumps(url)};\n"
+        "  function apply(){\n"
+        "    try {\n"
+        "      if (window.Stimulsoft && Stimulsoft.handler) Stimulsoft.handler.url = u;\n"
+        "    } catch (e) {}\n"
+        "  }\n"
+        "  apply();\n"
+        "  document.addEventListener('DOMContentLoaded', apply);\n"
+        "})();</script>\n"
+    )
+    if "window.__dashHandlerUrl" in html:
+        return html
+    script = script.replace(
+        "var u = ",
+        "window.__dashHandlerUrl = true; var u = ",
+        1,
+    )
+    if "</head>" in html:
+        return html.replace("</head>", script + "</head>", 1)
+    if "</body>" in html:
+        return html.replace("</body>", script + "</body>", 1)
+    return html + script
+
+
 def sti_response(
     component,
     inject_screenshot: bool = False,
     filters: dict[str, object] | None = None,
+    filter_token: str | None = None,
 ):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
@@ -427,6 +465,7 @@ def sti_response(
         if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
             html = inject_screenshot_ui(raw)
             html = inject_filter_values_js(html, filters)
+            html = inject_handler_url(html, filter_token)
             resp.set_data(html)
             resp.mimetype = "text/html"
     return resp
