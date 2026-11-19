@@ -360,7 +360,23 @@ def openapi_spec() -> dict:
                                 "properties": {
                                     "key": {},
                                     "value": {},
+                                    "checked": {"type": "boolean"},
                                 },
+                            },
+                        },
+                        "dialog": {
+                            "type": "object",
+                            "description": "DialogInfo: KeysColumn / ValuesColumn / CheckedColumn",
+                            "properties": {
+                                "source": {"type": "string"},
+                                "keys_column": {"type": "string"},
+                                "values_column": {"type": "string"},
+                                "checked_column": {
+                                    "type": "string",
+                                    "description": "DialogInfo.CheckedColumn — какие items checked",
+                                },
+                                "items_from": {"type": "string"},
+                                "allow_user_values": {"type": "boolean"},
                             },
                         },
                         "sql": {"type": "string"},

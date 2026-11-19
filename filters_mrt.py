@@ -3,7 +3,10 @@
 
 Два вида выбора значений:
   - items  — Keys/Values (или Items) заданы в DialogInfo;
-  - query  — KeysColumn/ValuesColumn → DataSource.SqlCommand (+ опционально выполнить SQL).
+  - query  — KeysColumn/ValuesColumn/CheckedColumn → DataSource.SqlCommand
+             (+ опционально выполнить SQL).
+
+В ответе `dialog` всегда несёт KeysColumn / ValuesColumn / CheckedColumn из DialogInfo.
 """
 
 from __future__ import annotations
@@ -164,19 +167,47 @@ def _run_sql(database_url: str, sql: str) -> list[dict]:
             return rows
 
 
+def _truthy_checked(value) -> bool:
+    if value is True or value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "y", "t"}:
+        return True
+    return False
+
+
+def _checked_states_list(di: dict) -> list[bool | None]:
+    """CheckedStates / Checked из DialogInfo → список флагов по индексу."""
+    raw = di.get("CheckedStates")
+    if raw is None:
+        raw = di.get("Checked")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [True if _truthy_checked(x) else False for x in raw]
+    if isinstance(raw, dict):
+        out: list[bool | None] = []
+        for item in numbered(raw):
+            out.append(True if _truthy_checked(item) else False)
+        return out
+    return []
+
+
 def _choices_from_rows(
     rows: list[dict],
     key_col: str | None,
     value_col: str | None,
+    checked_col: str | None = None,
 ) -> list[dict]:
     out: list[dict] = []
     key_l = (key_col or "").lower()
     val_l = (value_col or "").lower()
+    chk_l = (checked_col or "").lower()
     for row in rows:
         # case-insensitive column match
         keymap = {str(k).lower(): k for k in row.keys()}
         kk = keymap.get(key_l) if key_l else None
         vk = keymap.get(val_l) if val_l else None
+        ck = keymap.get(chk_l) if chk_l else None
         key = row.get(kk) if kk else None
         value = row.get(vk) if vk else None
         if key is None and value is None:
@@ -191,9 +222,33 @@ def _choices_from_rows(
             item["key"] = _jsonable(key)
         if value is not None and str(value) != "":
             item["value"] = _jsonable(value)
+        if ck is not None and _truthy_checked(row.get(ck)):
+            item["checked"] = True
         if item:
             out.append(item)
     return out
+
+
+def _dialog_meta(di: dict, *, source_name: str | None = None) -> dict:
+    """Поля DialogInfo для ответа API (включая CheckedColumn)."""
+    keys_column = text(di.get("KeysColumn"))
+    values_column = text(di.get("ValuesColumn"))
+    checked_column = text(di.get("CheckedColumn"))
+    init_type = text(di.get("ItemsInitializationType"))
+    dialog = {
+        "source": source_name,
+        "keys_column": keys_column,
+        "values_column": values_column,
+        "checked_column": checked_column,
+        "items_from": init_type,
+    }
+    if "AllowUserValues" in di:
+        dialog["allow_user_values"] = _flag_true(di.get("AllowUserValues"))
+    # если ключ CheckedColumn есть в .mrt, но значение пустое — всё равно отметим наличие
+    if "CheckedColumn" in di and not checked_column:
+        dialog["checked_column"] = None
+        dialog["has_checked_column"] = True
+    return {k: v for k, v in dialog.items() if v not in (None, "")}
 
 
 def _parse_filter_variable(
@@ -217,14 +272,20 @@ def _parse_filter_variable(
     # still mark as items-mode if Keys/Values keys present
     has_keys_values = "Keys" in di or "Values" in di or "Items" in di
     has_query_shape = (
-        "KeysColumn" in di or "ValuesColumn" in di or "ItemsInitializationType" in di
+        "KeysColumn" in di
+        or "ValuesColumn" in di
+        or "CheckedColumn" in di
+        or "ItemsInitializationType" in di
     )
     keys_column = text(di.get("KeysColumn"))
     values_column = text(di.get("ValuesColumn"))
+    checked_column = text(di.get("CheckedColumn"))
     init_type = text(di.get("ItemsInitializationType"))
     source_name = text(
         di.get("DataSourceName") or di.get("DataSource") or di.get("NameInSource")
-    ) or _source_head(keys_column) or _source_head(values_column)
+    ) or _source_head(keys_column) or _source_head(values_column) or _source_head(
+        checked_column
+    )
 
     item: dict = {
         "index": index,
@@ -240,35 +301,45 @@ def _parse_filter_variable(
     is_query = bool(
         keys_column
         or values_column
+        or checked_column
         or (init_type and init_type.lower() in {"columns", "column"})
         or (has_query_shape and not has_keys_values)
     )
     is_items = bool(items) or (has_keys_values and not is_query)
 
+    # DialogInfo всегда (KeysColumn / ValuesColumn / CheckedColumn / …)
+    dialog = _dialog_meta(di, source_name=source_name)
+    if dialog:
+        item["dialog"] = dialog
+
     if is_items and not is_query:
         item["choices_from"] = "items"
+        checks = _checked_states_list(di)
         if items:
+            # дополнить checked из CheckedStates, если dialog_items не проставил
+            for i, ch in enumerate(items):
+                if i < len(checks) and checks[i] and "checked" not in ch:
+                    ch["checked"] = True
             item["choices"] = items
         else:
             # структура Keys/Values есть, значения в .mrt обрезаны
             keys = string_list(di.get("Keys"))
             values = string_list(di.get("Values"))
-            item["choices_count"] = max(len(keys), len(values))
+            item["choices_count"] = max(len(keys), len(values), len(checks))
             item["choices"] = []
+            if checks:
+                item["dialog"] = {
+                    **(item.get("dialog") or {}),
+                    "checked_states_count": len(checks),
+                    "checked_count": sum(1 for c in checks if c),
+                }
     elif is_query or source_name:
         item["choices_from"] = "query"
-        item["dialog"] = {
-            "source": source_name,
-            "keys_column": keys_column,
-            "values_column": values_column,
-            "items_from": init_type,
-        }
-        item["dialog"] = {k: v for k, v in item["dialog"].items() if v}
 
         src = _resolve_source(source_name, sources_by_name, all_sources)
         if src and not source_name and src.get("name"):
             item.setdefault("dialog", {})["source"] = src.get("name")
-            item["dialog"] = {k: v for k, v in item["dialog"].items() if v}
+            item["dialog"] = {k: v for k, v in (item.get("dialog") or {}).items() if v not in (None, "")}
         sql = (src or {}).get("sql") if src else None
         if sql:
             item["sql"] = sql
@@ -280,7 +351,10 @@ def _parse_filter_variable(
                 rows = _run_sql(database_url, sql)
                 key_tail = _column_tail(keys_column)
                 val_tail = _column_tail(values_column)
-                item["choices"] = _choices_from_rows(rows, key_tail, val_tail)
+                chk_tail = _column_tail(checked_column)
+                item["choices"] = _choices_from_rows(
+                    rows, key_tail, val_tail, chk_tail
+                )
                 item["query_ok"] = True
                 item["query_rows"] = len(rows)
             except Exception as exc:
