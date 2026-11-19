@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import sys
 import webbrowser
 from datetime import datetime
@@ -35,6 +36,20 @@ from stimulsoft_reports.viewer import StiViewer
 
 ROOT = Path(__file__).resolve().parent
 _SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
+
+# token → {VariableName: value}; не только Flask session (Swagger/curl часто без cookie)
+RENDER_FILTER_STORE: dict[str, dict[str, object]] = {}
+_RENDER_QUERY_SKIP = {
+    "run_queries",
+    "sql",
+    "filters",
+    "sti_event",
+    "event",
+    "rf",
+    "no_redirect",
+    "redirect",
+    "open",
+}
 
 
 def load_env() -> None:
@@ -211,27 +226,114 @@ def _coerce_variable_value(type_name: str | None, value: object) -> object:
     return value
 
 
+def _store_render_filters(filters: dict[str, object]) -> str:
+    token = secrets.token_urlsafe(12)
+    RENDER_FILTER_STORE[token] = dict(filters)
+    # не раздувать память
+    while len(RENDER_FILTER_STORE) > 64:
+        RENDER_FILTER_STORE.pop(next(iter(RENDER_FILTER_STORE)), None)
+    return token
+
+
+def _load_render_filters(token: str | None) -> dict[str, object] | None:
+    if not token:
+        return None
+    got = RENDER_FILTER_STORE.get(token)
+    return dict(got) if isinstance(got, dict) else None
+
+
 def make_prepare_variables(filters: dict[str, object]):
     """onPrepareVariables: подставить переданные фильтры перед рендером."""
 
     def prepare_variables(args: StiVariablesEventArgs) -> None:
-        if not filters or not args.variables:
+        if not filters:
+            print("prepareVariables skip: no filters", flush=True)
             return
-        by_lower = {str(name).lower(): name for name in args.variables.keys()}
+        variables = args.variables
+        if not variables:
+            print(
+                f"prepareVariables skip: empty variables from client; wanted={list(filters.keys())}",
+                flush=True,
+            )
+            return
+        by_lower = {str(name).lower(): name for name in variables.keys()}
+        ordered = list(variables.items())
         applied = []
+        missed = []
         for name, value in filters.items():
             key = by_lower.get(str(name).lower())
-            if not key:
+            # запасной путь: числовой индекс среди variables (обрезанный .mrt без Name)
+            if key is None and str(name).isdigit():
+                idx = int(str(name))
+                if 0 <= idx < len(ordered):
+                    key = ordered[idx][0]
+            if key is None:
+                missed.append(str(name))
                 continue
-            var = args.variables[key]
+            var = variables[key]
             var.value = _coerce_variable_value(getattr(var, "typeName", None), value)
-            applied.append(key)
-        print(f"prepareVariables applied={applied}", flush=True)
+            applied.append(f"{key}={var.value!r}")
+        print(
+            f"prepareVariables applied={applied} missed={missed} "
+            f"available={list(variables.keys())}",
+            flush=True,
+        )
 
     return prepare_variables
 
 
-def build_viewer(*, filters: dict[str, object] | None = None, inject_screenshot: bool = True):
+def inject_filter_values_js(html: str, filters: dict[str, object] | None) -> str:
+    """Клиентский fallback: выставить variables до первого рендера (если server event не дошёл)."""
+    if not filters or not isinstance(html, str):
+        return html
+    payload = json.dumps(filters, ensure_ascii=False)
+    script = (
+        "<script>(function(){\n"
+        f"  window.__dashFilters = {payload};\n"
+        "  function dashApplyFilters(args){\n"
+        "    var F = window.__dashFilters || {};\n"
+        "    var vars = args && args.variables;\n"
+        "    if (!vars) return;\n"
+        "    var list = Array.isArray(vars) ? vars : null;\n"
+        "    if (list) {\n"
+        "      list.forEach(function(v, i){\n"
+        "        var n = (v && v.name != null) ? String(v.name) : '';\n"
+        "        var hit = null;\n"
+        "        Object.keys(F).forEach(function(k){\n"
+        "          if (hit != null) return;\n"
+        "          if (String(k).toLowerCase() === n.toLowerCase()) hit = F[k];\n"
+        "          else if (String(k) === String(i)) hit = F[k];\n"
+        "        });\n"
+        "        if (hit != null) v.value = hit;\n"
+        "      });\n"
+        "      return;\n"
+        "    }\n"
+        "    Object.keys(F).forEach(function(k){\n"
+        "      if (vars[k] != null) { vars[k].value = F[k]; return; }\n"
+        "      var lk = String(k).toLowerCase();\n"
+        "      Object.keys(vars).forEach(function(name){\n"
+        "        if (String(name).toLowerCase() === lk) vars[name].value = F[k];\n"
+        "      });\n"
+        "    });\n"
+        "  }\n"
+        "  window.dashApplyFilters = dashApplyFilters;\n"
+        "})();</script>\n"
+    )
+    if "window.__dashFilters" in html:
+        return html
+    if "</head>" in html:
+        return html.replace("</head>", script + "</head>", 1)
+    if "</body>" in html:
+        return html.replace("</body>", script + "</body>", 1)
+    return html + script
+
+
+def build_viewer(
+    *,
+    filters: dict[str, object] | None = None,
+    filter_token: str | None = None,
+    inject_screenshot: bool = True,
+):
     """Собрать StiViewer (+ опционально фильтры через onPrepareVariables)."""
     viewer = StiViewer()
     apply_license(viewer)
@@ -239,6 +341,11 @@ def build_viewer(*, filters: dict[str, object] | None = None, inject_screenshot:
     viewer.onBeginProcessData += begin_process_data
     if filters:
         viewer.onPrepareVariables += make_prepare_variables(filters)
+        # клиентский хук как дополнительный канал
+        viewer.onPrepareVariables += "dashApplyFilters"
+    # token в URL handler'а — PrepareVariables/BeginProcessData без cookie
+    if filter_token:
+        viewer.handler.url = f"/render?rf={filter_token}"
 
     # handler/GetResource — без inject: иначе JS ломается (в файле есть «StiViewer»)
     if sti_process(viewer):
@@ -247,7 +354,11 @@ def build_viewer(*, filters: dict[str, object] | None = None, inject_screenshot:
     report = StiReport()
     report.loadFile("/mrt")
     viewer.report = report
-    return sti_response(viewer, inject_screenshot=inject_screenshot)
+    return sti_response(
+        viewer,
+        inject_screenshot=inject_screenshot,
+        filters=filters,
+    )
 
 
 def save_report(args: StiReportEventArgs):
@@ -302,7 +413,11 @@ def inject_screenshot_ui(html: str) -> str:
     return html
 
 
-def sti_response(component, inject_screenshot: bool = False):
+def sti_response(
+    component,
+    inject_screenshot: bool = False,
+    filters: dict[str, object] | None = None,
+):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
@@ -310,7 +425,9 @@ def sti_response(component, inject_screenshot: bool = False):
     if inject_screenshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         raw = resp.get_data(as_text=True)
         if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
-            resp.set_data(inject_screenshot_ui(raw))
+            html = inject_screenshot_ui(raw)
+            html = inject_filter_values_js(html, filters)
+            resp.set_data(html)
             resp.mimetype = "text/html"
     return resp
 
@@ -407,7 +524,11 @@ def openapi_spec() -> dict:
                 },
                 "post": {
                     "tags": ["render"],
-                    "summary": "Рендер viewer с фильтрами (JSON)",
+                    "summary": "Рендер viewer с фильтрами (JSON → 303 на /render?rf=…)",
+                    "description": (
+                        "По умолчанию 303 Redirect на GET /render?rf=TOKEN — открой Location в браузере. "
+                        "Для сырого HTML: /render?no_redirect=1"
+                    ),
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -418,14 +539,17 @@ def openapi_spec() -> dict:
                                         "summary": "через filters",
                                         "value": {
                                             "filters": {
-                                                "Region": "Брестская",
-                                                "Year": 2024,
+                                                "trendtype": "nocumulative",
+                                                "typenum": 1000,
                                             }
                                         },
                                     },
                                     "flat": {
                                         "summary": "плоский объект",
-                                        "value": {"Region": "Брестская", "Year": 2024},
+                                        "value": {
+                                            "trendtype": "nocumulative",
+                                            "typenum": 1000,
+                                        },
                                     },
                                 },
                             }
@@ -741,17 +865,23 @@ def render_with_filters():
     """Принять значения фильтров (Category «Фильтры») и отрендерить viewer.
 
     POST JSON:
-      {"filters": {"Region": "Брестская", "Year": 2024}}
-      или {"Region": "Брестская", "Year": 2024}
+      {"filters": {"trendtype": "cumulative", "typenum": 1000000}}
+      или {"trendtype": "cumulative", "typenum": 1000000}
 
     GET:
-      /render?Region=Брестская&Year=2024
-      /render?filters={"Region":"Брестская"}
+      /render?trendtype=cumulative&typenum=1000000
+      /render?filters={"trendtype":"cumulative"}
+      /render?rf=TOKEN   — после POST (без cookie)
 
-    Значения кладутся в session — последующие POST viewer'а снова их подставят.
+    POST → сохраняет фильтры, открывает браузер на /render?rf=… и отдаёт HTML-заглушку
+    со ссылкой (Postman Preview тоже кликабелен). ?open=0 — не открывать браузер.
+    GET /render?... — сразу viewer с параметрами (удобнее всего из адресной строки).
     """
+    token = (request.args.get("rf") or "").strip() or None
     incoming: dict[str, object] = {}
-    if request.method == "POST" and not _is_stimulsoft_handler_request():
+    is_handler = _is_stimulsoft_handler_request()
+
+    if request.method == "POST" and not is_handler:
         body = request.get_json(silent=True)
         if body is None and request.data:
             try:
@@ -760,7 +890,11 @@ def render_with_filters():
                 body = None
         incoming = _parse_filters_payload(body)
         if not incoming and request.form:
-            incoming = {k: v for k, v in request.form.items() if k != "filters"}
+            incoming = {
+                k: v
+                for k, v in request.form.items()
+                if k not in _RENDER_QUERY_SKIP
+            }
             if request.form.get("filters"):
                 incoming.update(_parse_filters_payload(request.form.get("filters")))
     elif request.method == "GET":
@@ -770,16 +904,45 @@ def render_with_filters():
             incoming = {
                 k: v
                 for k, v in request.args.items()
-                if k not in {"run_queries", "sql", "filters", "sti_event", "event"}
+                if k not in _RENDER_QUERY_SKIP
             }
 
     if incoming:
         session["render_filters"] = incoming
+        token = _store_render_filters(incoming)
+        # POST из Postman/Swagger: открыть браузер на готовый URL с фильтрами
+        if request.method == "POST" and not is_handler:
+            view_path = f"/render?rf={token}"
+            view_url = f"http://{HOST}:{PORT}{view_path}"
+            open_flag = (request.args.get("open") or "1").strip().lower()
+            if open_flag not in {"0", "false", "no", "off"}:
+                try:
+                    webbrowser.open(view_url)
+                    print(f"opened browser: {view_url}", flush=True)
+                except Exception as exc:
+                    print(f"browser open failed: {exc}", flush=True)
+            html = (
+                "<!doctype html><meta charset=utf-8>"
+                f"<meta http-equiv=refresh content='0;url={view_path}'>"
+                "<title>Opening dashboard…</title>"
+                "<p>Открываю дашборд с фильтрами… "
+                f"<a href='{view_path}'>{view_url}</a></p>"
+            )
+            return Response(html, mimetype="text/html; charset=utf-8")
 
-    filters = session.get("render_filters") or incoming or None
+    filters = _load_render_filters(token) or session.get("render_filters") or incoming or None
     if isinstance(filters, dict) and not filters:
         filters = None
-    return build_viewer(filters=filters, inject_screenshot=True)
+    if filters and not token:
+        token = _store_render_filters(filters)
+        session["render_filters"] = filters
+
+    print(f"render filters={filters} rf={token}", flush=True)
+    return build_viewer(
+        filters=filters,
+        filter_token=token,
+        inject_screenshot=True,
+    )
 
 
 def main() -> None:
