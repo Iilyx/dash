@@ -491,9 +491,8 @@ def build_viewer(
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
-    if auto_render:
-        # не показывать Parameters / Submit — значения уже переданы
-        viewer.options.toolbar.showParametersButton = False
+    # /open: панель нужна — Submit шлёт postInteraction(Variables), без этого
+    # карта остаётся без данных. Кнопку жмём сами в JS после render.
     if filters:
         viewer.onPrepareVariables += make_prepare_variables(filters)
         # клиентский хук как дополнительный канал
@@ -566,10 +565,11 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     """Кнопка «Скрин» на странице viewer + window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
+    auto_submit_js = ""
     if auto_render:
-        # Критично: isReportRenderingAfterSubmit=true — иначе Stimulsoft
-        # setDefaultValueForRequestFromUserVariables затирает List-значения
-        # из DialogInfo/CheckedColumn ДО SQL карты → пустая карта.
+        # isReportRenderingAfterSubmit — не дать DialogInfo затереть List до SQL.
+        # После первого render — один Action('Submit'): как ручная кнопка,
+        # шлёт postInteraction({action:'Variables', variables: panel values}).
         auto_block = (
             "try { report.requestParameters = false; } catch (e) {}\n"
             "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
@@ -602,12 +602,63 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "  }\n"
             "} catch (e) {}\n"
         )
+        auto_submit_js = (
+            "(function(){\n"
+            "  var F = window.__dashFilters || {};\n"
+            "  if (!F || !Object.keys(F).length) return;\n"
+            "  var tries = 0;\n"
+            "  var done = false;\n"
+            "  function findParam(params, key){\n"
+            "    if (!params) return null;\n"
+            "    if (params[key]) return params[key];\n"
+            "    var lk = String(key).toLowerCase();\n"
+            "    var names = Object.keys(params);\n"
+            "    for (var i = 0; i < names.length; i++) {\n"
+            "      if (String(names[i]).toLowerCase() === lk) return params[names[i]];\n"
+            "    }\n"
+            "    return null;\n"
+            "  }\n"
+            "  function tick(){\n"
+            "    if (done) return;\n"
+            "    tries++;\n"
+            "    var viewer = window.__dashViewer || window.viewer;\n"
+            "    var js = viewer && viewer.jsObject;\n"
+            "    if (!js) { if (tries < 80) return; clearInterval(timer); return; }\n"
+            "    var panel = js.controls && js.controls.parametersPanel;\n"
+            "    var params = js.options && js.options.parameters;\n"
+            "    if (!panel || !params || !Object.keys(params).length) {\n"
+            "      if (tries < 80) return;\n"
+            "      clearInterval(timer);\n"
+            "      return;\n"
+            "    }\n"
+            "    Object.keys(F).forEach(function(k){\n"
+            "      var p = findParam(params, k);\n"
+            "      if (!p) return;\n"
+            "      try { if (typeof p.setValue === 'function') p.setValue(F[k]); } catch (e1) {}\n"
+            "    });\n"
+            "    done = true;\n"
+            "    clearInterval(timer);\n"
+            "    try {\n"
+            "      if (typeof js.Action === 'function') js.Action('Submit');\n"
+            "      else if (panel.mainButtons && panel.mainButtons.submit &&\n"
+            "               typeof panel.mainButtons.submit.action === 'function') {\n"
+            "        panel.mainButtons.submit.action();\n"
+            "      }\n"
+            "    } catch (e2) {}\n"
+            "    try { if (typeof panel.changeVisibleState === 'function') panel.changeVisibleState(false); } catch (e3) {}\n"
+            "  }\n"
+            "  var timer = setInterval(tick, 200);\n"
+            "  setTimeout(tick, 0);\n"
+            "})();\n"
+        )
     repl = (
         auto_block
         + "viewer.report = report;\n"
         "window.__dashViewer = viewer;\n"
         "window.__dashReport = report;\n"
-        "viewer.renderHtml('viewerContent');"
+        "window.viewer = viewer;\n"
+        "viewer.renderHtml('viewerContent');\n"
+        + auto_submit_js
     )
     if needle in html:
         html = html.replace(needle, repl, 1)
