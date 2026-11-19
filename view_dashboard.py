@@ -567,9 +567,12 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
     if auto_render:
-        # после sync loadFile: проставить valueObject (name/alias), иначе карта без данных
+        # Критично: isReportRenderingAfterSubmit=true — иначе Stimulsoft
+        # setDefaultValueForRequestFromUserVariables затирает List-значения
+        # из DialogInfo/CheckedColumn ДО SQL карты → пустая карта.
         auto_block = (
             "try { report.requestParameters = false; } catch (e) {}\n"
+            "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
             "try {\n"
             "  var F = window.__dashFilters || {};\n"
             "  function dashPick(name, alias){\n"
