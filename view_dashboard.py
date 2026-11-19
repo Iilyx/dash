@@ -44,6 +44,7 @@ _RENDER_QUERY_SKIP = {
     "sql",
     "filters",
     "sti_event",
+    "sti_data",
     "event",
     "rf",
     "no_redirect",
@@ -359,7 +360,8 @@ def inject_filter_values_js(
     """Клиентский fallback: выставить variables; для /render — без панели Submit."""
     if not filters or not isinstance(html, str):
         return html
-    payload = json.dumps(filters, ensure_ascii=False)
+    # экранируем < чтобы JSON не закрыл <script> (Unexpected token)
+    payload = json.dumps(filters, ensure_ascii=False).replace("<", "\\u003c")
     auto_js = "true" if auto_render else "false"
     script = (
         "<script>(function(){\n"
@@ -426,15 +428,14 @@ def build_viewer(
         viewer.onPrepareVariables += make_prepare_variables(filters)
         # клиентский хук как дополнительный канал
         viewer.onPrepareVariables += "dashApplyFilters"
-    # token в URL handler'а — PrepareVariables/BeginProcessData без cookie
-    # StiHandler.url — property без setter, только __init__; пишем private field
+    # StiJavaScript всегда клеит `?sti_event=` к handler.url —
+    # нельзя писать `/open?rf=…` (получится `?rf=…?sti_event=` → HTML вместо JS → Unexpected token).
+    # rf остаётся в /mrt-render?rf= и в session; handler = чистый путь.
     handler_path = "/open" if auto_render else "/viewer"
-    if filter_token:
-        handler_url = f"{handler_path}?rf={filter_token}"
-        try:
-            viewer.handler._StiBaseHandler__url = handler_url  # noqa: SLF001
-        except Exception:
-            pass
+    try:
+        viewer.handler._StiBaseHandler__url = handler_path  # noqa: SLF001
+    except Exception:
+        pass
 
     # handler/GetResource — без inject: иначе JS ломается (в файле есть «StiViewer»)
     if sti_process(viewer):
@@ -540,14 +541,15 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
 
 def inject_handler_url(
     html: str,
-    filter_token: str | None,
+    filter_token: str | None = None,
     *,
     handler_path: str = "/open",
 ) -> str:
-    """Прописать Stimulsoft.handler.url с rf=token (на случай если private set не сработал)."""
-    if not filter_token or not isinstance(html, str):
+    """Прописать Stimulsoft.handler.url = чистый путь (без ?rf=)."""
+    if not isinstance(html, str):
         return html
-    url = f"{handler_path}?rf={filter_token}"
+    # filter_token специально не в URL — см. build_viewer
+    url = handler_path or "/open"
     script = (
         "<script>(function(){\n"
         f"  var u = {json.dumps(url)};\n"
@@ -1164,9 +1166,11 @@ def open_dashboard_with_filters():
     filters = _load_render_filters(token) or session.get("render_filters") or incoming or None
     if isinstance(filters, dict) and not filters:
         filters = None
-    if filters and not token:
-        token = _store_render_filters(filters)
+    if filters:
+        # session нужна: handler POST идёт на /open без ?rf=
         session["render_filters"] = filters
+        if not token:
+            token = _store_render_filters(filters)
 
     print(f"open filters={filters} rf={token}", flush=True)
     return build_viewer(
