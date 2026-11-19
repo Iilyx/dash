@@ -402,11 +402,76 @@
   }
 
   function findReport() {
+    // после drill-down viewer.report может смениться — не кэшируем устаревший __dashReport
+    var live =
+      (window.__dashViewer && window.__dashViewer.report) ||
+      (window.viewer && window.viewer.report) ||
+      null;
+    if (live) {
+      window.__dashReport = live;
+      return live;
+    }
     if (window.__dashReport) return window.__dashReport;
-    if (window.__dashViewer && window.__dashViewer.report)
-      return window.__dashViewer.report;
-    if (window.viewer && window.viewer.report) return window.viewer.report;
     return null;
+  }
+
+  function currentDashboardPage(report) {
+    if (!report) return null;
+    try {
+      if (report.currentPage) return report.currentPage;
+    } catch (e) {}
+    try {
+      var idx =
+        report.currentPageIndex != null
+          ? report.currentPageIndex
+          : report.pageNumber != null
+            ? report.pageNumber
+            : null;
+      if (
+        idx != null &&
+        report.pages &&
+        idx >= 0 &&
+        idx < report.pages.count
+      ) {
+        return report.pages.getByIndex(idx);
+      }
+    } catch (e2) {}
+    // drill-down часто показывает последнюю добавленную страницу
+    try {
+      if (report.pages && report.pages.count > 0) {
+        return report.pages.getByIndex(report.pages.count - 1);
+      }
+    } catch (e3) {}
+    return null;
+  }
+
+  function isDomReallyVisible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      var st = window.getComputedStyle(el);
+      if (
+        st.display === "none" ||
+        st.visibility === "hidden" ||
+        Number(st.opacity) === 0
+      ) {
+        return false;
+      }
+      // скрытые страницы после drill-down часто уезжают за экран / в zero-size panel
+      var panel = el.closest
+        ? el.closest(
+            ".stiJsViewerDashboardBackPanel, .stiJsViewerPageView, .stiJsViewerReportPanel"
+          )
+        : null;
+      if (panel) {
+        var pr = panel.getBoundingClientRect();
+        if (pr.width < 4 || pr.height < 4) return false;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   function isOnlineMapElement(c) {
@@ -449,7 +514,38 @@
     return isTableElement(c) || isPivotTableElement(c);
   }
 
-  function exportElementAsync(element, format) {
+  /** PDF settings как у Save на элементе: A2 Landscape. */
+  function dashboardPdfSettings() {
+    var Exp = Stimulsoft.Dashboard && Stimulsoft.Dashboard.Export;
+    if (!Exp) return null;
+    var Settings = Exp.Settings || Exp;
+    var Ctor =
+      (Settings && Settings.StiPdfDashboardExportSettings) ||
+      Exp.StiPdfDashboardExportSettings;
+    if (!Ctor) return null;
+    try {
+      var s = new Ctor();
+      var PaperKind =
+        Stimulsoft.System &&
+        Stimulsoft.System.Drawing &&
+        Stimulsoft.System.Drawing.Printing &&
+        Stimulsoft.System.Drawing.Printing.PaperKind;
+      if (PaperKind && PaperKind.A2 != null) s.paperSize = PaperKind.A2;
+      var Orient =
+        Stimulsoft.Report &&
+        Stimulsoft.Report.Components &&
+        Stimulsoft.Report.Components.StiPageOrientation;
+      if (Orient && Orient.Landscape != null) s.orientation = Orient.Landscape;
+      if ("imageQuality" in s) s.imageQuality = 200;
+      if ("openAfterExport" in s) s.openAfterExport = false;
+      return s;
+    } catch (e) {
+      console.warn("[dash-shot] pdf settings", e);
+      return null;
+    }
+  }
+
+  function exportElementAsync(element, settingsOrFormat) {
     return new Promise(function (resolve, reject) {
       try {
         var Tools =
@@ -466,7 +562,7 @@
             else resolve(data);
           },
           element,
-          format
+          settingsOrFormat
         );
       } catch (e) {
         reject(e);
@@ -513,52 +609,114 @@
     return body;
   }
 
-  /** Имена Table/Pivot, видимых на текущей панели. */
-  function visibleTableNames(root) {
-    var names = {};
-    var nodes = root.querySelectorAll("*");
+  /** Table/Pivot в DOM, которые реально видны (после drill-down родительские скрыты). */
+  function visibleTableInfos(root) {
+    var infos = [];
+    var nodes = (root || document).querySelectorAll("*");
     for (var i = 0; i < nodes.length; i++) {
-      var t = attrType(nodes[i]);
-      if (/TableElement|PivotTable/i.test(t)) {
-        var n = attrName(nodes[i]);
-        if (n) names[n] = true;
-      }
+      var el = nodes[i];
+      var t = attrType(el);
+      if (!/TableElement|PivotTable/i.test(t)) continue;
+      if (!isDomReallyVisible(el)) continue;
+      var n = attrName(el);
+      if (!n) continue;
+      infos.push({ name: n, el: el });
     }
-    return names;
+    return infos;
+  }
+
+  function collectTablesOnPage(page) {
+    var list = [];
+    if (!page) return list;
+    walkComponents(page, function (c) {
+      if (isExportableTable(c)) list.push(c);
+    });
+    return list;
   }
 
   /**
-   * Save на Table/Pivot → Image/Excel/Data; PDF — через export API (все строки).
+   * Таблицы для экспорта: только текущая страница + реально видимые в DOM.
+   * Иначе после drill-down уходит PDF родительского уровня.
+   */
+  function tablesForExport(report, root) {
+    var visible = visibleTableInfos(root || document);
+    var page = currentDashboardPage(report);
+    var comps = collectTablesOnPage(page);
+    if (!comps.length) {
+      // fallback: все, но потом сузим по visible
+      comps = collectAll(report).filter(isExportableTable);
+    }
+    var visibleNames = {};
+    for (var i = 0; i < visible.length; i++) visibleNames[visible[i].name] = true;
+
+    console.log(
+      "[dash-shot] tables page",
+      page && (page.name || page.pageName || "?"),
+      "comps",
+      comps.map(function (c) {
+        return c.name || typeName(c);
+      }),
+      "visibleDom",
+      Object.keys(visibleNames),
+      "drillDownFilters",
+      comps.map(function (c) {
+        try {
+          return {
+            name: c.name,
+            level: c.drillDownCurrentLevel,
+            filters: c.drillDownFilters && c.drillDownFilters.length,
+          };
+        } catch (e) {
+          return { name: c.name };
+        }
+      })
+    );
+
+    if (Object.keys(visibleNames).length) {
+      var matched = comps.filter(function (c) {
+        return c.name && visibleNames[c.name];
+      });
+      if (matched.length) return matched;
+      // имена в DOM не совпали с page comps — возьмём visible из всего report
+      var all = collectAll(report).filter(isExportableTable);
+      matched = all.filter(function (c) {
+        return c.name && visibleNames[c.name];
+      });
+      if (matched.length) return matched;
+    }
+    // нет DOM-метки: только comps текущей страницы (не все страницы!)
+    return comps;
+  }
+
+  /**
+   * Save на Table/Pivot → PDF A2 (как hover Save), с учётом drill-down.
    * Скачивает PDF + кладёт в exports/.
    */
   async function exportTablesToPdf(report, root) {
     if (!report) return 0;
-    var Pdf =
-      Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
-        ? Stimulsoft.Report.StiExportFormat.Pdf
-        : null;
-    if (Pdf == null) {
-      console.warn("[dash-shot] StiExportFormat.Pdf нет");
+    var settings = dashboardPdfSettings();
+    if (!settings) {
+      // fallback: Report.StiExportFormat.Pdf → helper соберёт settings (A4)
+      settings =
+        Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
+          ? Stimulsoft.Report.StiExportFormat.Pdf
+          : null;
+    }
+    if (settings == null) {
+      console.warn("[dash-shot] PDF settings нет");
       return 0;
     }
-    var visible = visibleTableNames(root || document);
-    var comps = collectAll(report).filter(isExportableTable);
-    console.log(
-      "[dash-shot] tables for pdf",
-      comps.map(function (c) {
-        return c.name || typeName(c);
-      }),
-      "visible",
-      Object.keys(visible)
-    );
-    if (Object.keys(visible).length) {
-      var onPage = comps.filter(function (c) {
-        return c.name && visible[c.name];
-      });
-      if (onPage.length) comps = onPage;
-    }
+    try {
+      console.log(
+        "[dash-shot] pdf paper",
+        settings.paperSize,
+        "orient",
+        settings.orientation
+      );
+    } catch (e) {}
+    var comps = tablesForExport(report, root || document);
     if (!comps.length) {
-      console.warn("[dash-shot] Table/Pivot не найден");
+      console.warn("[dash-shot] Table/Pivot не найден на текущем уровне");
       return 0;
     }
     var saved = 0;
@@ -569,9 +727,9 @@
         "_" +
         stamp();
       var pdfName = base + ".pdf";
-      setStatus("PDF " + (el.name || base) + "…");
+      setStatus("PDF A2 " + (el.name || base) + "…");
       try {
-        var data = await exportElementAsync(el, Pdf);
+        var data = await exportElementAsync(el, settings);
         try {
           Stimulsoft.System.StiObject.saveAs(
             data,
