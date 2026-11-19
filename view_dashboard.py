@@ -202,6 +202,37 @@ def favicon():
     return Response(status=204)
 
 
+@app.get("/filters")
+def filters():
+    """Variables с Category «Фильтр(ы)»: items или SQL dialog.source (SQL по умолчанию)."""
+    try:
+        from filters_mrt import extract_filters
+
+        # по умолчанию SQL выполняется; ?run_queries=0 — только метаданные
+        rq = (request.args.get("run_queries") or request.args.get("sql") or "1").strip().lower()
+        run_queries = rq not in {"0", "false", "no", "off"}
+        plan = extract_filters(
+            MRT_PATH,
+            run_queries=run_queries,
+            database_url=_db or None,
+        )
+    except Exception as exc:
+        return jsonify(
+            {
+                "mrt": MRT_PATH.name,
+                "kind": "category_filters",
+                "error": str(exc),
+                "count": 0,
+                "filters": [],
+            }
+        ), 500
+    resp = jsonify(plan)
+    resp.headers["Cache-Control"] = "no-store"
+    if plan.get("mrt_stripped"):
+        return resp, 422
+    return resp
+
+
 @app.get("/screenshot-dashboard.js")
 def screenshot_dashboard_js():
     path = ROOT / "screenshot_dashboard.js"
@@ -287,6 +318,7 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
         try:
