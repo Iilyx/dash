@@ -257,12 +257,18 @@ def make_prepare_variables(filters: dict[str, object]):
                 flush=True,
             )
             return
+        # name + alias → real variable key
+        index = _mrt_var_index()
         by_lower = {str(name).lower(): name for name in variables.keys()}
         ordered = list(variables.items())
         applied = []
         missed = []
         for name, value in filters.items():
             key = by_lower.get(str(name).lower())
+            if key is None:
+                meta = index.get(str(name).lower())
+                if meta and meta.get("name"):
+                    key = by_lower.get(str(meta["name"]).lower())
             # запасной путь: числовой индекс среди variables (обрезанный .mrt без Name)
             if key is None and str(name).isdigit():
                 idx = int(str(name))
@@ -300,8 +306,71 @@ def _mrt_variable_list(data: dict) -> list[tuple[str, dict]]:
     return out
 
 
+def _mrt_var_index(mrt_path: Path | None = None) -> dict[str, dict]:
+    """name/alias(lower) → {name, alias, type, raw} из текущего .mrt."""
+    path = mrt_path or MRT_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for key, var in _mrt_variable_list(data if isinstance(data, dict) else {}):
+        name = str(var.get("Name") or "").strip()
+        alias = str(var.get("Alias") or "").strip()
+        typ = str(var.get("Type") or "").strip()
+        meta = {"name": name or key, "alias": alias, "type": typ, "key": key, "raw": var}
+        if name:
+            out[name.lower()] = meta
+        if alias:
+            out[alias.lower()] = meta
+        out[str(key).lower()] = meta
+    return out
+
+
+def _normalize_filters_against_mrt(filters: dict[str, object]) -> dict[str, object]:
+    """alias→name, value под Type (StringList → list, не JSON-строка)."""
+    if not filters:
+        return {}
+    index = _mrt_var_index()
+    out: dict[str, object] = {}
+    for key, value in filters.items():
+        meta = index.get(str(key).lower())
+        name = (meta or {}).get("name") or str(key)
+        typ = (meta or {}).get("type")
+        out[name] = _coerce_variable_value(typ, value)
+    return out
+
+
+def _set_mrt_variable_value(target: dict, value: object) -> None:
+    """Записать Value в переменную .mrt в формате Stimulsoft (List = JSON array)."""
+    typ = str(target.get("Type") or "")
+    coerced = _coerce_variable_value(typ, value)
+    if typ.endswith("List") or (isinstance(coerced, list) and not typ.endswith("Range")):
+        # важно: массив в JSON, НЕ строка "[...]" — иначе карта/SQL не видят список
+        if isinstance(coerced, list):
+            target["Value"] = coerced
+        elif coerced is None:
+            target["Value"] = []
+        else:
+            target["Value"] = [coerced]
+        return
+    if typ.endswith("Range") and isinstance(coerced, dict):
+        target["Value"] = coerced
+        return
+    if isinstance(coerced, bool):
+        target["Value"] = "True" if coerced else "False"
+        return
+    if coerced is None:
+        target["Value"] = ""
+        return
+    if isinstance(coerced, (int, float)):
+        target["Value"] = str(coerced)
+        return
+    target["Value"] = str(coerced)
+
+
 def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> str:
-    """Только для /render: выключить RequestParameters и проставить Value фильтров.
+    """Только для /open: выключить RequestParameters и проставить Value фильтров.
 
     Обычный /viewer (/mrt) не трогаем — там остаётся панель + Submit.
     """
@@ -319,20 +388,18 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
         for _, v in vars_list
         if str(v.get("Name") or "").strip()
     }
+    by_alias = {
+        str(v.get("Alias") or "").strip().lower(): v
+        for _, v in vars_list
+        if str(v.get("Alias") or "").strip()
+    }
     by_key = {k: v for k, v in vars_list}
-
-    def _set_value(target: dict, value: object) -> None:
-        if isinstance(value, bool):
-            target["Value"] = "True" if value else "False"
-        elif isinstance(value, (list, dict)):
-            target["Value"] = json.dumps(value, ensure_ascii=False)
-        else:
-            target["Value"] = "" if value is None else str(value)
 
     applied = []
     missed: list[str] = []
     for name, value in filters.items():
-        target = by_name.get(str(name).lower())
+        key_l = str(name).lower()
+        target = by_name.get(key_l) or by_alias.get(key_l)
         if target is None and str(name) in by_key:
             target = by_key[str(name)]
         if target is None and str(name).isdigit():
@@ -342,8 +409,10 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
         if target is None:
             missed.append(str(name))
             continue
-        _set_value(target, value)
-        applied.append(str(target.get("Name") or name))
+        _set_mrt_variable_value(target, value)
+        applied.append(
+            f"{target.get('Name') or name}={target.get('Value')!r}"
+        )
     print(
         f"mrt-render patched values={applied} missed={missed} RequestParameters=False",
         flush=True,
@@ -381,15 +450,16 @@ def inject_filter_values_js(
         "          if (String(k).toLowerCase() === n.toLowerCase()) hit = F[k];\n"
         "          else if (String(k) === String(i)) hit = F[k];\n"
         "        });\n"
-        "        if (hit != null) v.value = hit;\n"
+        "        if (hit != null) { v.value = hit; try { v.valueObject = hit; } catch (e) {} }\n"
         "      });\n"
         "      return;\n"
         "    }\n"
         "    Object.keys(F).forEach(function(k){\n"
-        "      if (vars[k] != null) { vars[k].value = F[k]; return; }\n"
+        "      function applyOne(vv){ if (!vv) return; vv.value = F[k]; try { vv.valueObject = F[k]; } catch (e) {} }\n"
+        "      if (vars[k] != null) { applyOne(vars[k]); return; }\n"
         "      var lk = String(k).toLowerCase();\n"
         "      Object.keys(vars).forEach(function(name){\n"
-        "        if (String(name).toLowerCase() === lk) vars[name].value = F[k];\n"
+        "        if (String(name).toLowerCase() === lk) applyOne(vars[name]);\n"
         "      });\n"
         "    });\n"
         "  }\n"
@@ -497,22 +567,34 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
     if auto_render:
-        # только /render: без диалога параметров, значения уже в .mrt / __dashFilters
+        # после sync loadFile: проставить valueObject (name/alias), иначе карта без данных
         auto_block = (
             "try { report.requestParameters = false; } catch (e) {}\n"
             "try {\n"
+            "  var F = window.__dashFilters || {};\n"
+            "  function dashPick(name, alias){\n"
+            "    if (name != null && F[name] != null) return F[name];\n"
+            "    if (alias != null && F[alias] != null) return F[alias];\n"
+            "    var nl = String(name || '').toLowerCase();\n"
+            "    var al = String(alias || '').toLowerCase();\n"
+            "    var keys = Object.keys(F);\n"
+            "    for (var ki = 0; ki < keys.length; ki++) {\n"
+            "      var k = keys[ki];\n"
+            "      var lk = String(k).toLowerCase();\n"
+            "      if (lk === nl || (al && lk === al)) return F[k];\n"
+            "    }\n"
+            "    return null;\n"
+            "  }\n"
             "  if (report.dictionary && report.dictionary.variables) {\n"
-            "    var F = window.__dashFilters || {};\n"
             "    var vs = report.dictionary.variables;\n"
             "    var n = vs.count || 0;\n"
             "    for (var i = 0; i < n; i++) {\n"
             "      var v = vs.getByIndex ? vs.getByIndex(i) : (vs.list && vs.list[i]);\n"
             "      if (!v) continue;\n"
-            "      var name = (v.name || '') + '';\n"
-            "      if (F[name] != null) { v.valueObject = F[name]; continue; }\n"
-            "      Object.keys(F).forEach(function(k){\n"
-            "        if (String(k).toLowerCase() === name.toLowerCase()) v.valueObject = F[k];\n"
-            "      });\n"
+            "      var hit = dashPick(v.name, v.alias);\n"
+            "      if (hit == null) continue;\n"
+            "      try { v.valueObject = hit; } catch (e1) {}\n"
+            "      try { v.value = hit; } catch (e2) {}\n"
             "    }\n"
             "  }\n"
             "} catch (e) {}\n"
@@ -1130,6 +1212,7 @@ def open_dashboard_with_filters():
     is_handler = _is_stimulsoft_handler_request()
 
     if incoming:
+        incoming = _normalize_filters_against_mrt(incoming)
         session["render_filters"] = incoming
         token = _store_render_filters(incoming)
         if request.method == "POST" and not is_handler:
@@ -1167,10 +1250,14 @@ def open_dashboard_with_filters():
     if isinstance(filters, dict) and not filters:
         filters = None
     if filters:
+        filters = _normalize_filters_against_mrt(filters)
         # session нужна: handler POST идёт на /open без ?rf=
         session["render_filters"] = filters
         if not token:
             token = _store_render_filters(filters)
+        else:
+            # обновить store нормализованными значениями (List и т.д.)
+            RENDER_FILTER_STORE[token] = dict(filters)
 
     print(f"open filters={filters} rf={token}", flush=True)
     return build_viewer(
