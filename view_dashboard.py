@@ -212,16 +212,23 @@ def screenshot_dashboard_js():
 
 @app.get("/filters")
 def filters():
-    """Параметры/фильтры Dictionary.Variables — ввод до генерации дашборда (не ComboBox на странице)."""
+    """Variables с Category «Фильтр(ы)»: фиксированные choices или SQL dialog.source (+ rows)."""
     try:
         from filters_mrt import extract_filters
 
-        plan = extract_filters(MRT_PATH)
+        # run_queries=1|true — выполнить SQL источников и вернуть choices
+        rq = (request.args.get("run_queries") or request.args.get("sql") or "").strip().lower()
+        run_queries = rq in {"1", "true", "yes", "on"}
+        plan = extract_filters(
+            MRT_PATH,
+            run_queries=run_queries,
+            database_url=_db or None,
+        )
     except Exception as exc:
         return jsonify(
             {
                 "mrt": MRT_PATH.name,
-                "kind": "report_variables",
+                "kind": "category_filters",
                 "error": str(exc),
                 "count": 0,
                 "filters": [],
