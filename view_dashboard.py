@@ -370,15 +370,15 @@ def _set_mrt_variable_value(target: dict, value: object) -> None:
 
 
 def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> str:
-    """Только для /open: проставить Value фильтров, панель параметров оставить.
+    """Только для /open: проставить Value фильтров.
 
-    RequestParameters=true — иначе Stimulsoft не показывает панель фильтров.
-    Submit после загрузки жмём в JS (карта иначе без Variables/SQL).
+    RequestParameters=false + isReportRenderingAfterSubmit в JS — один рендер
+    с SQL карты, без второго Variables/Submit. Панель открываем сами в JS.
     """
     data = json.loads(raw)
     if not isinstance(data, dict):
         return raw
-    data["RequestParameters"] = True
+    data["RequestParameters"] = False
     if not filters:
         return json.dumps(data, ensure_ascii=False)
     vars_list = _mrt_variable_list(data)
@@ -413,7 +413,7 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
             f"{target.get('Name') or name}={target.get('Value')!r}"
         )
     print(
-        f"mrt-render patched values={applied} missed={missed} RequestParameters=True",
+        f"mrt-render patched values={applied} missed={missed} RequestParameters=False",
         flush=True,
     )
     return json.dumps(data, ensure_ascii=False)
@@ -566,10 +566,11 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     auto_block = ""
     auto_submit_js = ""
     if auto_render:
-        # Панель как в /viewer (requestParameters=true). Один Submit → Variables/SQL.
-        # После refresh Variables панель снова открываем и держим.
+        # Один рендер: AfterSubmit сохраняет List, без второго Variables/Submit.
+        # Панель фильтров открываем сами и рисуем values вместо keys.
         auto_block = (
-            "try { report.requestParameters = true; } catch (e) {}\n"
+            "try { report.requestParameters = false; } catch (e) {}\n"
+            "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
             "try {\n"
             "  var F = window.__dashFilters || {};\n"
             "  function dashPick(name, alias){\n"
@@ -603,7 +604,7 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "(function(){\n"
             "  var F = window.__dashFilters || {};\n"
             "  var tries = 0;\n"
-            "  var submitted = false;\n"
+            "  var applied = false;\n"
             "  function findParam(params, key){\n"
             "    if (!params) return null;\n"
             "    if (params[key]) return params[key];\n"
@@ -664,11 +665,11 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "        var it = items[keys[i]];\n"
             "        var on = matchWant(it, want);\n"
             "        try { it.isChecked = on; } catch (e2) {}\n"
+            "        // не зовём checkBox.setChecked — onChecked → InitVars = вторая загрузка\n"
             "        try {\n"
             "          if (p.menu && p.menu.paramsItems && p.menu.paramsItems[i] &&\n"
-            "              p.menu.paramsItems[i].checkBox &&\n"
-            "              typeof p.menu.paramsItems[i].checkBox.setChecked === 'function') {\n"
-            "            p.menu.paramsItems[i].checkBox.setChecked(on);\n"
+            "              p.menu.paramsItems[i].checkBox) {\n"
+            "            p.menu.paramsItems[i].checkBox.isChecked = on;\n"
             "          }\n"
             "        } catch (e3) {}\n"
             "      }\n"
@@ -718,40 +719,26 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "    keepFiltersOpen(js);\n"
             "    if (!panel) { if (tries < 100) return; clearInterval(timer); return; }\n"
             "    var params = js.options && js.options.parameters;\n"
-            "    if (!submitted) {\n"
-            "      var ready = params && Object.keys(params).length;\n"
-            "      if (!ready && tries < 40) return;\n"
-            "      if (params) {\n"
-            "        if (F && Object.keys(F).length) {\n"
-            "          Object.keys(F).forEach(function(k){\n"
-            "            var p = findParam(params, k);\n"
-            "            if (!p) return;\n"
-            "            applyParamValue(p, F[k]);\n"
-            "          });\n"
-            "        }\n"
-            "        // allowUserValues иначе рисует keys — перерисовать подписи values\n"
-            "        Object.keys(params).forEach(function(n){\n"
-            "          var p = params[n];\n"
-            "          if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
+            "    if (!params || !Object.keys(params).length) {\n"
+            "      if (tries < 40) return;\n"
+            "      clearInterval(timer);\n"
+            "      return;\n"
+            "    }\n"
+            "    if (!applied) {\n"
+            "      applied = true;\n"
+            "      if (F && Object.keys(F).length) {\n"
+            "        Object.keys(F).forEach(function(k){\n"
+            "          var p = findParam(params, k);\n"
+            "          if (!p) return;\n"
+            "          applyParamValue(p, F[k]);\n"
             "        });\n"
             "      }\n"
-            "      submitted = true;\n"
-            "      try {\n"
-            "        if (typeof js.Action === 'function') js.Action('Submit');\n"
-            "        else if (panel.mainButtons && panel.mainButtons.submit &&\n"
-            "                 typeof panel.mainButtons.submit.action === 'function') {\n"
-            "          panel.mainButtons.submit.action();\n"
-            "        }\n"
-            "      } catch (e2) {}\n"
             "    }\n"
-            "    keepFiltersOpen(js);\n"
-            "    if (params) {\n"
-            "      Object.keys(params).forEach(function(n){\n"
-            "        var p = params[n];\n"
-            "        if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
-            "      });\n"
-            "    }\n"
-            "    if (tries > 40) clearInterval(timer);\n"
+            "    Object.keys(params).forEach(function(n){\n"
+            "      var p = params[n];\n"
+            "      if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
+            "    });\n"
+            "    if (tries > 24) clearInterval(timer);\n"
             "  }\n"
             "  var timer = setInterval(tick, 250);\n"
             "  setTimeout(tick, 0);\n"
