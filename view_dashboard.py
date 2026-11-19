@@ -370,16 +370,15 @@ def _set_mrt_variable_value(target: dict, value: object) -> None:
 
 
 def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> str:
-    """Только для /open: выключить RequestParameters и проставить Value фильтров.
+    """Только для /open: проставить Value фильтров, панель параметров оставить.
 
-    Обычный /viewer (/mrt) не трогаем — там остаётся панель + Submit.
+    RequestParameters=true — иначе Stimulsoft не показывает панель фильтров.
+    Submit после загрузки жмём в JS (карта иначе без Variables/SQL).
     """
     data = json.loads(raw)
     if not isinstance(data, dict):
         return raw
-    data["RequestParameters"] = False
-    if "ParametersDisplayMode" in data:
-        data["ParametersDisplayMode"] = "Once"
+    data["RequestParameters"] = True
     if not filters:
         return json.dumps(data, ensure_ascii=False)
     vars_list = _mrt_variable_list(data)
@@ -414,7 +413,7 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
             f"{target.get('Name') or name}={target.get('Value')!r}"
         )
     print(
-        f"mrt-render patched values={applied} missed={missed} RequestParameters=False",
+        f"mrt-render patched values={applied} missed={missed} RequestParameters=True",
         flush=True,
     )
     return json.dumps(data, ensure_ascii=False)
@@ -567,12 +566,10 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     auto_block = ""
     auto_submit_js = ""
     if auto_render:
-        # isReportRenderingAfterSubmit — не дать DialogInfo затереть List до SQL.
-        # После первого render — один Action('Submit'): как ручная кнопка,
-        # шлёт postInteraction({action:'Variables', variables: panel values}).
+        # Панель как в /viewer (requestParameters=true). Один Submit → Variables/SQL.
+        # После refresh Variables панель снова открываем и держим.
         auto_block = (
-            "try { report.requestParameters = false; } catch (e) {}\n"
-            "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
+            "try { report.requestParameters = true; } catch (e) {}\n"
             "try {\n"
             "  var F = window.__dashFilters || {};\n"
             "  function dashPick(name, alias){\n"
@@ -605,9 +602,8 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
         auto_submit_js = (
             "(function(){\n"
             "  var F = window.__dashFilters || {};\n"
-            "  if (!F || !Object.keys(F).length) return;\n"
             "  var tries = 0;\n"
-            "  var done = false;\n"
+            "  var submitted = false;\n"
             "  function findParam(params, key){\n"
             "    if (!params) return null;\n"
             "    if (params[key]) return params[key];\n"
@@ -618,43 +614,50 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "    }\n"
             "    return null;\n"
             "  }\n"
+            "  function keepFiltersOpen(js){\n"
+            "    try {\n"
+            "      var panel = js && js.controls && js.controls.parametersPanel;\n"
+            "      if (!panel) return;\n"
+            "      if (typeof panel.changeVisibleState === 'function') panel.changeVisibleState(true);\n"
+            "      var btn = js.controls && js.controls.buttons && js.controls.buttons.Parameters;\n"
+            "      if (btn) {\n"
+            "        try { btn.isSelected = true; } catch (e0) {}\n"
+            "        try { if (typeof btn.setSelected === 'function') btn.setSelected(true); } catch (e1) {}\n"
+            "      }\n"
+            "    } catch (e) {}\n"
+            "  }\n"
             "  function tick(){\n"
-            "    if (done) return;\n"
             "    tries++;\n"
             "    var viewer = window.__dashViewer || window.viewer;\n"
             "    var js = viewer && viewer.jsObject;\n"
-            "    if (!js) { if (tries < 80) return; clearInterval(timer); return; }\n"
+            "    if (!js) { if (tries < 100) return; clearInterval(timer); return; }\n"
             "    var panel = js.controls && js.controls.parametersPanel;\n"
+            "    keepFiltersOpen(js);\n"
+            "    if (!panel) { if (tries < 100) return; clearInterval(timer); return; }\n"
             "    var params = js.options && js.options.parameters;\n"
-            "    if (!panel || !params || !Object.keys(params).length) {\n"
-            "      if (tries < 80) return;\n"
-            "      clearInterval(timer);\n"
-            "      return;\n"
-            "    }\n"
-            "    Object.keys(F).forEach(function(k){\n"
-            "      var p = findParam(params, k);\n"
-            "      if (!p) return;\n"
-            "      try { if (typeof p.setValue === 'function') p.setValue(F[k]); } catch (e1) {}\n"
-            "    });\n"
-            "    done = true;\n"
-            "    clearInterval(timer);\n"
-            "    try {\n"
-            "      if (typeof js.Action === 'function') js.Action('Submit');\n"
-            "      else if (panel.mainButtons && panel.mainButtons.submit &&\n"
-            "               typeof panel.mainButtons.submit.action === 'function') {\n"
-            "        panel.mainButtons.submit.action();\n"
+            "    if (!submitted) {\n"
+            "      var ready = params && Object.keys(params).length;\n"
+            "      if (!ready && tries < 40) return;\n"
+            "      if (F && Object.keys(F).length && params) {\n"
+            "        Object.keys(F).forEach(function(k){\n"
+            "          var p = findParam(params, k);\n"
+            "          if (!p) return;\n"
+            "          try { if (typeof p.setValue === 'function') p.setValue(F[k]); } catch (e1) {}\n"
+            "        });\n"
             "      }\n"
-            "    } catch (e2) {}\n"
-            "    function keepFiltersOpen(){\n"
+            "      submitted = true;\n"
             "      try {\n"
-            "        if (typeof panel.changeVisibleState === 'function') panel.changeVisibleState(true);\n"
-            "      } catch (e3) {}\n"
+            "        if (typeof js.Action === 'function') js.Action('Submit');\n"
+            "        else if (panel.mainButtons && panel.mainButtons.submit &&\n"
+            "                 typeof panel.mainButtons.submit.action === 'function') {\n"
+            "          panel.mainButtons.submit.action();\n"
+            "        }\n"
+            "      } catch (e2) {}\n"
             "    }\n"
-            "    keepFiltersOpen();\n"
-            "    setTimeout(keepFiltersOpen, 0);\n"
-            "    setTimeout(keepFiltersOpen, 600);\n"
+            "    keepFiltersOpen(js);\n"
+            "    if (tries > 40) clearInterval(timer);\n"
             "  }\n"
-            "  var timer = setInterval(tick, 200);\n"
+            "  var timer = setInterval(tick, 250);\n"
             "  setTimeout(tick, 0);\n"
             "})();\n"
         )
