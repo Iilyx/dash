@@ -460,6 +460,9 @@ def filters():
         ), 500
     resp = jsonify(plan)
     resp.headers["Cache-Control"] = "no-store"
+    # обрезанный .mrt без Name — не 200 «как будто ок»
+    if plan.get("mrt_stripped"):
+        return resp, 422
     return resp
 
 

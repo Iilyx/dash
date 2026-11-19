@@ -321,6 +321,7 @@ def extract_filters(
     db_url = _database_url(database_url)
 
     filters: list[dict] = []
+    nameless = 0
     raw_vars = dictionary.get("Variables") if isinstance(dictionary, dict) else None
     for idx, raw in enumerate(numbered(raw_vars)):
         parsed = _parse_filter_variable(
@@ -331,10 +332,15 @@ def extract_filters(
             run_queries=run_queries,
             database_url=db_url,
         )
-        if parsed:
-            filters.append(parsed)
+        if not parsed:
+            continue
+        # без Name фильтр бесполезен для API — пропускаем
+        if not parsed.get("name"):
+            nameless += 1
+            continue
+        filters.append(parsed)
 
-    return {
+    out: dict = {
         "mrt": mrt_path.name,
         "kind": "category_filters",
         "description": "Variables с Category «Фильтр(ы)»: items или результат SQL dialog.source",
@@ -343,6 +349,15 @@ def extract_filters(
         "count": len(filters),
         "filters": filters,
     }
+    if nameless and not filters:
+        out["mrt_stripped"] = True
+        out["error"] = (
+            f"В `{mrt_path.name}` у переменных Category «Фильтры» пустые Name/Keys/SQL "
+            f"({nameless} шт.). Нужен полный .mrt — задай MRT_PATH на файл с именами."
+        )
+    elif nameless:
+        out["skipped_nameless"] = nameless
+    return out
 
 
 def main() -> None:
