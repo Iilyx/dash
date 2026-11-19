@@ -282,14 +282,89 @@ def make_prepare_variables(filters: dict[str, object]):
     return prepare_variables
 
 
-def inject_filter_values_js(html: str, filters: dict[str, object] | None) -> str:
-    """Клиентский fallback: выставить variables до первого рендера (если server event не дошёл)."""
+def _mrt_variable_list(data: dict) -> list[tuple[str, dict]]:
+    """[(key, variable_dict), ...] из Dictionary.Variables."""
+    dictionary = data.get("Dictionary") if isinstance(data, dict) else None
+    raw = dictionary.get("Variables") if isinstance(dictionary, dict) else None
+    out: list[tuple[str, dict]] = []
+    if isinstance(raw, dict):
+        for key in sorted(raw.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            var = raw[key]
+            if isinstance(var, dict):
+                out.append((str(key), var))
+    elif isinstance(raw, list):
+        for i, var in enumerate(raw):
+            if isinstance(var, dict):
+                out.append((str(i), var))
+    return out
+
+
+def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> str:
+    """Только для /render: выключить RequestParameters и проставить Value фильтров.
+
+    Обычный /viewer (/mrt) не трогаем — там остаётся панель + Submit.
+    """
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        return raw
+    data["RequestParameters"] = False
+    if "ParametersDisplayMode" in data:
+        data["ParametersDisplayMode"] = "Once"
+    if not filters:
+        return json.dumps(data, ensure_ascii=False)
+    vars_list = _mrt_variable_list(data)
+    by_name = {
+        str(v.get("Name") or "").strip().lower(): v
+        for _, v in vars_list
+        if str(v.get("Name") or "").strip()
+    }
+    by_key = {k: v for k, v in vars_list}
+
+    def _set_value(target: dict, value: object) -> None:
+        if isinstance(value, bool):
+            target["Value"] = "True" if value else "False"
+        elif isinstance(value, (list, dict)):
+            target["Value"] = json.dumps(value, ensure_ascii=False)
+        else:
+            target["Value"] = "" if value is None else str(value)
+
+    applied = []
+    missed: list[str] = []
+    for name, value in filters.items():
+        target = by_name.get(str(name).lower())
+        if target is None and str(name) in by_key:
+            target = by_key[str(name)]
+        if target is None and str(name).isdigit():
+            idx = int(str(name))
+            if 0 <= idx < len(vars_list):
+                target = vars_list[idx][1]
+        if target is None:
+            missed.append(str(name))
+            continue
+        _set_value(target, value)
+        applied.append(str(target.get("Name") or name))
+    print(
+        f"mrt-render patched values={applied} missed={missed} RequestParameters=False",
+        flush=True,
+    )
+    return json.dumps(data, ensure_ascii=False)
+
+
+def inject_filter_values_js(
+    html: str,
+    filters: dict[str, object] | None,
+    *,
+    auto_render: bool = False,
+) -> str:
+    """Клиентский fallback: выставить variables; для /render — без панели Submit."""
     if not filters or not isinstance(html, str):
         return html
     payload = json.dumps(filters, ensure_ascii=False)
+    auto_js = "true" if auto_render else "false"
     script = (
         "<script>(function(){\n"
         f"  window.__dashFilters = {payload};\n"
+        f"  window.__dashAutoRender = {auto_js};\n"
         "  function dashApplyFilters(args){\n"
         "    var F = window.__dashFilters || {};\n"
         "    var vars = args && args.variables;\n"
@@ -333,12 +408,20 @@ def build_viewer(
     filters: dict[str, object] | None = None,
     filter_token: str | None = None,
     inject_screenshot: bool = True,
+    auto_render: bool = False,
 ):
-    """Собрать StiViewer (+ опционально фильтры через onPrepareVariables)."""
+    """Собрать StiViewer.
+
+    auto_render=True — только /render: без панели Submit, сразу дашборд с фильтрами.
+    /viewer вызывает с auto_render=False.
+    """
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
+    if auto_render:
+        # не показывать Parameters / Submit — значения уже переданы
+        viewer.options.toolbar.showParametersButton = False
     if filters:
         viewer.onPrepareVariables += make_prepare_variables(filters)
         # клиентский хук как дополнительный канал
@@ -354,16 +437,26 @@ def build_viewer(
 
     # handler/GetResource — без inject: иначе JS ломается (в файле есть «StiViewer»)
     if sti_process(viewer):
-        return sti_response(viewer, inject_screenshot=False, filter_token=filter_token)
+        return sti_response(
+            viewer,
+            inject_screenshot=False,
+            filter_token=filter_token,
+            auto_render=auto_render,
+        )
 
     report = StiReport()
-    report.loadFile("/mrt")
+    # /render → пропатченный .mrt без RequestParameters; /viewer → обычный /mrt
+    if auto_render and filter_token:
+        report.loadFile(f"/mrt-render?rf={filter_token}")
+    else:
+        report.loadFile("/mrt")
     viewer.report = report
     return sti_response(
         viewer,
         inject_screenshot=inject_screenshot,
         filters=filters,
         filter_token=filter_token,
+        auto_render=auto_render,
     )
 
 
@@ -395,11 +488,34 @@ def sti_process(component) -> bool:
     return handled
 
 
-def inject_screenshot_ui(html: str) -> str:
+def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     """Кнопка «Скрин» на странице viewer + window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
+    auto_block = ""
+    if auto_render:
+        # только /render: без диалога параметров, значения уже в .mrt / __dashFilters
+        auto_block = (
+            "try { report.requestParameters = false; } catch (e) {}\n"
+            "try {\n"
+            "  if (report.dictionary && report.dictionary.variables) {\n"
+            "    var F = window.__dashFilters || {};\n"
+            "    var vs = report.dictionary.variables;\n"
+            "    var n = vs.count || 0;\n"
+            "    for (var i = 0; i < n; i++) {\n"
+            "      var v = vs.getByIndex ? vs.getByIndex(i) : (vs.list && vs.list[i]);\n"
+            "      if (!v) continue;\n"
+            "      var name = (v.name || '') + '';\n"
+            "      if (F[name] != null) { v.valueObject = F[name]; continue; }\n"
+            "      Object.keys(F).forEach(function(k){\n"
+            "        if (String(k).toLowerCase() === name.toLowerCase()) v.valueObject = F[k];\n"
+            "      });\n"
+            "    }\n"
+            "  }\n"
+            "} catch (e) {}\n"
+        )
     repl = (
-        "viewer.report = report;\n"
+        auto_block
+        + "viewer.report = report;\n"
         "window.__dashViewer = viewer;\n"
         "window.__dashReport = report;\n"
         "viewer.renderHtml('viewerContent');"
@@ -455,6 +571,7 @@ def sti_response(
     inject_screenshot: bool = False,
     filters: dict[str, object] | None = None,
     filter_token: str | None = None,
+    auto_render: bool = False,
 ):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
@@ -463,8 +580,9 @@ def sti_response(
     if inject_screenshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         raw = resp.get_data(as_text=True)
         if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
-            html = inject_screenshot_ui(raw)
-            html = inject_filter_values_js(html, filters)
+            # сначала __dashFilters, потом патч renderHtml (auto_render)
+            html = inject_filter_values_js(raw, filters, auto_render=auto_render)
+            html = inject_screenshot_ui(html, auto_render=auto_render)
             html = inject_handler_url(html, filter_token)
             resp.set_data(html)
             resp.mimetype = "text/html"
@@ -844,8 +962,27 @@ def api_screenshot():
 
 @app.route("/mrt", methods=["GET", "POST"])
 def serve_mrt():
+    """Обычный шаблон для /viewer и /designer — панель параметров как в .mrt."""
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
     resp = Response(raw, mimetype="application/json; charset=utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/mrt-render", methods=["GET", "POST"])
+def serve_mrt_render():
+    """Шаблон только для /render: RequestParameters=false + Value из фильтров."""
+    token = (request.args.get("rf") or "").strip() or None
+    filters = _load_render_filters(token) or session.get("render_filters") or {}
+    if not isinstance(filters, dict):
+        filters = {}
+    raw = MRT_PATH.read_text(encoding="utf-8-sig")
+    try:
+        patched = patch_mrt_for_auto_render(raw, filters)
+    except Exception as exc:
+        print(f"mrt-render patch failed: {exc}", flush=True)
+        patched = raw
+    resp = Response(patched, mimetype="application/json; charset=utf-8")
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -977,10 +1114,12 @@ def render_with_filters():
         session["render_filters"] = filters
 
     print(f"render filters={filters} rf={token}", flush=True)
+    # auto_render: сразу дашборд с фильтрами, без ручного Submit (/viewer не трогаем)
     return build_viewer(
         filters=filters,
         filter_token=token,
         inject_screenshot=True,
+        auto_render=True,
     )
 
 
