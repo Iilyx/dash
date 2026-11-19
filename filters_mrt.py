@@ -234,27 +234,30 @@ def _eval_checked_expression(row: dict, expression: str) -> bool:
         return _truthy_checked(val) if val is not None else False
 
     left, op, right = m.group(1), m.group(2), m.group(3).strip()
-    # литерал
-    if (right.startswith('"') and right.endswith('"')) or (
+    # литерал в кавычках — только строковое сравнение (иначе "0000000" ↔ 0)
+    quoted = (right.startswith('"') and right.endswith('"')) or (
         right.startswith("'") and right.endswith("'")
-    ):
-        want = right[1:-1]
-    else:
-        want = right
+    )
+    want = right[1:-1] if quoted else right
 
     got = _row_field(row, left)
     if got is None:
         return False
     got_s = _norm_cell(got)
     want_s = str(want).strip()
-    # числовое сравнение, если оба числа
-    try:
-        got_n = float(got_s.replace(",", ".")) if got_s else None
-        want_n = float(want_s.replace(",", ".")) if want_s else None
-    except ValueError:
-        got_n = want_n = None
-
-    eq = (got_n == want_n) if (got_n is not None and want_n is not None) else (got_s == want_s)
+    if quoted:
+        eq = got_s == want_s
+    else:
+        try:
+            got_n = float(got_s.replace(",", ".")) if got_s else None
+            want_n = float(want_s.replace(",", ".")) if want_s else None
+        except ValueError:
+            got_n = want_n = None
+        eq = (
+            (got_n == want_n)
+            if (got_n is not None and want_n is not None)
+            else (got_s == want_s)
+        )
     if op in {"==", "="}:
         return eq
     if op in {"!=", "<>"}:
@@ -266,14 +269,65 @@ def _row_is_checked(row: dict, checked: dict) -> bool:
     """Строка отмечена по CheckedColumn (expression или bool-колонка)."""
     if not checked:
         return False
-    expr = checked.get("expression")
-    if expr:
-        return _eval_checked_expression(row, expr)
-    col = checked.get("column")
-    if col:
-        val = _row_field(row, col)
-        return _truthy_checked(val)
+    try:
+        expr = checked.get("expression")
+        if expr:
+            return _eval_checked_expression(row, expr)
+        col = checked.get("column")
+        if col:
+            val = _row_field(row, col)
+            return _truthy_checked(val)
+    except Exception:
+        return False
     return False
+
+
+def _variable_value(raw: dict):
+    """Variable.Value: строка / число / список / {0:..,1:..} — не только text()."""
+    v = raw.get("Value")
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return text(v)
+    if isinstance(v, (int, float, bool)):
+        return _jsonable(v)
+    if isinstance(v, list):
+        out = [_jsonable(x) for x in v if x not in (None, "")]
+        return out or None
+    if isinstance(v, dict):
+        # Stimulsoft numbered list: {"0": "a", "1": "b"}
+        try:
+            parts = [_jsonable(x) for x in numbered(v) if x not in (None, "")]
+            if parts:
+                return parts if len(parts) > 1 else parts[0]
+        except Exception:
+            pass
+        return _jsonable(v)
+    return _jsonable(v)
+
+
+def _apply_choice_labels(choices: list[dict], items: list[dict] | None = None) -> list[dict]:
+    """Вернуть пропавшие подписи: из items по key, иначе key → value."""
+    by_key: dict[str, object] = {}
+    if items:
+        for it in items:
+            k = it.get("key")
+            if k is None or k == "":
+                continue
+            lab = it.get("value")
+            if lab not in (None, ""):
+                by_key[str(k)] = lab
+    for c in choices:
+        if c.get("value") not in (None, ""):
+            continue
+        k = c.get("key")
+        if k is None or k == "":
+            continue
+        if str(k) in by_key:
+            c["value"] = by_key[str(k)]
+        else:
+            c["value"] = k
+    return choices
 
 
 def _run_sql(database_url: str, sql: str) -> list[dict]:
@@ -344,6 +398,9 @@ def _choices_from_rows(
             item["key"] = _jsonable(key)
         if value is not None and str(value) != "":
             item["value"] = _jsonable(value)
+        elif item.get("key") not in (None, ""):
+            # подпись не нашлась по ValuesColumn — не отдаём голый key без value
+            item["value"] = item["key"]
         if checked and _row_is_checked(row, checked):
             item["checked"] = True
         if item:
@@ -430,7 +487,7 @@ def _parse_filter_variable(
         "alias": text(raw.get("Alias")),
         "category": category or "Фильтры",
         "type": text(raw.get("Type")),
-        "value": text(raw.get("Value")),
+        "value": _variable_value(raw),
         "request_from_user": True if _flag_true(raw.get("RequestFromUser")) or "RequestFromUser" in raw else None,
         "sql_parameter": True if _flag_true(raw.get("AllowUseAsSqlParameter")) else None,
     }
@@ -458,7 +515,7 @@ def _parse_filter_variable(
                 if i < len(checks) and checks[i] and "checked" not in ch:
                     ch["checked"] = True
             item["choices"] = items
-            if not item.get("value"):
+            if item.get("value") in (None, ""):
                 default = _default_from_checked_choices(items)
                 if default is not None:
                     item["value"] = default
@@ -501,6 +558,8 @@ def _parse_filter_variable(
                 key_tail = _column_tail(keys_column)
                 val_tail = _column_tail(values_column)
                 choices = _choices_from_rows(rows, key_tail, val_tail, checked)
+                # подтянуть подписи из Keys/Values, если SQL-колонка не совпала
+                choices = _apply_choice_labels(choices, items if items else None)
                 item["choices"] = choices
                 item["query_ok"] = True
                 item["query_rows"] = len(rows)
@@ -508,7 +567,7 @@ def _parse_filter_variable(
                 if checked_n:
                     item["checked_count"] = checked_n
                 # Value пустой → дефолт из CheckedColumn expression / bool-колонки
-                if not item.get("value"):
+                if item.get("value") in (None, ""):
                     default = _default_from_checked_choices(choices)
                     if default is not None:
                         item["value"] = default
@@ -516,9 +575,18 @@ def _parse_filter_variable(
             except Exception as exc:
                 item["query_ok"] = False
                 item["query_error"] = str(exc)
-                item["choices"] = []
+                # не теряем Keys/Values из .mrt, если SQL упал
+                if items:
+                    item["choices"] = items
+                    item["choices_fallback"] = "items"
+                else:
+                    item["choices"] = []
         else:
-            item["choices"] = []
+            if items:
+                item["choices"] = items
+                item["choices_fallback"] = "items"
+            else:
+                item["choices"] = []
             if not sql:
                 item["query_ok"] = False
                 item["query_error"] = "sql/source не найдены в Dictionary.DataSources"
@@ -531,6 +599,12 @@ def _parse_filter_variable(
             # без SQL всё равно отдадим разобранное условие
             if checked.get("expression"):
                 item.setdefault("dialog", {})["checked_expression"] = checked["expression"]
+            # дефолт из CheckedStates / items, если Value пуст
+            if item.get("value") in (None, "") and item.get("choices"):
+                default = _default_from_checked_choices(item["choices"])
+                if default is not None:
+                    item["value"] = default
+                    item["value_from"] = "checked_states"
     else:
         # Category Фильтры, но без списка и без колонок — всё равно вернём переменную
         item["choices_from"] = "none"
