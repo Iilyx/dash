@@ -210,6 +210,20 @@ def screenshot_dashboard_js():
     return resp
 
 
+@app.get("/filters")
+def filters():
+    """Что лежит в фильтрах .mrt: ComboBox / ListBox / DatePicker / NumberBox / TreeView*."""
+    try:
+        from filters_mrt import extract_filters
+
+        plan = extract_filters(MRT_PATH)
+    except Exception as exc:
+        return jsonify({"mrt": MRT_PATH.name, "error": str(exc), "count": 0, "filters": []}), 500
+    resp = jsonify(plan)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.post("/api/screenshot")
 def api_screenshot():
     """Сохраняет PNG/CSV (и др.) из viewer в EXPORT_DIR."""
