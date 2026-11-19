@@ -372,13 +372,13 @@ def _set_mrt_variable_value(target: dict, value: object) -> None:
 def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> str:
     """Только для /open: проставить Value фильтров.
 
-    RequestParameters=false + isReportRenderingAfterSubmit в JS — один рендер
-    с SQL карты, без второго Variables/Submit. Панель открываем сами в JS.
+    RequestParameters=true — первый paint только панель (без SQL карты).
+    Один postInteraction(Variables) в JS = одна загрузка карты.
     """
     data = json.loads(raw)
     if not isinstance(data, dict):
         return raw
-    data["RequestParameters"] = False
+    data["RequestParameters"] = True
     if not filters:
         return json.dumps(data, ensure_ascii=False)
     vars_list = _mrt_variable_list(data)
@@ -413,7 +413,7 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
             f"{target.get('Name') or name}={target.get('Value')!r}"
         )
     print(
-        f"mrt-render patched values={applied} missed={missed} RequestParameters=False",
+        f"mrt-render patched values={applied} missed={missed} RequestParameters=True",
         flush=True,
     )
     return json.dumps(data, ensure_ascii=False)
@@ -566,11 +566,10 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     auto_block = ""
     auto_submit_js = ""
     if auto_render:
-        # Один рендер: AfterSubmit сохраняет List, без второго Variables/Submit.
-        # Панель фильтров открываем сами и рисуем values вместо keys.
+        # Ждём панель (requestParameters=true) → один Variables → карта один раз.
+        # Без InitVars/setChecked и без второго Submit.
         auto_block = (
-            "try { report.requestParameters = false; } catch (e) {}\n"
-            "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
+            "try { report.requestParameters = true; } catch (e) {}\n"
             "try {\n"
             "  var F = window.__dashFilters || {};\n"
             "  function dashPick(name, alias){\n"
@@ -604,7 +603,7 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "(function(){\n"
             "  var F = window.__dashFilters || {};\n"
             "  var tries = 0;\n"
-            "  var applied = false;\n"
+            "  var loaded = false;\n"
             "  function findParam(params, key){\n"
             "    if (!params) return null;\n"
             "    if (params[key]) return params[key];\n"
@@ -720,12 +719,11 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "    if (!panel) { if (tries < 100) return; clearInterval(timer); return; }\n"
             "    var params = js.options && js.options.parameters;\n"
             "    if (!params || !Object.keys(params).length) {\n"
-            "      if (tries < 40) return;\n"
+            "      if (tries < 60) return;\n"
             "      clearInterval(timer);\n"
             "      return;\n"
             "    }\n"
-            "    if (!applied) {\n"
-            "      applied = true;\n"
+            "    if (!loaded) {\n"
             "      if (F && Object.keys(F).length) {\n"
             "        Object.keys(F).forEach(function(k){\n"
             "          var p = findParam(params, k);\n"
@@ -733,12 +731,36 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "          applyParamValue(p, F[k]);\n"
             "        });\n"
             "      }\n"
+            "      Object.keys(params).forEach(function(n){\n"
+            "        var p = params[n];\n"
+            "        if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
+            "      });\n"
+            "      loaded = true;\n"
+            "      clearInterval(timer);\n"
+            "      try {\n"
+            "        if (typeof panel.getParametersValues === 'function' &&\n"
+            "            typeof js.postInteraction === 'function') {\n"
+            "          js.postInteraction({\n"
+            "            action: 'Variables',\n"
+            "            variables: panel.getParametersValues()\n"
+            "          });\n"
+            "        } else if (typeof js.Action === 'function') {\n"
+            "          js.Action('Submit');\n"
+            "        }\n"
+            "      } catch (e2) {}\n"
+            "      function afterLoad(){\n"
+            "        keepFiltersOpen(js);\n"
+            "        var p2 = js.options && js.options.parameters;\n"
+            "        if (!p2) return;\n"
+            "        Object.keys(p2).forEach(function(n){\n"
+            "          var p = p2[n];\n"
+            "          if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
+            "        });\n"
+            "      }\n"
+            "      setTimeout(afterLoad, 300);\n"
+            "      setTimeout(afterLoad, 1000);\n"
+            "      return;\n"
             "    }\n"
-            "    Object.keys(params).forEach(function(n){\n"
-            "      var p = params[n];\n"
-            "      if (p && p.params && p.params.basicType === 'List') refreshListLabels(p);\n"
-            "    });\n"
-            "    if (tries > 24) clearInterval(timer);\n"
             "  }\n"
             "  var timer = setInterval(tick, 250);\n"
             "  setTimeout(tick, 0);\n"
