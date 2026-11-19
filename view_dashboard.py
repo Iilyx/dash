@@ -250,12 +250,13 @@ def make_prepare_variables(filters: dict[str, object]):
         if not filters:
             print("prepareVariables skip: no filters", flush=True)
             return
-        from stimulsoft_reports.report.dictionary.StiVariable import StiVariable
-
         variables = args.variables
-        if variables is None:
-            variables = {}
-            args.variables = variables
+        if not variables:
+            print(
+                f"prepareVariables skip: empty variables from client; wanted={list(filters.keys())}",
+                flush=True,
+            )
+            return
         # name + alias → real variable key
         index = _mrt_var_index()
         by_lower = {str(name).lower(): name for name in variables.keys()}
@@ -264,28 +265,20 @@ def make_prepare_variables(filters: dict[str, object]):
         missed = []
         for name, value in filters.items():
             key = by_lower.get(str(name).lower())
-            meta = index.get(str(name).lower())
-            if key is None and meta and meta.get("name"):
-                key = by_lower.get(str(meta["name"]).lower())
+            if key is None:
+                meta = index.get(str(name).lower())
+                if meta and meta.get("name"):
+                    key = by_lower.get(str(meta["name"]).lower())
             # запасной путь: числовой индекс среди variables (обрезанный .mrt без Name)
             if key is None and str(name).isdigit():
                 idx = int(str(name))
                 if 0 <= idx < len(ordered):
                     key = ordered[idx][0]
-            typ = None
-            if key is not None:
-                var = variables[key]
-                typ = getattr(var, "typeName", None)
-            elif meta:
-                typ = meta.get("type")
-                key = meta.get("name") or str(name)
-                var = StiVariable(key, typ or "String", "")
-                variables[key] = var
-                by_lower[str(key).lower()] = key
-            else:
+            if key is None:
                 missed.append(str(name))
                 continue
-            var.value = _coerce_variable_value(typ, value)
+            var = variables[key]
+            var.value = _coerce_variable_value(getattr(var, "typeName", None), value)
             applied.append(f"{key}={var.value!r}")
         print(
             f"prepareVariables applied={applied} missed={missed} "
@@ -427,51 +420,6 @@ def patch_mrt_for_auto_render(raw: str, filters: dict[str, object] | None) -> st
     return json.dumps(data, ensure_ascii=False)
 
 
-def _mrt_is_stripped(mrt_path: Path | None = None) -> tuple[bool, str]:
-    """True если у Category «Фильтры» пустые Name (карта/SQL без имён не взведутся)."""
-    try:
-        from filters_mrt import extract_filters
-
-        plan = extract_filters(mrt_path or MRT_PATH, run_queries=False)
-    except Exception as exc:
-        return False, str(exc)
-    if plan.get("mrt_stripped"):
-        return True, str(plan.get("error") or "mrt stripped")
-    return False, ""
-
-
-def inject_mrt_warning(html: str, message: str) -> str:
-    """Баннер поверх viewer, если .mrt обрезан."""
-    if not isinstance(html, str) or not message:
-        return html
-    if "window.__dashMrtWarn" in html:
-        return html
-    text = json.dumps(message, ensure_ascii=False)
-    banner = (
-        "<script>(function(){\n"
-        "  window.__dashMrtWarn = true;\n"
-        f"  var msg = {text};\n"
-        "  function show(){\n"
-        "    if (document.getElementById('dashMrtWarn')) return;\n"
-        "    var el = document.createElement('div');\n"
-        "    el.id = 'dashMrtWarn';\n"
-        "    el.setAttribute('role','alert');\n"
-        "    el.style.cssText = 'position:fixed;z-index:99999;left:12px;right:12px;top:12px;'"
-        "      + 'padding:12px 16px;background:#7f1d1d;color:#fff;font:14px/1.4 system-ui,sans-serif;'"
-        "      + 'border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.35)';\n"
-        "    el.textContent = msg;\n"
-        "    document.body.appendChild(el);\n"
-        "  }\n"
-        "  if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);\n"
-        "})();</script>\n"
-    )
-    if "</head>" in html:
-        return html.replace("</head>", banner + "</head>", 1)
-    if "</body>" in html:
-        return html.replace("</body>", banner + "</body>", 1)
-    return html + banner
-
-
 def inject_filter_values_js(
     html: str,
     filters: dict[str, object] | None,
@@ -543,8 +491,9 @@ def build_viewer(
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
     viewer.onBeginProcessData += begin_process_data
-    # панель параметров оставляем: дашборд/карта берут значения через
-    # postInteraction(Variables) с parametersPanel; прячем только после авто-Submit в JS
+    if auto_render:
+        # не показывать Parameters / Submit — значения уже переданы
+        viewer.options.toolbar.showParametersButton = False
     if filters:
         viewer.onPrepareVariables += make_prepare_variables(filters)
         # клиентский хук как дополнительный канал
@@ -618,24 +567,24 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
     if auto_render:
-        # Карта/дашборд читают фильтры через postInteraction(Variables),
-        # а не только dictionary.valueObject. После render — InitVars+Variables
-        # (+ Submit панели, если она есть).
+        # Критично: isReportRenderingAfterSubmit=true — иначе Stimulsoft
+        # setDefaultValueForRequestFromUserVariables затирает List-значения
+        # из DialogInfo/CheckedColumn ДО SQL карты → пустая карта.
         auto_block = (
             "try { report.requestParameters = false; } catch (e) {}\n"
             "try { report.isReportRenderingAfterSubmit = true; } catch (e) {}\n"
             "try {\n"
-            "  var F0 = window.__dashFilters || {};\n"
+            "  var F = window.__dashFilters || {};\n"
             "  function dashPick(name, alias){\n"
-            "    if (name != null && F0[name] != null) return F0[name];\n"
-            "    if (alias != null && F0[alias] != null) return F0[alias];\n"
+            "    if (name != null && F[name] != null) return F[name];\n"
+            "    if (alias != null && F[alias] != null) return F[alias];\n"
             "    var nl = String(name || '').toLowerCase();\n"
             "    var al = String(alias || '').toLowerCase();\n"
-            "    var keys = Object.keys(F0);\n"
+            "    var keys = Object.keys(F);\n"
             "    for (var ki = 0; ki < keys.length; ki++) {\n"
             "      var k = keys[ki];\n"
             "      var lk = String(k).toLowerCase();\n"
-            "      if (lk === nl || (al && lk === al)) return F0[k];\n"
+            "      if (lk === nl || (al && lk === al)) return F[k];\n"
             "    }\n"
             "    return null;\n"
             "  }\n"
@@ -649,75 +598,16 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
             "      if (hit == null) continue;\n"
             "      try { v.valueObject = hit; } catch (e1) {}\n"
             "      try { v.value = hit; } catch (e2) {}\n"
-            "      try { report.setVariable(v.name, hit); } catch (e3) {}\n"
             "    }\n"
             "  }\n"
             "} catch (e) {}\n"
         )
-        force_vars_js = (
-            "(function(){\n"
-            "  var F = window.__dashFilters || {};\n"
-            "  if (!F || !Object.keys(F).length) return;\n"
-            "  var tries = 0;\n"
-            "  function fillPanel(js){\n"
-            "    try {\n"
-            "      var panel = js.controls && js.controls.parametersPanel;\n"
-            "      if (!panel) return false;\n"
-            "      var params = js.options && js.options.parameters;\n"
-            "      if (params) {\n"
-            "        Object.keys(F).forEach(function(k){\n"
-            "          var p = params[k];\n"
-            "          if (!p) {\n"
-            "            var lk = String(k).toLowerCase();\n"
-            "            Object.keys(params).forEach(function(n){\n"
-            "              if (String(n).toLowerCase() === lk) p = params[n];\n"
-            "            });\n"
-            "          }\n"
-            "          if (!p) return;\n"
-            "          try { if (typeof p.setValue === 'function') p.setValue(F[k]); } catch (e1) {}\n"
-            "          try { p.params.value = F[k]; } catch (e2) {}\n"
-            "        });\n"
-            "      }\n"
-            "      try {\n"
-            "        var btn = panel.mainButtons && panel.mainButtons.submit;\n"
-            "        if (btn && typeof btn.action === 'function') { btn.action(); return true; }\n"
-            "      } catch (e3) {}\n"
-            "      return false;\n"
-            "    } catch (e) { return false; }\n"
-            "  }\n"
-            "  function pushVars(){\n"
-            "    tries++;\n"
-            "    var viewer = window.__dashViewer || window.viewer;\n"
-            "    var js = viewer && viewer.jsObject;\n"
-            "    if (!js) { if (tries < 60) return; clearInterval(timer); return; }\n"
-            "    try {\n"
-            "      js.options = js.options || {};\n"
-            "      js.options.paramsVariables = js.options.paramsVariables || {};\n"
-            "      Object.keys(F).forEach(function(k){ js.options.paramsVariables[k] = F[k]; });\n"
-            "    } catch (e0) {}\n"
-            "    try {\n"
-            "      if (typeof js.postInteraction === 'function') {\n"
-            "        js.postInteraction({ action: 'InitVars', variables: F });\n"
-            "        js.postInteraction({ action: 'Variables', variables: F });\n"
-            "      }\n"
-            "    } catch (e1) {}\n"
-            "    var submitted = fillPanel(js);\n"
-            "    if (submitted || tries > 40) clearInterval(timer);\n"
-            "  }\n"
-            "  var timer = setInterval(pushVars, 250);\n"
-            "  setTimeout(pushVars, 0);\n"
-            "})();\n"
-        )
-    else:
-        force_vars_js = ""
     repl = (
         auto_block
         + "viewer.report = report;\n"
         "window.__dashViewer = viewer;\n"
         "window.__dashReport = report;\n"
-        "window.viewer = viewer;\n"
-        "viewer.renderHtml('viewerContent');\n"
-        + force_vars_js
+        "viewer.renderHtml('viewerContent');"
     )
     if needle in html:
         html = html.replace(needle, repl, 1)
@@ -790,9 +680,6 @@ def sti_response(
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
             html = inject_screenshot_ui(html, auto_render=auto_render)
             html = inject_handler_url(html, filter_token, handler_path=handler_path)
-            stripped, strip_msg = _mrt_is_stripped()
-            if stripped:
-                html = inject_mrt_warning(html, strip_msg)
             resp.set_data(html)
             resp.mimetype = "text/html"
     return resp
@@ -1344,18 +1231,15 @@ def open_dashboard_with_filters():
             # JSON удобен для Postman; HTML — для браузера
             wants_json = "application/json" in (request.headers.get("Accept") or "")
             if wants_json:
-                stripped, strip_msg = _mrt_is_stripped()
-                payload = {
-                    "ok": not stripped,
-                    "url": view_url,
-                    "path": view_path,
-                    "rf": token,
-                    "filters": incoming,
-                }
-                if stripped:
-                    payload["mrt_stripped"] = True
-                    payload["error"] = strip_msg
-                return jsonify(payload), (422 if stripped else 200)
+                return jsonify(
+                    {
+                        "ok": True,
+                        "url": view_url,
+                        "path": view_path,
+                        "rf": token,
+                        "filters": incoming,
+                    }
+                )
             html = (
                 "<!doctype html><meta charset=utf-8>"
                 f"<meta http-equiv=refresh content='0;url={view_path}'>"
