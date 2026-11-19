@@ -428,8 +428,9 @@ def build_viewer(
         viewer.onPrepareVariables += "dashApplyFilters"
     # token в URL handler'а — PrepareVariables/BeginProcessData без cookie
     # StiHandler.url — property без setter, только __init__; пишем private field
+    handler_path = "/open" if auto_render else "/viewer"
     if filter_token:
-        handler_url = f"/render?rf={filter_token}"
+        handler_url = f"{handler_path}?rf={filter_token}"
         try:
             viewer.handler._StiBaseHandler__url = handler_url  # noqa: SLF001
         except Exception:
@@ -442,10 +443,11 @@ def build_viewer(
             inject_screenshot=False,
             filter_token=filter_token,
             auto_render=auto_render,
+            handler_path=handler_path,
         )
 
     report = StiReport()
-    # /render → пропатченный .mrt без RequestParameters; /viewer → обычный /mrt
+    # /open → пропатченный .mrt без RequestParameters; /viewer → обычный /mrt
     if auto_render and filter_token:
         report.loadFile(f"/mrt-render?rf={filter_token}")
     else:
@@ -457,6 +459,7 @@ def build_viewer(
         filters=filters,
         filter_token=filter_token,
         auto_render=auto_render,
+        handler_path=handler_path,
     )
 
 
@@ -535,11 +538,16 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     return html
 
 
-def inject_handler_url(html: str, filter_token: str | None) -> str:
+def inject_handler_url(
+    html: str,
+    filter_token: str | None,
+    *,
+    handler_path: str = "/open",
+) -> str:
     """Прописать Stimulsoft.handler.url с rf=token (на случай если private set не сработал)."""
     if not filter_token or not isinstance(html, str):
         return html
-    url = f"/render?rf={filter_token}"
+    url = f"{handler_path}?rf={filter_token}"
     script = (
         "<script>(function(){\n"
         f"  var u = {json.dumps(url)};\n"
@@ -572,6 +580,7 @@ def sti_response(
     filters: dict[str, object] | None = None,
     filter_token: str | None = None,
     auto_render: bool = False,
+    handler_path: str = "/open",
 ):
     component.handler.framework = StiFrameworkType.FLASK
     if not component.handler.origin:
@@ -583,7 +592,7 @@ def sti_response(
             # сначала __dashFilters, потом патч renderHtml (auto_render)
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
             html = inject_screenshot_ui(html, auto_render=auto_render)
-            html = inject_handler_url(html, filter_token)
+            html = inject_handler_url(html, filter_token, handler_path=handler_path)
             resp.set_data(html)
             resp.mimetype = "text/html"
     return resp
@@ -616,7 +625,8 @@ def openapi_spec() -> dict:
             "title": "Stimulsoft Viewer API",
             "version": "1.0.0",
             "description": (
-                "Фильтры Dictionary.Variables (Category «Фильтры») и рендер дашборда. "
+                "`/viewer` — preview (панель + Submit). "
+                "`/open` — передал фильтры → сразу готовый дашборд. "
                 f"MRT: `{MRT_PATH.name}`"
             ),
         },
@@ -654,37 +664,38 @@ def openapi_spec() -> dict:
                     },
                 }
             },
-            "/render": {
+            "/open": {
                 "get": {
-                    "tags": ["render"],
-                    "summary": "Рендер viewer с фильтрами (query)",
+                    "tags": ["open"],
+                    "summary": "Открыть дашборд уже с фильтрами",
+                    "description": "Сразу построенный дашборд, без Submit. /viewer не меняется.",
                     "parameters": [
                         {
                             "name": "filters",
                             "in": "query",
                             "schema": {"type": "string"},
-                            "description": 'JSON: {"Region":"Брестская","Year":2024}',
+                            "description": 'JSON: {"trendtype":"nocumulative","typenum":1000}',
                         },
                         {
-                            "name": "Region",
+                            "name": "trendtype",
                             "in": "query",
                             "schema": {"type": "string"},
-                            "description": "Любые имена variables как query-параметры",
+                            "description": "Имена variables из GET /filters",
                         },
                     ],
                     "responses": {
                         "200": {
-                            "description": "HTML Stimulsoft Viewer",
+                            "description": "HTML дашборда с фильтрами",
                             "content": {"text/html": {"schema": {"type": "string"}}},
                         }
                     },
                 },
                 "post": {
-                    "tags": ["render"],
-                    "summary": "Рендер viewer с фильтрами (JSON → 303 на /render?rf=…)",
+                    "tags": ["open"],
+                    "summary": "Передать фильтры и открыть дашборд",
                     "description": (
-                        "По умолчанию 303 Redirect на GET /render?rf=TOKEN — открой Location в браузере. "
-                        "Для сырого HTML: /render?no_redirect=1"
+                        "Открывает браузер на /open?rf=TOKEN. "
+                        "Accept: application/json → {ok,url,rf}. ?open=0 — без браузера."
                     ),
                     "requestBody": {
                         "required": True,
@@ -714,7 +725,39 @@ def openapi_spec() -> dict:
                     },
                     "responses": {
                         "200": {
-                            "description": "HTML Stimulsoft Viewer",
+                            "description": "HTML-редирект или JSON {url}",
+                            "content": {
+                                "text/html": {"schema": {"type": "string"}},
+                                "application/json": {"schema": {"type": "object"}},
+                            },
+                        }
+                    },
+                },
+            },
+            "/render": {
+                "get": {
+                    "tags": ["open"],
+                    "summary": "Алиас /open",
+                    "responses": {
+                        "200": {
+                            "description": "То же что /open",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                },
+                "post": {
+                    "tags": ["open"],
+                    "summary": "Алиас /open",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/RenderRequest"}
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "То же что /open",
                             "content": {"text/html": {"schema": {"type": "string"}}},
                         }
                     },
@@ -723,10 +766,10 @@ def openapi_spec() -> dict:
             "/viewer": {
                 "get": {
                     "tags": ["viewer"],
-                    "summary": "Обычный viewer без подстановки фильтров",
+                    "summary": "Preview: панель + ручной Submit",
                     "responses": {
                         "200": {
-                            "description": "HTML Stimulsoft Viewer",
+                            "description": "HTML Stimulsoft Viewer без авто-фильтров",
                             "content": {"text/html": {"schema": {"type": "string"}}},
                         }
                     },
@@ -971,7 +1014,7 @@ def serve_mrt():
 
 @app.route("/mrt-render", methods=["GET", "POST"])
 def serve_mrt_render():
-    """Шаблон только для /render: RequestParameters=false + Value из фильтров."""
+    """Шаблон только для /open: RequestParameters=false + Value из фильтров."""
     token = (request.args.get("rf") or "").strip() or None
     filters = _load_render_filters(token) or session.get("render_filters") or {}
     if not isinstance(filters, dict):
@@ -1036,27 +1079,10 @@ def _is_stimulsoft_handler_request() -> bool:
     return False
 
 
-@app.route("/render", methods=["GET", "POST"])
-def render_with_filters():
-    """Принять значения фильтров (Category «Фильтры») и отрендерить viewer.
-
-    POST JSON:
-      {"filters": {"trendtype": "cumulative", "typenum": 1000000}}
-      или {"trendtype": "cumulative", "typenum": 1000000}
-
-    GET:
-      /render?trendtype=cumulative&typenum=1000000
-      /render?filters={"trendtype":"cumulative"}
-      /render?rf=TOKEN   — после POST (без cookie)
-
-    POST → сохраняет фильтры, открывает браузер на /render?rf=… и отдаёт HTML-заглушку
-    со ссылкой (Postman Preview тоже кликабелен). ?open=0 — не открывать браузер.
-    GET /render?... — сразу viewer с параметрами (удобнее всего из адресной строки).
-    """
-    token = (request.args.get("rf") or "").strip() or None
+def _collect_incoming_filters() -> dict[str, object]:
+    """Собрать {name: value} из POST JSON / form или GET query."""
     incoming: dict[str, object] = {}
     is_handler = _is_stimulsoft_handler_request()
-
     if request.method == "POST" and not is_handler:
         body = request.get_json(silent=True)
         if body is None and request.data:
@@ -1082,13 +1108,28 @@ def render_with_filters():
                 for k, v in request.args.items()
                 if k not in _RENDER_QUERY_SKIP
             }
+    return incoming
+
+
+def open_dashboard_with_filters():
+    """Подставить фильтры и открыть уже построенный дашборд (без Submit).
+
+    Отдельно от /viewer (preview с ручным Submit).
+
+    GET  /open?trendtype=nocumulative&typenum=1000
+    GET  /open?filters={"trendtype":"nocumulative","typenum":1000}
+    POST /open  JSON {"filters":{"trendtype":"nocumulative","typenum":1000}}
+         → открывает браузер на /open?rf=TOKEN (или ?open=0 без браузера)
+    """
+    token = (request.args.get("rf") or "").strip() or None
+    incoming = _collect_incoming_filters()
+    is_handler = _is_stimulsoft_handler_request()
 
     if incoming:
         session["render_filters"] = incoming
         token = _store_render_filters(incoming)
-        # POST из Postman/Swagger: открыть браузер на готовый URL с фильтрами
         if request.method == "POST" and not is_handler:
-            view_path = f"/render?rf={token}"
+            view_path = f"/open?rf={token}"
             view_url = f"http://{HOST}:{PORT}{view_path}"
             open_flag = (request.args.get("open") or "1").strip().lower()
             if open_flag not in {"0", "false", "no", "off"}:
@@ -1097,6 +1138,18 @@ def render_with_filters():
                     print(f"opened browser: {view_url}", flush=True)
                 except Exception as exc:
                     print(f"browser open failed: {exc}", flush=True)
+            # JSON удобен для Postman; HTML — для браузера
+            wants_json = "application/json" in (request.headers.get("Accept") or "")
+            if wants_json:
+                return jsonify(
+                    {
+                        "ok": True,
+                        "url": view_url,
+                        "path": view_path,
+                        "rf": token,
+                        "filters": incoming,
+                    }
+                )
             html = (
                 "<!doctype html><meta charset=utf-8>"
                 f"<meta http-equiv=refresh content='0;url={view_path}'>"
@@ -1113,8 +1166,7 @@ def render_with_filters():
         token = _store_render_filters(filters)
         session["render_filters"] = filters
 
-    print(f"render filters={filters} rf={token}", flush=True)
-    # auto_render: сразу дашборд с фильтрами, без ручного Submit (/viewer не трогаем)
+    print(f"open filters={filters} rf={token}", flush=True)
     return build_viewer(
         filters=filters,
         filter_token=token,
@@ -1123,13 +1175,25 @@ def render_with_filters():
     )
 
 
+@app.route("/open", methods=["GET", "POST"])
+def open_with_filters():
+    """Новый endpoint: передал фильтры → открылся дашборд уже с ними (без Submit)."""
+    return open_dashboard_with_filters()
+
+
+@app.route("/render", methods=["GET", "POST"])
+def render_with_filters():
+    """Алиас /open (совместимость)."""
+    return open_dashboard_with_filters()
+
+
 def main() -> None:
     print("Stimulsoft Dashboards.PYTHON 2024.2.2 — official Flask wiring", flush=True)
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
-    print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
+    print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
     print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
-    print(f"Render:   http://{HOST}:{PORT}/render  (POST filters → viewer)", flush=True)
+    print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
     print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
