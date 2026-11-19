@@ -240,8 +240,9 @@ def build_viewer(*, filters: dict[str, object] | None = None, inject_screenshot:
     if filters:
         viewer.onPrepareVariables += make_prepare_variables(filters)
 
+    # handler/GetResource — без inject: иначе JS ломается (в файле есть «StiViewer»)
     if sti_process(viewer):
-        return sti_response(viewer, inject_screenshot=inject_screenshot)
+        return sti_response(viewer, inject_screenshot=False)
 
     report = StiReport()
     report.loadFile("/mrt")
