@@ -449,7 +449,24 @@
     return isTableElement(c) || isPivotTableElement(c);
   }
 
-  function exportElementAsync(element, format) {
+  /** Dashboard export format/settings (НЕ Report.StiExportFormat — у него другие номера). */
+  function dashboardPdfSettings() {
+    var Exp = Stimulsoft.Dashboard && Stimulsoft.Dashboard.Export;
+    if (!Exp) return null;
+    try {
+      if (Exp.StiPdfDashboardExportSettings) {
+        var s = new Exp.StiPdfDashboardExportSettings();
+        if ("imageQuality" in s) s.imageQuality = 200;
+        return s;
+      }
+    } catch (e) {}
+    if (Exp.StiDashboardExportFormat && Exp.StiDashboardExportFormat.Pdf != null) {
+      return Exp.StiDashboardExportFormat.Pdf;
+    }
+    return null;
+  }
+
+  function exportElementAsync(element, settings) {
     return new Promise(function (resolve, reject) {
       try {
         var Tools =
@@ -466,7 +483,7 @@
             else resolve(data);
           },
           element,
-          format
+          settings
         );
       } catch (e) {
         reject(e);
@@ -528,17 +545,14 @@
   }
 
   /**
-   * Save на Table/Pivot → Image/Excel/Data; PDF — через export API (все строки).
-   * Скачивает PDF + кладёт в exports/.
+   * Table/Pivot → PDF через StiDashboardExportFormat.Pdf
+   * (раньше ошибочно шёл Report.StiExportFormat.Pdf=1 → это Excel в dashboard API).
    */
   async function exportTablesToPdf(report, root) {
     if (!report) return 0;
-    var Pdf =
-      Stimulsoft.Report && Stimulsoft.Report.StiExportFormat
-        ? Stimulsoft.Report.StiExportFormat.Pdf
-        : null;
-    if (Pdf == null) {
-      console.warn("[dash-shot] StiExportFormat.Pdf нет");
+    var pdfSettings = dashboardPdfSettings();
+    if (pdfSettings == null) {
+      console.warn("[dash-shot] StiDashboardExportFormat.Pdf / PdfSettings нет");
       return 0;
     }
     var visible = visibleTableNames(root || document);
@@ -549,7 +563,9 @@
         return c.name || typeName(c);
       }),
       "visible",
-      Object.keys(visible)
+      Object.keys(visible),
+      "settings",
+      pdfSettings && pdfSettings.format != null ? pdfSettings.format : pdfSettings
     );
     if (Object.keys(visible).length) {
       var onPage = comps.filter(function (c) {
@@ -571,7 +587,7 @@
       var pdfName = base + ".pdf";
       setStatus("PDF " + (el.name || base) + "…");
       try {
-        var data = await exportElementAsync(el, Pdf);
+        var data = await exportElementAsync(el, pdfSettings);
         try {
           Stimulsoft.System.StiObject.saveAs(
             data,
