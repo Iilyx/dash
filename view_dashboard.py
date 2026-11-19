@@ -334,6 +334,285 @@ def favicon():
     return Response(status=204)
 
 
+def openapi_spec() -> dict:
+    """OpenAPI 3 для Flask viewer — /docs."""
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Stimulsoft Viewer API",
+            "version": "1.0.0",
+            "description": (
+                "Фильтры Dictionary.Variables (Category «Фильтры») и рендер дашборда. "
+                f"MRT: `{MRT_PATH.name}`"
+            ),
+        },
+        "paths": {
+            "/filters": {
+                "get": {
+                    "tags": ["filters"],
+                    "summary": "Список фильтров из .mrt (+ SQL choices)",
+                    "description": (
+                        "Variables с Category «Фильтр(ы)». "
+                        "`choices_from=items` — Keys/Values; "
+                        "`choices_from=query` — SqlCommand DataSource (по умолчанию выполняется)."
+                    ),
+                    "parameters": [
+                        {
+                            "name": "run_queries",
+                            "in": "query",
+                            "schema": {
+                                "type": "string",
+                                "enum": ["0", "1", "true", "false"],
+                                "default": "1",
+                            },
+                            "description": "1 — выполнить SQL dialog.source; 0 — только метаданные",
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Фильтры",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/FiltersResponse"}
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/render": {
+                "get": {
+                    "tags": ["render"],
+                    "summary": "Рендер viewer с фильтрами (query)",
+                    "parameters": [
+                        {
+                            "name": "filters",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": 'JSON: {"Region":"Брестская","Year":2024}',
+                        },
+                        {
+                            "name": "Region",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "Любые имена variables как query-параметры",
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "HTML Stimulsoft Viewer",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                },
+                "post": {
+                    "tags": ["render"],
+                    "summary": "Рендер viewer с фильтрами (JSON)",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/RenderRequest"},
+                                "examples": {
+                                    "wrapped": {
+                                        "summary": "через filters",
+                                        "value": {
+                                            "filters": {
+                                                "Region": "Брестская",
+                                                "Year": 2024,
+                                            }
+                                        },
+                                    },
+                                    "flat": {
+                                        "summary": "плоский объект",
+                                        "value": {"Region": "Брестская", "Year": 2024},
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "HTML Stimulsoft Viewer",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                },
+            },
+            "/viewer": {
+                "get": {
+                    "tags": ["viewer"],
+                    "summary": "Обычный viewer без подстановки фильтров",
+                    "responses": {
+                        "200": {
+                            "description": "HTML Stimulsoft Viewer",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                }
+            },
+            "/designer": {
+                "get": {
+                    "tags": ["viewer"],
+                    "summary": "Stimulsoft Designer",
+                    "responses": {
+                        "200": {
+                            "description": "HTML Designer",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                }
+            },
+            "/mrt": {
+                "get": {
+                    "tags": ["viewer"],
+                    "summary": "Сырой .mrt (JSON)",
+                    "responses": {
+                        "200": {
+                            "description": "MRT JSON",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        }
+                    },
+                }
+            },
+            "/api/screenshot": {
+                "post": {
+                    "tags": ["export"],
+                    "summary": "Сохранить PNG/PDF/CSV в exports/",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ScreenshotRequest"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Сохранено",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/ScreenshotResponse"}
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        },
+        "components": {
+            "schemas": {
+                "FiltersResponse": {
+                    "type": "object",
+                    "properties": {
+                        "mrt": {"type": "string"},
+                        "kind": {"type": "string", "example": "category_filters"},
+                        "count": {"type": "integer"},
+                        "run_queries": {"type": "boolean"},
+                        "database": {"type": "boolean"},
+                        "filters": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/FilterItem"},
+                        },
+                    },
+                },
+                "FilterItem": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "name": {"type": "string"},
+                        "alias": {"type": "string"},
+                        "category": {"type": "string", "example": "Фильтры"},
+                        "type": {"type": "string"},
+                        "choices_from": {
+                            "type": "string",
+                            "enum": ["items", "query", "none"],
+                        },
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "key": {},
+                                    "value": {},
+                                },
+                            },
+                        },
+                        "sql": {"type": "string"},
+                        "query_ok": {"type": "boolean"},
+                        "query_error": {"type": "string"},
+                    },
+                },
+                "RenderRequest": {
+                    "type": "object",
+                    "description": "Либо {filters:{...}}, либо плоский {Name: value}",
+                    "additionalProperties": True,
+                    "properties": {
+                        "filters": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "example": {"Region": "Брестская", "Year": 2024},
+                        }
+                    },
+                },
+                "ScreenshotRequest": {
+                    "type": "object",
+                    "required": ["data_b64"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "ext": {"type": "string", "example": "png"},
+                        "data_b64": {"type": "string", "format": "byte"},
+                    },
+                },
+                "ScreenshotResponse": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "name": {"type": "string"},
+                        "path": {"type": "string"},
+                        "error": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
+
+
+@app.get("/openapi.json")
+def openapi_json():
+    resp = jsonify(openapi_spec())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/docs")
+def swagger_docs():
+    """Swagger UI для viewer API."""
+    html = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <title>Stimulsoft Viewer API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: "/openapi.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      layout: "BaseLayout"
+    });
+  </script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
 @app.get("/screenshot-dashboard.js")
 def screenshot_dashboard_js():
     path = ROOT / "screenshot_dashboard.js"
@@ -510,6 +789,7 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer", flush=True)
     print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
     print(f"Render:   http://{HOST}:{PORT}/render  (POST filters → viewer)", flush=True)
+    print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
         try:
