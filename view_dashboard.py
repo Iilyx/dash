@@ -212,13 +212,21 @@ def screenshot_dashboard_js():
 
 @app.get("/filters")
 def filters():
-    """Что лежит в фильтрах .mrt: ComboBox / ListBox / DatePicker / NumberBox / TreeView*."""
+    """Параметры/фильтры Dictionary.Variables — ввод до генерации дашборда (не ComboBox на странице)."""
     try:
         from filters_mrt import extract_filters
 
         plan = extract_filters(MRT_PATH)
     except Exception as exc:
-        return jsonify({"mrt": MRT_PATH.name, "error": str(exc), "count": 0, "filters": []}), 500
+        return jsonify(
+            {
+                "mrt": MRT_PATH.name,
+                "kind": "report_variables",
+                "error": str(exc),
+                "count": 0,
+                "filters": [],
+            }
+        ), 500
     resp = jsonify(plan)
     resp.headers["Cache-Control"] = "no-store"
     return resp
