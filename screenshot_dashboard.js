@@ -449,19 +449,49 @@
     return isTableElement(c) || isPivotTableElement(c);
   }
 
-  /** Dashboard export format/settings (НЕ Report.StiExportFormat — у него другие номера). */
-  function dashboardPdfSettings() {
+  /**
+   * Настройки экспорта дашборд-элемента.
+   * getDashboardExportSettings2 ждёт Report.StiExportFormat (Pdf=1),
+   * а не StiDashboardExportFormat (Pdf=0 = None → падает).
+   */
+  function dashboardExportSettings(kind) {
     var Exp = Stimulsoft.Dashboard && Stimulsoft.Dashboard.Export;
-    if (!Exp) return null;
-    try {
-      if (Exp.StiPdfDashboardExportSettings) {
-        var s = new Exp.StiPdfDashboardExportSettings();
-        if ("imageQuality" in s) s.imageQuality = 200;
-        return s;
+    var RepFmt = Stimulsoft.Report && Stimulsoft.Report.StiExportFormat;
+    kind = (kind || "pdf").toLowerCase();
+    if (Exp) {
+      try {
+        if (kind === "pdf" && Exp.StiPdfDashboardExportSettings) {
+          var pdf = new Exp.StiPdfDashboardExportSettings();
+          if ("imageQuality" in pdf) pdf.imageQuality = 200;
+          return pdf;
+        }
+        if (kind === "excel" && Exp.StiExcelDashboardExportSettings) {
+          return new Exp.StiExcelDashboardExportSettings();
+        }
+        if (
+          (kind === "data" || kind === "csv") &&
+          Exp.StiDataDashboardExportSettings
+        ) {
+          var dataType =
+            Stimulsoft.Report &&
+            Stimulsoft.Report.Export &&
+            Stimulsoft.Report.Export.StiDataType
+              ? Stimulsoft.Report.Export.StiDataType.Csv
+              : undefined;
+          return dataType != null
+            ? new Exp.StiDataDashboardExportSettings(dataType)
+            : new Exp.StiDataDashboardExportSettings();
+        }
+      } catch (e) {
+        console.warn("[dash-shot] settings ctor", kind, e);
       }
-    } catch (e) {}
-    if (Exp.StiDashboardExportFormat && Exp.StiDashboardExportFormat.Pdf != null) {
-      return Exp.StiDashboardExportFormat.Pdf;
+    }
+    // fallback: номера из Report.StiExportFormat
+    if (RepFmt) {
+      if (kind === "pdf" && RepFmt.Pdf != null) return RepFmt.Pdf;
+      if (kind === "excel" && (RepFmt.Excel2007 != null || RepFmt.Excel != null))
+        return RepFmt.Excel2007 != null ? RepFmt.Excel2007 : RepFmt.Excel;
+      if (kind === "csv" && RepFmt.Csv != null) return RepFmt.Csv;
     }
     return null;
   }
@@ -489,6 +519,83 @@
         reject(e);
       }
     });
+  }
+
+  function exportBytesToUint8(data) {
+    data = normalizeExportBytes(data);
+    if (!data) return null;
+    if (typeof data === "string") {
+      // base64?
+      try {
+        if (/^[A-Za-z0-9+/=\s]+$/.test(data.slice(0, 80)) && data.length > 64) {
+          var bin = atob(data.replace(/\s+/g, ""));
+          var arr = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+          return arr;
+        }
+      } catch (e) {}
+      // обычный текст (CSV)
+      try {
+        return new TextEncoder().encode(data);
+      } catch (e2) {
+        var out = new Uint8Array(data.length);
+        for (var j = 0; j < data.length; j++) out[j] = data.charCodeAt(j) & 0xff;
+        return out;
+      }
+    }
+    return data instanceof Uint8Array ? data : null;
+  }
+
+  function sniffExportKind(bytes) {
+    if (!bytes || !bytes.length) return "bin";
+    if (
+      bytes[0] === 0x25 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x44 &&
+      bytes[3] === 0x46
+    )
+      return "pdf";
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return "xlsx";
+    // CSV/text
+    try {
+      var head = String.fromCharCode.apply(
+        null,
+        bytes.subarray(0, Math.min(64, bytes.length))
+      );
+      if (/^[\w\"';\t\r\n.,;-]/.test(head)) return "csv";
+    } catch (e) {}
+    return "bin";
+  }
+
+  function mimeForKind(kind) {
+    if (kind === "pdf") return "application/pdf";
+    if (kind === "xlsx")
+      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (kind === "csv") return "text/csv;charset=utf-8";
+    return "application/octet-stream";
+  }
+
+  async function saveExportBytes(data, baseName, preferExt) {
+    var bytes = exportBytesToUint8(data);
+    if (!bytes || !bytes.length) throw new Error("empty export bytes");
+    var kind = sniffExportKind(bytes);
+    var ext = preferExt || kind;
+    if (kind === "pdf") ext = "pdf";
+    else if (kind === "xlsx") ext = "xlsx";
+    else if (kind === "csv") ext = "csv";
+    var fileName = baseName + "." + ext;
+    var mime = mimeForKind(kind === "bin" ? ext : kind);
+    try {
+      Stimulsoft.System.StiObject.saveAs(data, fileName, mime);
+    } catch (e) {
+      downloadBlob(new Blob([bytes], { type: mime }), fileName);
+    }
+    try {
+      await postExportFile(fileName, stiBytesToBase64(data), ext);
+    } catch (e) {
+      console.warn("[dash-shot] upload", fileName, e);
+    }
+    return { name: fileName, kind: kind, bytes: bytes.length };
   }
 
   function stiBytesToBase64(data) {
@@ -545,27 +652,20 @@
   }
 
   /**
-   * Table/Pivot → PDF через StiDashboardExportFormat.Pdf
-   * (раньше ошибочно шёл Report.StiExportFormat.Pdf=1 → это Excel в dashboard API).
+   * Table/Pivot → PDF + Excel (все строки).
+   * Порядок попыток на формат: settings-класс → Report.StiExportFormat номер.
    */
   async function exportTablesToPdf(report, root) {
     if (!report) return 0;
-    var pdfSettings = dashboardPdfSettings();
-    if (pdfSettings == null) {
-      console.warn("[dash-shot] StiDashboardExportFormat.Pdf / PdfSettings нет");
-      return 0;
-    }
     var visible = visibleTableNames(root || document);
     var comps = collectAll(report).filter(isExportableTable);
     console.log(
-      "[dash-shot] tables for pdf",
+      "[dash-shot] tables",
       comps.map(function (c) {
         return c.name || typeName(c);
       }),
       "visible",
-      Object.keys(visible),
-      "settings",
-      pdfSettings && pdfSettings.format != null ? pdfSettings.format : pdfSettings
+      Object.keys(visible)
     );
     if (Object.keys(visible).length) {
       var onPage = comps.filter(function (c) {
@@ -575,8 +675,14 @@
     }
     if (!comps.length) {
       console.warn("[dash-shot] Table/Pivot не найден");
+      setStatus("таблица не найдена");
       return 0;
     }
+
+    var formats = [
+      { kind: "pdf", preferExt: "pdf" },
+      { kind: "excel", preferExt: "xlsx" },
+    ];
     var saved = 0;
     for (var i = 0; i < comps.length; i++) {
       var el = comps[i];
@@ -584,37 +690,39 @@
         String(el.name || "Table" + (i + 1)).replace(/\s+/g, "_") +
         "_" +
         stamp();
-      var pdfName = base + ".pdf";
-      setStatus("PDF " + (el.name || base) + "…");
-      try {
-        var data = await exportElementAsync(el, pdfSettings);
+      var gotOne = false;
+      for (var f = 0; f < formats.length; f++) {
+        var fmt = formats[f];
+        var settings = dashboardExportSettings(fmt.kind);
+        if (settings == null) {
+          console.warn("[dash-shot] нет settings", fmt.kind);
+          continue;
+        }
+        setStatus(fmt.kind.toUpperCase() + " " + (el.name || base) + "…");
         try {
-          Stimulsoft.System.StiObject.saveAs(
-            data,
-            pdfName,
-            "application/pdf"
-          );
-        } catch (e) {
-          console.warn("[dash-shot] saveAs pdf", e);
-          try {
-            var b64dl = stiBytesToBase64(data);
-            var bin = atob(b64dl);
-            var arr = new Uint8Array(bin.length);
-            for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
-            downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
-          } catch (e2) {
-            console.warn("[dash-shot] blob pdf", e2);
+          var data = await exportElementAsync(el, settings);
+          var info = await saveExportBytes(data, base + "_" + fmt.kind, fmt.preferExt);
+          saved++;
+          gotOne = true;
+          console.log("[dash-shot] table export", el.name, info);
+        } catch (err) {
+          console.warn("[dash-shot] table export failed", el.name, fmt.kind, err);
+        }
+      }
+      if (!gotOne) {
+        // последний шанс — CSV
+        try {
+          var csvSettings = dashboardExportSettings("csv");
+          if (csvSettings != null) {
+            setStatus("CSV " + (el.name || base) + "…");
+            var csvData = await exportElementAsync(el, csvSettings);
+            var csvInfo = await saveExportBytes(csvData, base + "_data", "csv");
+            saved++;
+            console.log("[dash-shot] table csv", el.name, csvInfo);
           }
+        } catch (err2) {
+          console.warn("[dash-shot] table csv failed", el.name, err2);
         }
-        try {
-          await postExportFile(pdfName, stiBytesToBase64(data), "pdf");
-        } catch (e) {
-          console.warn("[dash-shot] pdf upload", e);
-        }
-        saved++;
-        console.log("[dash-shot] table pdf", pdfName);
-      } catch (err) {
-        console.warn("[dash-shot] table pdf failed", el.name, err);
       }
     }
     return saved;
