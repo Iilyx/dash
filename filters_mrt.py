@@ -10,7 +10,7 @@ CheckedColumn Stimulsoft: `Source;Expression`, напр.
   payment_types;payment_types.payment_code==\"0000000\"
 → choices[].checked + value (если Variable.Value пустой).
 
-В ответе `dialog` всегда несёт KeysColumn / ValuesColumn / CheckedColumn из DialogInfo.
+Публичный ответ /filters: у каждого фильтра только alias, choices, name, value.
 """
 
 from __future__ import annotations
@@ -645,14 +645,10 @@ def extract_filters(
         if not parsed.get("name"):
             nameless += 1
             continue
-        filters.append(parsed)
+        filters.append(_public_filter(parsed))
 
     out: dict = {
         "mrt": mrt_path.name,
-        "kind": "category_filters",
-        "description": "Variables с Category «Фильтр(ы)»: items или результат SQL dialog.source",
-        "run_queries": run_queries,
-        "database": bool(db_url),
         "count": len(filters),
         "filters": filters,
     }
@@ -662,9 +658,32 @@ def extract_filters(
             f"В `{mrt_path.name}` у переменных Category «Фильтры» пустые Name/Keys/SQL "
             f"({nameless} шт.). Нужен полный .mrt — задай MRT_PATH на файл с именами."
         )
-    elif nameless:
-        out["skipped_nameless"] = nameless
     return out
+
+
+def _public_choice(ch: dict) -> dict:
+    """Один пункт choices: key + value (+ checked если есть)."""
+    out: dict = {}
+    if "key" in ch and ch["key"] not in (None, ""):
+        out["key"] = ch["key"]
+    if "value" in ch and ch["value"] not in (None, ""):
+        out["value"] = ch["value"]
+    elif "key" in out:
+        out["value"] = out["key"]
+    if ch.get("checked"):
+        out["checked"] = True
+    return out
+
+
+def _public_filter(parsed: dict) -> dict:
+    """Только alias, choices, name, value."""
+    choices = parsed.get("choices") or []
+    return {
+        "alias": parsed.get("alias") or parsed.get("name"),
+        "choices": [_public_choice(c) for c in choices if isinstance(c, dict)],
+        "name": parsed.get("name"),
+        "value": parsed.get("value"),
+    }
 
 
 def main() -> None:
