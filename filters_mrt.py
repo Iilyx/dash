@@ -40,26 +40,97 @@ def _is_filter_category(category: str | None, raw: dict) -> bool:
     return False
 
 
-def _datasources_by_name(dictionary: dict) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for item in numbered(dictionary.get("DataSources")):
+def _jsonable(v):
+    """datetime/Decimal/UUID → JSON-friendly."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    try:
+        from datetime import date, datetime
+        from decimal import Decimal
+        from uuid import UUID
+
+        if isinstance(v, (datetime, date)):
+            return v.isoformat()
+        if isinstance(v, Decimal):
+            return float(v)
+        if isinstance(v, UUID):
+            return str(v)
+        if isinstance(v, (bytes, bytearray)):
+            return v.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return str(v)
+
+
+def _database_url(explicit: str | None = None) -> str | None:
+    if explicit and explicit.strip():
+        return explicit.strip()
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        return url
+    user = os.environ.get("POSTGRES_USER", "").strip()
+    password = os.environ.get("POSTGRES_PASSWORD", "").strip()
+    db = os.environ.get("POSTGRES_DB", "").strip()
+    host = os.environ.get("POSTGRES_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.environ.get("POSTGRES_PORT", "5432").strip() or "5432"
+    if user and password and db:
+        from urllib.parse import quote_plus
+
+        return f"postgresql://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{db}"
+    return None
+
+
+def _datasources_index(dictionary: dict) -> tuple[dict[str, dict], list[dict]]:
+    """name/alias/NameInSource → source; плюс список всех с SQL."""
+    by_name: dict[str, dict] = {}
+    all_src: list[dict] = []
+    for idx, item in enumerate(numbered(dictionary.get("DataSources"))):
         if not isinstance(item, dict):
             continue
-        name = text(item.get("Name")) or text(item.get("Alias"))
-        if not name:
-            # обрезанный .mrt — индекс как ключ не поможет для KeysColumn; всё равно сохраним sql
-            continue
-        out[name.lower()] = {
+        name = text(item.get("Name"))
+        alias = text(item.get("Alias"))
+        name_in = text(item.get("NameInSource"))
+        sql = query_of(item)
+        cols = [
+            text(c.get("Name")) or text(c.get("NameInSource"))
+            for c in numbered(item.get("Columns"))
+            if isinstance(c, dict)
+        ]
+        cols = [c for c in cols if c]
+        rec = {
+            "index": idx,
             "name": name,
-            "alias": text(item.get("Alias")),
-            "sql": query_of(item),
-            "columns": [
-                text(c.get("Name")) or text(c.get("NameInSource"))
-                for c in numbered(item.get("Columns"))
-                if isinstance(c, dict)
-            ],
+            "alias": alias,
+            "name_in_source": name_in,
+            "sql": sql,
+            "columns": cols,
         }
-    return out
+        all_src.append(rec)
+        for key in (name, alias, name_in):
+            if key:
+                by_name[key.lower()] = rec
+    return by_name, all_src
+
+
+def _resolve_source(
+    source_name: str | None,
+    by_name: dict[str, dict],
+    all_src: list[dict],
+) -> dict | None:
+    if source_name:
+        hit = by_name.get(source_name.lower())
+        if hit:
+            return hit
+        # частичное совпадение: source в начале имени / имя в source
+        sn = source_name.lower()
+        for key, rec in by_name.items():
+            if key.startswith(sn) or sn.startswith(key):
+                return rec
+    # один источник с SQL — единственный кандидат
+    with_sql = [s for s in all_src if s.get("sql")]
+    if len(with_sql) == 1:
+        return with_sql[0]
+    return None
 
 
 def _column_tail(path: str | None) -> str | None:
@@ -117,9 +188,9 @@ def _choices_from_rows(
             value = vals[1] if len(vals) > 1 else vals[0]
         item = {}
         if key is not None and str(key) != "":
-            item["key"] = key if not isinstance(key, (dict, list)) else str(key)
+            item["key"] = _jsonable(key)
         if value is not None and str(value) != "":
-            item["value"] = value if not isinstance(value, (dict, list)) else str(value)
+            item["value"] = _jsonable(value)
         if item:
             out.append(item)
     return out
@@ -128,7 +199,8 @@ def _choices_from_rows(
 def _parse_filter_variable(
     raw: dict,
     index: int,
-    sources: dict[str, dict],
+    sources_by_name: dict[str, dict],
+    all_sources: list[dict],
     *,
     run_queries: bool,
     database_url: str | None,
@@ -193,7 +265,10 @@ def _parse_filter_variable(
         }
         item["dialog"] = {k: v for k, v in item["dialog"].items() if v}
 
-        src = sources.get((source_name or "").lower()) if source_name else None
+        src = _resolve_source(source_name, sources_by_name, all_sources)
+        if src and not source_name and src.get("name"):
+            item.setdefault("dialog", {})["source"] = src.get("name")
+            item["dialog"] = {k: v for k, v in item["dialog"].items() if v}
         sql = (src or {}).get("sql") if src else None
         if sql:
             item["sql"] = sql
@@ -217,6 +292,12 @@ def _parse_filter_variable(
             if not sql:
                 item["query_ok"] = False
                 item["query_error"] = "sql/source не найдены в Dictionary.DataSources"
+            elif not database_url:
+                item["query_ok"] = False
+                item["query_error"] = "нет DATABASE_URL / POSTGRES_*"
+            elif not run_queries:
+                item["query_ok"] = False
+                item["query_error"] = "run_queries выключен"
     else:
         # Category Фильтры, но без списка и без колонок — всё равно вернём переменную
         item["choices_from"] = "none"
@@ -228,14 +309,16 @@ def _parse_filter_variable(
 def extract_filters(
     mrt_path: Path | str,
     *,
-    run_queries: bool = False,
+    run_queries: bool = True,
     database_url: str | None = None,
 ) -> dict:
     mrt_path = Path(mrt_path)
     data = json.loads(mrt_path.read_text(encoding="utf-8-sig"))
     dictionary = data.get("Dictionary") or {}
-    sources = _datasources_by_name(dictionary if isinstance(dictionary, dict) else {})
-    db_url = database_url or os.environ.get("DATABASE_URL", "").strip() or None
+    sources_by_name, all_sources = _datasources_index(
+        dictionary if isinstance(dictionary, dict) else {}
+    )
+    db_url = _database_url(database_url)
 
     filters: list[dict] = []
     raw_vars = dictionary.get("Variables") if isinstance(dictionary, dict) else None
@@ -243,7 +326,8 @@ def extract_filters(
         parsed = _parse_filter_variable(
             raw,
             idx,
-            sources,
+            sources_by_name,
+            all_sources,
             run_queries=run_queries,
             database_url=db_url,
         )
@@ -254,6 +338,8 @@ def extract_filters(
         "mrt": mrt_path.name,
         "kind": "category_filters",
         "description": "Variables с Category «Фильтр(ы)»: items или результат SQL dialog.source",
+        "run_queries": run_queries,
+        "database": bool(db_url),
         "count": len(filters),
         "filters": filters,
     }
@@ -264,15 +350,15 @@ def main() -> None:
     ap.add_argument("mrt", type=Path, nargs="?", default=None)
     ap.add_argument("-o", "--output", type=Path, default=None)
     ap.add_argument(
-        "--run-queries",
+        "--no-run-queries",
         action="store_true",
-        help="Выполнить SQL dialog.source (нужен DATABASE_URL)",
+        help="Не выполнять SQL (по умолчанию SQL считается)",
     )
     args = ap.parse_args()
     mrt = args.mrt or Path(os.environ.get("MRT_PATH") or "test.mrt")
     if not mrt.is_file():
         raise SystemExit(f"нет файла: {mrt}")
-    plan = extract_filters(mrt, run_queries=args.run_queries)
+    plan = extract_filters(mrt, run_queries=not args.no_run_queries)
     text_out = json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.write_text(text_out, encoding="utf-8")

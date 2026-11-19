@@ -212,13 +212,13 @@ def screenshot_dashboard_js():
 
 @app.get("/filters")
 def filters():
-    """Variables с Category «Фильтр(ы)»: фиксированные choices или SQL dialog.source (+ rows)."""
+    """Variables с Category «Фильтр(ы)»: items или SQL dialog.source (SQL считается по умолчанию)."""
     try:
         from filters_mrt import extract_filters
 
-        # run_queries=1|true — выполнить SQL источников и вернуть choices
-        rq = (request.args.get("run_queries") or request.args.get("sql") or "").strip().lower()
-        run_queries = rq in {"1", "true", "yes", "on"}
+        # по умолчанию SQL выполняется; ?run_queries=0 — только метаданные
+        rq = (request.args.get("run_queries") or request.args.get("sql") or "1").strip().lower()
+        run_queries = rq not in {"0", "false", "no", "off"}
         plan = extract_filters(
             MRT_PATH,
             run_queries=run_queries,
