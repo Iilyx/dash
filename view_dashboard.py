@@ -425,7 +425,7 @@ def inject_filter_values_js(
     *,
     auto_render: bool = False,
 ) -> str:
-    """Клиентский fallback: выставить variables; для /render — без панели Submit."""
+    """Клиентский fallback: выставить variables из __dashFilters."""
     if not filters or not isinstance(html, str):
         return html
     # экранируем < чтобы JSON не закрыл <script> (Unexpected token)
@@ -483,7 +483,7 @@ def build_viewer(
 ):
     """Собрать StiViewer.
 
-    auto_render=True — только /render: без панели Submit, сразу дашборд с фильтрами.
+    auto_render=True — /open: сразу дашборд с фильтрами.
     /viewer вызывает с auto_render=False.
     """
     viewer = StiViewer()
@@ -978,35 +978,6 @@ def openapi_spec() -> dict:
                     },
                 },
             },
-            "/render": {
-                "get": {
-                    "tags": ["open"],
-                    "summary": "Алиас /open",
-                    "responses": {
-                        "200": {
-                            "description": "То же что /open",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
-                        }
-                    },
-                },
-                "post": {
-                    "tags": ["open"],
-                    "summary": "Алиас /open",
-                    "requestBody": {
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/RenderRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "То же что /open",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
-                        }
-                    },
-                },
-            },
             "/viewer": {
                 "get": {
                     "tags": ["viewer"],
@@ -1430,13 +1401,7 @@ def open_dashboard_with_filters():
 
 @app.route("/open", methods=["GET", "POST"])
 def open_with_filters():
-    """Новый endpoint: передал фильтры → открылся дашборд уже с ними (без Submit)."""
-    return open_dashboard_with_filters()
-
-
-@app.route("/render", methods=["GET", "POST"])
-def render_with_filters():
-    """Алиас /open (совместимость)."""
+    """Передал фильтры → открылся дашборд уже с ними (без Submit)."""
     return open_dashboard_with_filters()
 
 
