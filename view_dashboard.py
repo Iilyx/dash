@@ -33,6 +33,9 @@ from stimulsoft_reports.designer import StiDesigner
 from stimulsoft_reports.events import StiDataEventArgs, StiReportEventArgs, StiVariablesEventArgs
 from stimulsoft_reports.report import StiReport
 from stimulsoft_reports.viewer import StiViewer
+from stimulsoft_reports.viewer.enums.StiParametersPanelPosition import (
+    StiParametersPanelPosition,
+)
 
 ROOT = Path(__file__).resolve().parent
 _SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
@@ -86,6 +89,15 @@ def apply_license(component) -> None:
         component.license.setKey(key)
     elif file_raw:
         component.license.setFile(str(path_of(file_raw).resolve()))
+
+
+def apply_filter_panel_ui(viewer_options) -> None:
+    """Фильтры в строку сверху; Submit/Reset → Применить/Сбросить (ru)."""
+    viewer_options.localization = "ru"
+    appearance = viewer_options.appearance
+    appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
+    # много колонок → элементы в ряд, а не столбец слева
+    appearance.parametersPanelColumnsCount = 8
 
 
 load_env()
@@ -489,6 +501,7 @@ def build_viewer(
     viewer = StiViewer()
     apply_license(viewer)
     viewer.options.appearance.fullScreenMode = True
+    apply_filter_panel_ui(viewer.options)
     viewer.onBeginProcessData += begin_process_data
     # /open: панель нужна — Submit шлёт postInteraction(Variables), без этого
     # карта остаётся без данных. Кнопку жмём сами в JS после render.
@@ -1236,6 +1249,8 @@ def designer():
     designer = StiDesigner()
     apply_license(designer)
     designer.options.appearance.fullScreenMode = True
+    designer.options.localization = "ru"
+    apply_filter_panel_ui(designer.options.viewerOptions)
     designer.onBeginProcessData += begin_process_data
     designer.onSaveReport += save_report
     designer.onSaveAsReport += save_report
