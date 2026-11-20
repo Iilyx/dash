@@ -109,6 +109,127 @@ def apply_filter_panel_ui(viewer_options) -> None:
     appearance.parametersPanelColumnsCount = 8
 
 
+def inject_filter_panel_layout(html: str) -> str:
+    """Шире контролы; кнопки Сброс/Применить в той же строке, что фильтры."""
+    if "dashFilterPanelLayout" in html:
+        return html
+    block = (
+        "<style id=\"dashFilterPanelLayout\">\n"
+        ".stiJsViewerParametersPanel .stiJsViewerTextBoxDefault input,\n"
+        ".stiJsViewerParametersPanel input.stiJsViewerTextBox,\n"
+        ".stiJsViewerParametersPanel .stiJsViewerTextBox {\n"
+        "  min-width: 300px !important;\n"
+        "  width: 300px !important;\n"
+        "}\n"
+        ".stiJsViewerParametersPanel [id$=\"MainButtons\"] {\n"
+        "  margin-top: 0 !important;\n"
+        "  white-space: nowrap;\n"
+        "}\n"
+        "</style>\n"
+        "<script>(function(){\n"
+        "  var PARAM_W = 300;\n"
+        "  function widen(js){\n"
+        "    try { js.options.currentParameterWidth = PARAM_W; } catch (e) {}\n"
+        "    try {\n"
+        "      var r = (window.__dashReport || (window.__dashViewer && window.__dashViewer.report)\n"
+        "               || (window.viewer && window.viewer.report));\n"
+        "      if (r) r.parameterWidth = PARAM_W;\n"
+        "    } catch (e2) {}\n"
+        "    try {\n"
+        "      var panel = js.controls && js.controls.parametersPanel;\n"
+        "      if (!panel || !panel.container) return;\n"
+        "      var inputs = panel.container.querySelectorAll('input');\n"
+        "      for (var i = 0; i < inputs.length; i++) {\n"
+        "        inputs[i].style.width = PARAM_W + 'px';\n"
+        "        inputs[i].style.minWidth = PARAM_W + 'px';\n"
+        "      }\n"
+        "    } catch (e3) {}\n"
+        "  }\n"
+        "  function sameRow(panel){\n"
+        "    var btn = panel && panel.mainButtons;\n"
+        "    if (!btn) return false;\n"
+        "    var table = panel.container && panel.container.querySelector('table');\n"
+        "    if (!table || !table.rows || !table.rows.length) return false;\n"
+        "    var row0 = table.rows[0];\n"
+        "    var target = null;\n"
+        "    for (var g = 0; g + 1 < row0.cells.length; g += 2) {\n"
+        "      var nameCell = row0.cells[g];\n"
+        "      var ctrlCell = row0.cells[g + 1];\n"
+        "      var hasName = !!(nameCell && String(nameCell.innerText || '').trim());\n"
+        "      var hasCtrl = !!(ctrlCell && ctrlCell.querySelector(\n"
+        "        '.stiJsViewerTextBoxDefault, table, input, select'));\n"
+        "      if (!hasName && !hasCtrl) { target = ctrlCell; break; }\n"
+        "    }\n"
+        "    if (!target) {\n"
+        "      var nc = row0.insertCell(-1);\n"
+        "      nc.style.padding = '0 10px 0 30px';\n"
+        "      target = row0.insertCell(-1);\n"
+        "      target.style.padding = '0';\n"
+        "    } else {\n"
+        "      try { target.previousElementSibling.style.padding = '0 10px 0 30px'; } catch (e0) {}\n"
+        "    }\n"
+        "    target.style.verticalAlign = 'bottom';\n"
+        "    if (btn.parentNode !== target) target.appendChild(btn);\n"
+        "    btn.style.marginTop = '0';\n"
+        "    for (var r = table.rows.length - 1; r >= 1; r--) {\n"
+        "      var row = table.rows[r];\n"
+        "      var empty = true;\n"
+        "      for (var c = 0; c < row.cells.length; c++) {\n"
+        "        if (row.cells[c].childNodes.length) { empty = false; break; }\n"
+        "      }\n"
+        "      if (empty) table.deleteRow(r);\n"
+        "    }\n"
+        "    return true;\n"
+        "  }\n"
+        "  function fix(){\n"
+        "    var viewer = window.__dashViewer || window.viewer;\n"
+        "    var js = viewer && viewer.jsObject;\n"
+        "    if (!js) return false;\n"
+        "    widen(js);\n"
+        "    var panel = js.controls && js.controls.parametersPanel;\n"
+        "    if (!panel) return false;\n"
+        "    try {\n"
+        "      if (js.collections && js.collections.loc) js.collections.loc.Reset = 'Сбросить';\n"
+        "      if (panel.mainButtons && panel.mainButtons.reset) {\n"
+        "        var b = panel.mainButtons.reset;\n"
+        "        if (b.caption) b.caption.innerText = 'Сбросить';\n"
+        "        else if (b.innerText) b.innerText = 'Сбросить';\n"
+        "      }\n"
+        "    } catch (e4) {}\n"
+        "    return sameRow(panel);\n"
+        "  }\n"
+        "  var n = 0;\n"
+        "  var t = setInterval(function(){\n"
+        "    n++;\n"
+        "    var ok = fix();\n"
+        "    if (ok || n > 80) {\n"
+        "      clearInterval(t);\n"
+        "      if (!ok) return;\n"
+        "      try {\n"
+        "        var viewer = window.__dashViewer || window.viewer;\n"
+        "        var panel = viewer && viewer.jsObject && viewer.jsObject.controls\n"
+        "                   && viewer.jsObject.controls.parametersPanel;\n"
+        "        var root = panel && panel.container;\n"
+        "        if (!root || root.__dashLayoutObs) return;\n"
+        "        root.__dashLayoutObs = new MutationObserver(function(){\n"
+        "          if (root.__dashFixing) return;\n"
+        "          root.__dashFixing = true;\n"
+        "          try { fix(); } finally { root.__dashFixing = false; }\n"
+        "        });\n"
+        "        root.__dashLayoutObs.observe(root, { childList: true });\n"
+        "      } catch (e5) {}\n"
+        "    }\n"
+        "  }, 200);\n"
+        "  setTimeout(fix, 0);\n"
+        "})();</script>\n"
+    )
+    if "</head>" in html:
+        return html.replace("</head>", block + "</head>", 1)
+    if "</body>" in html:
+        return html.replace("</body>", block + "</body>", 1)
+    return html + block
+
+
 load_env()
 
 _mrt = os.environ.get("MRT_PATH", "").strip()
@@ -782,6 +903,7 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     repl = (
         auto_block
         + "viewer.report = report;\n"
+        "try { report.parameterWidth = 300; } catch (ePw) {}\n"
         "window.__dashViewer = viewer;\n"
         "window.__dashReport = report;\n"
         "window.viewer = viewer;\n"
@@ -852,13 +974,22 @@ def sti_response(
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
     resp = component.getFrameworkResponse()
-    if inject_screenshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
+    if hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         raw = resp.get_data(as_text=True)
-        if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
-            # сначала __dashFilters, потом патч renderHtml (auto_render)
-            html = inject_filter_values_js(raw, filters, auto_render=auto_render)
-            html = inject_screenshot_ui(html, auto_render=auto_render)
-            html = inject_handler_url(html, filter_token, handler_path=handler_path)
+        # только HTML страницы — не GetResource/JS (там тоже встречается «StiViewer»)
+        is_html = isinstance(raw, str) and (
+            "viewerContent" in raw
+            or "<!DOCTYPE" in raw
+            or "<html" in raw[:200].lower()
+        )
+        if is_html:
+            html = raw
+            if inject_screenshot:
+                # сначала __dashFilters, потом патч renderHtml (auto_render)
+                html = inject_filter_values_js(html, filters, auto_render=auto_render)
+                html = inject_screenshot_ui(html, auto_render=auto_render)
+                html = inject_handler_url(html, filter_token, handler_path=handler_path)
+            html = inject_filter_panel_layout(html)
             resp.set_data(html)
             resp.mimetype = "text/html"
     return resp
