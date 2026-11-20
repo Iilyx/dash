@@ -728,11 +728,7 @@ def sti_process(component) -> bool:
 
 
 def inject_screenshot_ui(
-    html: str,
-    *,
-    auto_render: bool = False,
-    auto_shot: bool = False,
-    filter_token: str | None = None,
+    html: str, *, auto_render: bool = False, auto_shot: bool = False
 ) -> str:
     """Скрипт скрина (+ опц. кнопка) и window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
@@ -952,18 +948,11 @@ def inject_screenshot_ui(
         "yes",
         "on",
     }
-    # shot_key в session — чтобы GET /shot без ?rf= нашёл ту же вкладку
-    if "shot_key" not in session:
-        session["shot_key"] = secrets.token_urlsafe(10)
     flag_parts = []
     if show_btn:
         flag_parts.append("window.__dashShowShotButton=true;")
     if auto_shot:
         flag_parts.append("window.__dashAutoShot=true;")
-    if filter_token:
-        flag_parts.append(
-            f"window.__dashShotRf={json.dumps(filter_token)};"
-        )
     flags = (
         f"<script>{''.join(flag_parts)}</script>\n" if flag_parts else ""
     )
@@ -1034,10 +1023,7 @@ def sti_response(
             # сначала __dashFilters, потом патч renderHtml (auto_render)
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
             html = inject_screenshot_ui(
-                html,
-                auto_render=auto_render,
-                auto_shot=auto_shot,
-                filter_token=filter_token,
+                html, auto_render=auto_render, auto_shot=auto_shot
             )
             html = inject_handler_url(html, filter_token, handler_path=handler_path)
             html = inject_filter_panel_layout(html)
@@ -1233,20 +1219,11 @@ def openapi_spec() -> dict:
             "/shot": {
                 "get": {
                     "tags": ["export"],
-                    "summary": "Сигнал открытому /open: скрин + download (без reload)",
+                    "summary": "Сигнал открытому /open: скрин + download (без reload, без токена)",
                     "description": (
-                        "Держи /open в браузере. GET /shot только даёт сигнал вкладке — "
-                        "дашборд не перезагружается. Ждёт результат (JSON)."
+                        "Держи /open в браузере. GET /shot — общий сигнал любой вкладке, "
+                        "токен не нужен. Дашборд не перезагружается."
                     ),
-                    "parameters": [
-                        {
-                            "name": "rf",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "string"},
-                            "description": "Токен от /open; иначе session cookie",
-                        }
-                    ],
                     "responses": {
                         "200": {
                             "description": "ok + files (png/pdfs)",
@@ -1441,14 +1418,8 @@ def api_screenshot():
     return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
 
 
-def _shot_client_key() -> str:
-    """Ключ сигнала: ?rf=… или cookie-session (та же, что у /open)."""
-    rf = (request.args.get("rf") or "").strip()
-    if rf:
-        return f"rf:{rf}"
-    if "shot_key" not in session:
-        session["shot_key"] = secrets.token_urlsafe(10)
-    return f"s:{session['shot_key']}"
+# Общий сигнал: GET /shot без параметров → любая открытая вкладка /open|/viewer
+_SHOT_GLOBAL_KEY = "*"
 
 
 def _shot_wait_ms() -> int:
@@ -1461,40 +1432,37 @@ def _shot_wait_ms() -> int:
 
 @app.get("/api/shot-poll")
 def api_shot_poll():
-    """Открытый /open опрашивает: есть ли запрос на скрин."""
-    key = _shot_client_key()
+    """Открытый /open|/viewer опрашивает: есть ли общий запрос на скрин."""
     with _SHOT_LOCK:
-        pending = key in _SHOT_PENDING
+        pending = _SHOT_GLOBAL_KEY in _SHOT_PENDING
         if pending:
-            _SHOT_PENDING.pop(key, None)
-    return jsonify({"shoot": pending, "key": key})
+            _SHOT_PENDING.pop(_SHOT_GLOBAL_KEY, None)
+    return jsonify({"shoot": pending})
 
 
 @app.post("/api/shot-done")
 def api_shot_done():
-    """Вкладка /open отдала результат скрина."""
-    key = _shot_client_key()
+    """Вкладка отдала результат скрина на GET /shot."""
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         body = {"ok": False, "error": "bad body"}
     with _SHOT_LOCK:
-        _SHOT_RESULTS[key] = body
+        _SHOT_RESULTS[_SHOT_GLOBAL_KEY] = body
     return jsonify({"ok": True})
 
 
 @app.get("/shot")
 def api_shot():
-    """Сигнал уже открытому /open: скрин + download, без перезагрузки дашборда.
+    """Сигнал любой открытой вкладке /open: скрин + download, без токена и без reload.
 
     1) Браузер: /open?...  (вкладка остаётся открытой)
-    2) curl/GET /shot       → вкладка снимает PNG/PDF и скачивает
-       GET /shot?rf=TOKEN   → тот же rf, что у /open
+    2) GET /shot           → вкладка снимает PNG/PDF и скачивает
     """
-    key = _shot_client_key()
+    key = _SHOT_GLOBAL_KEY
     with _SHOT_LOCK:
         _SHOT_PENDING[key] = time.time()
         _SHOT_RESULTS.pop(key, None)
-    print(f"shot signal key={key}", flush=True)
+    print("shot signal (global)", flush=True)
 
     deadline = time.time() + (_shot_wait_ms() / 1000.0)
     result: dict[str, object] | None = None
@@ -1512,14 +1480,12 @@ def api_shot():
             {
                 "ok": False,
                 "error": "timeout: открой /open в браузере и повтори GET /shot",
-                "key": key,
             }
         ), 504
 
     ok = bool(result.get("ok"))
     payload = {
         "ok": ok,
-        "key": key,
         "png": result.get("png"),
         "pdfs": result.get("pdfs") or [],
         "files": result.get("files") or [],

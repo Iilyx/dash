@@ -1514,38 +1514,11 @@
     });
   }
 
-  function shotPollUrl() {
-    var rf =
-      window.__dashShotRf ||
-      (function () {
-        try {
-          return new URLSearchParams(window.location.search || "").get("rf");
-        } catch (e) {
-          return null;
-        }
-      })();
-    var q = rf ? "?rf=" + encodeURIComponent(rf) : "";
-    return "/api/shot-poll" + q;
-  }
-
-  function shotDoneUrl() {
-    var rf = window.__dashShotRf;
-    if (!rf) {
-      try {
-        rf = new URLSearchParams(window.location.search || "").get("rf");
-      } catch (e) {
-        rf = null;
-      }
-    }
-    return "/api/shot-done" + (rf ? "?rf=" + encodeURIComponent(rf) : "");
-  }
-
   async function reportShotDone(result) {
     try {
-      await fetch(shotDoneUrl(), {
+      await fetch("/api/shot-done", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
         body: JSON.stringify(result || { ok: false, error: "empty" }),
       });
     } catch (e) {
@@ -1586,7 +1559,7 @@
     if (window.__dashShotPoller) return;
     window.__dashShotPoller = setInterval(function () {
       if (window.__dashShotBusy) return;
-      fetch(shotPollUrl(), { credentials: "same-origin", cache: "no-store" })
+      fetch("/api/shot-poll", { cache: "no-store" })
         .then(function (r) {
           return r.json();
         })
