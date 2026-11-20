@@ -1,7 +1,7 @@
 /* Скрин дашборда + Table/Pivot → PDF.
  *
  * UI-кнопка выключена по умолчанию (SHOT_SHOW_BUTTON / ?shot_ui=1).
- * Авто: GET /shot или ?autoscreenshot=1 → ждёт рендер, PNG+PDF в exports/.
+ * Авто: GET /shot → ждёт рендер, скачивает PNG+PDF (и в exports/).
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
@@ -709,13 +709,9 @@
     return !!(window.__dashShowShotButton || queryFlag("shot_ui"));
   }
 
-  function wantBrowserDownload() {
-    return !autoShotEnabled();
-  }
-
   /**
    * Save на Table/Pivot → PDF A2 (как hover Save), с учётом drill-down.
-   * Кладёт PDF в exports/ (и скачивает в браузере, если не autoscreenshot).
+   * Скачивает PDF + кладёт в exports/.
    * @returns {Promise<Array<{name:string,path?:string}>>}
    */
   async function exportTablesToPdf(report, root) {
@@ -756,24 +752,22 @@
       setStatus("PDF A2 " + (el.name || base) + "…");
       try {
         var data = await exportElementAsync(el, settings);
-        if (wantBrowserDownload()) {
+        try {
+          Stimulsoft.System.StiObject.saveAs(
+            data,
+            pdfName,
+            "application/pdf"
+          );
+        } catch (e) {
+          console.warn("[dash-shot] saveAs pdf", e);
           try {
-            Stimulsoft.System.StiObject.saveAs(
-              data,
-              pdfName,
-              "application/pdf"
-            );
-          } catch (e) {
-            console.warn("[dash-shot] saveAs pdf", e);
-            try {
-              var b64dl = stiBytesToBase64(data);
-              var bin = atob(b64dl);
-              var arr = new Uint8Array(bin.length);
-              for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
-              downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
-            } catch (e2) {
-              console.warn("[dash-shot] blob pdf", e2);
-            }
+            var b64dl = stiBytesToBase64(data);
+            var bin = atob(b64dl);
+            var arr = new Uint8Array(bin.length);
+            for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+            downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
+          } catch (e2) {
+            console.warn("[dash-shot] blob pdf", e2);
           }
         }
         try {
@@ -1440,7 +1434,7 @@
         }, "image/png");
       });
       var name = "dashboard_" + stamp() + ".png";
-      if (wantBrowserDownload()) downloadBlob(blob, name);
+      downloadBlob(blob, name);
       try {
         var b64 = await blobToBase64(blob);
         var body = await postExportFile(name, b64, "png");
@@ -1452,7 +1446,7 @@
         result.files.push(result.png);
         setStatus("saved " + result.png.name);
       } catch (err) {
-        setStatus(wantBrowserDownload() ? "download ok" : "png upload fail");
+        setStatus("download ok");
         console.warn(err);
         if (!result.png) result.error = String((err && err.message) || err);
       }

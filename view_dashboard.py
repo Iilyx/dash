@@ -1213,23 +1213,23 @@ def openapi_spec() -> dict:
             "/shot": {
                 "get": {
                     "tags": ["export"],
-                    "summary": "Открыть дашборд и сразу PNG + PDF таблиц в exports/",
+                    "summary": "Скрин + download (фильтры уже из /open)",
                     "description": (
-                        "Как /open, но без кнопки: страница сама снимает скрин и таблицы. "
-                        "Вызывать в браузере (на той машине, где крутится viewer)."
+                        "Сначала /open с фильтрами, потом GET /shot (или /shot?rf=TOKEN). "
+                        "Браузер скачает PNG и PDF таблиц; копии в exports/."
                     ),
                     "parameters": [
                         {
-                            "name": "filters",
+                            "name": "rf",
                             "in": "query",
                             "required": False,
                             "schema": {"type": "string"},
-                            "description": 'JSON {"Name": value} или отдельные query-параметры',
+                            "description": "Токен от /open; иначе session",
                         }
                     ],
                     "responses": {
                         "200": {
-                            "description": "HTML viewer; файлы появятся в exports/",
+                            "description": "HTML viewer; авто-скрин и download",
                             "content": {"text/html": {"schema": {"type": "string"}}},
                         }
                     },
@@ -1419,21 +1419,27 @@ def api_screenshot():
 
 @app.get("/shot")
 def api_shot():
-    """Открыть дашборд с фильтрами и сразу снять PNG + PDF таблиц → exports/.
+    """Скрин + скачивание PNG/PDF. Фильтры уже из /open (session или ?rf=).
 
-    Без кнопки и без доп. зависимостей: страница в браузере сама делает снимок.
-    Фильтры как у /open.
-
-    GET /shot?trendtype=nocumulative&typenum=1000
-    GET /shot?filters={"trendtype":"nocumulative"}
+    1) /open?...filters...  → запомнил фильтры
+    2) GET /shot            → тот же дашборд, сразу скрин и download
+       GET /shot?rf=TOKEN   → явно по токену от /open
     """
-    incoming = _collect_incoming_filters()
-    filters: dict[str, object] = {}
-    if incoming:
-        filters = _normalize_filters_against_mrt(incoming)
-    token = _store_render_filters(filters)
-    session["render_filters"] = filters
-    print(f"shot filters={filters} rf={token}", flush=True)
+    token = (request.args.get("rf") or "").strip() or None
+    filters = _load_render_filters(token) or session.get("render_filters") or {}
+    if not isinstance(filters, dict):
+        filters = {}
+    if filters:
+        filters = _normalize_filters_against_mrt(filters)
+        session["render_filters"] = filters
+        if not token:
+            token = _store_render_filters(filters)
+        else:
+            RENDER_FILTER_STORE[token] = dict(filters)
+    else:
+        token = token or _store_render_filters({})
+        session["render_filters"] = {}
+    print(f"shot rf={token} filters={filters}", flush=True)
     return build_viewer(
         filters=filters or None,
         filter_token=token,
