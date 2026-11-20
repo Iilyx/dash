@@ -974,21 +974,15 @@ def sti_response(
     if not component.handler.origin:
         component.handler.origin = request.origin or "*"
     resp = component.getFrameworkResponse()
-    if hasattr(resp, "get_data") and hasattr(resp, "set_data"):
+    # GetResource/handler: inject_screenshot=False — иначе ломаем JS
+    # (в бандлах есть «viewerContent»/«StiViewer»).
+    if inject_screenshot and hasattr(resp, "get_data") and hasattr(resp, "set_data"):
         raw = resp.get_data(as_text=True)
-        # только HTML страницы — не GetResource/JS (там тоже встречается «StiViewer»)
-        is_html = isinstance(raw, str) and (
-            "viewerContent" in raw
-            or "<!DOCTYPE" in raw
-            or "<html" in raw[:200].lower()
-        )
-        if is_html:
-            html = raw
-            if inject_screenshot:
-                # сначала __dashFilters, потом патч renderHtml (auto_render)
-                html = inject_filter_values_js(html, filters, auto_render=auto_render)
-                html = inject_screenshot_ui(html, auto_render=auto_render)
-                html = inject_handler_url(html, filter_token, handler_path=handler_path)
+        if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
+            # сначала __dashFilters, потом патч renderHtml (auto_render)
+            html = inject_filter_values_js(raw, filters, auto_render=auto_render)
+            html = inject_screenshot_ui(html, auto_render=auto_render)
+            html = inject_handler_url(html, filter_token, handler_path=handler_path)
             html = inject_filter_panel_layout(html)
             resp.set_data(html)
             resp.mimetype = "text/html"
