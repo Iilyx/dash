@@ -425,7 +425,7 @@ def inject_filter_values_js(
     *,
     auto_render: bool = False,
 ) -> str:
-    """Клиентский fallback: выставить variables; для /render — без панели Submit."""
+    """Клиентский fallback: выставить variables из __dashFilters."""
     if not filters or not isinstance(html, str):
         return html
     # экранируем < чтобы JSON не закрыл <script> (Unexpected token)
@@ -483,7 +483,7 @@ def build_viewer(
 ):
     """Собрать StiViewer.
 
-    auto_render=True — только /render: без панели Submit, сразу дашборд с фильтрами.
+    auto_render=True — /open: сразу дашборд с фильтрами.
     /viewer вызывает с auto_render=False.
     """
     viewer = StiViewer()
@@ -870,7 +870,7 @@ def openapi_spec() -> dict:
             "version": "1.0.0",
             "description": (
                 "`/viewer` — preview (панель + Submit). "
-                "`/open` — передал фильтры → сразу готовый дашборд. "
+                "`POST /open` — фильтры → готовый дашборд. "
                 f"MRT: `{MRT_PATH.name}`"
             ),
         },
@@ -909,37 +909,12 @@ def openapi_spec() -> dict:
                 }
             },
             "/open": {
-                "get": {
-                    "tags": ["open"],
-                    "summary": "Открыть дашборд уже с фильтрами",
-                    "description": "Сразу построенный дашборд, без Submit. /viewer не меняется.",
-                    "parameters": [
-                        {
-                            "name": "filters",
-                            "in": "query",
-                            "schema": {"type": "string"},
-                            "description": 'JSON: {"trendtype":"nocumulative","typenum":1000}',
-                        },
-                        {
-                            "name": "trendtype",
-                            "in": "query",
-                            "schema": {"type": "string"},
-                            "description": "Имена variables из GET /filters",
-                        },
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "HTML дашборда с фильтрами",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
-                        }
-                    },
-                },
                 "post": {
                     "tags": ["open"],
                     "summary": "Передать фильтры и открыть дашборд",
                     "description": (
-                        "Открывает браузер на /open?rf=TOKEN. "
-                        "Accept: application/json → {ok,url,rf}. ?open=0 — без браузера."
+                        "POST JSON filters → HTML дашборда сразу. "
+                        "Accept: application/json → {ok,rf,filters}."
                     ),
                     "requestBody": {
                         "required": True,
@@ -969,40 +944,11 @@ def openapi_spec() -> dict:
                     },
                     "responses": {
                         "200": {
-                            "description": "HTML-редирект или JSON {url}",
+                            "description": "HTML viewer или JSON {ok,rf,filters}",
                             "content": {
                                 "text/html": {"schema": {"type": "string"}},
                                 "application/json": {"schema": {"type": "object"}},
                             },
-                        }
-                    },
-                },
-            },
-            "/render": {
-                "get": {
-                    "tags": ["open"],
-                    "summary": "Алиас /open",
-                    "responses": {
-                        "200": {
-                            "description": "То же что /open",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
-                        }
-                    },
-                },
-                "post": {
-                    "tags": ["open"],
-                    "summary": "Алиас /open",
-                    "requestBody": {
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/RenderRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "То же что /open",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
                         }
                     },
                 },
@@ -1326,85 +1272,60 @@ def _is_stimulsoft_handler_request() -> bool:
 
 
 def _collect_incoming_filters() -> dict[str, object]:
-    """Собрать {name: value} из POST JSON / form или GET query."""
+    """Собрать {name: value} только из POST JSON / form (не GET)."""
     incoming: dict[str, object] = {}
-    is_handler = _is_stimulsoft_handler_request()
-    if request.method == "POST" and not is_handler:
-        body = request.get_json(silent=True)
-        if body is None and request.data:
-            try:
-                body = json.loads(request.data.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                body = None
-        incoming = _parse_filters_payload(body)
-        if not incoming and request.form:
-            incoming = {
-                k: v
-                for k, v in request.form.items()
-                if k not in _RENDER_QUERY_SKIP
-            }
-            if request.form.get("filters"):
-                incoming.update(_parse_filters_payload(request.form.get("filters")))
-    elif request.method == "GET":
-        if request.args.get("filters"):
-            incoming = _parse_filters_payload(request.args.get("filters"))
-        if not incoming:
-            incoming = {
-                k: v
-                for k, v in request.args.items()
-                if k not in _RENDER_QUERY_SKIP
-            }
+    if request.method != "POST" or _is_stimulsoft_handler_request():
+        return incoming
+    body = request.get_json(silent=True)
+    if body is None and request.data:
+        try:
+            body = json.loads(request.data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            body = None
+    incoming = _parse_filters_payload(body)
+    if not incoming and request.form:
+        incoming = {
+            k: v
+            for k, v in request.form.items()
+            if k not in _RENDER_QUERY_SKIP
+        }
+        if request.form.get("filters"):
+            incoming.update(_parse_filters_payload(request.form.get("filters")))
     return incoming
 
 
 def open_dashboard_with_filters():
-    """Подставить фильтры и открыть уже построенный дашборд (без Submit).
+    """Только POST /open.
 
-    Отдельно от /viewer (preview с ручным Submit).
-
-    GET  /open?trendtype=nocumulative&typenum=1000
-    GET  /open?filters={"trendtype":"nocumulative","typenum":1000}
-    POST /open  JSON {"filters":{"trendtype":"nocumulative","typenum":1000}}
-         → открывает браузер на /open?rf=TOKEN (или ?open=0 без браузера)
+    JSON filters → HTML viewer сразу (или JSON {ok,rf,filters} при Accept: application/json).
+    Stimulsoft handler тоже POST на /open (session/rf).
     """
     token = (request.args.get("rf") or "").strip() or None
     incoming = _collect_incoming_filters()
     is_handler = _is_stimulsoft_handler_request()
 
-    if incoming:
+    if incoming and not is_handler:
         incoming = _normalize_filters_against_mrt(incoming)
         session["render_filters"] = incoming
         token = _store_render_filters(incoming)
-        if request.method == "POST" and not is_handler:
-            view_path = f"/open?rf={token}"
-            view_url = f"http://{HOST}:{PORT}{view_path}"
-            open_flag = (request.args.get("open") or "1").strip().lower()
-            if open_flag not in {"0", "false", "no", "off"}:
-                try:
-                    webbrowser.open(view_url)
-                    print(f"opened browser: {view_url}", flush=True)
-                except Exception as exc:
-                    print(f"browser open failed: {exc}", flush=True)
-            # JSON удобен для Postman; HTML — для браузера
-            wants_json = "application/json" in (request.headers.get("Accept") or "")
-            if wants_json:
-                return jsonify(
-                    {
-                        "ok": True,
-                        "url": view_url,
-                        "path": view_path,
-                        "rf": token,
-                        "filters": incoming,
-                    }
-                )
-            html = (
-                "<!doctype html><meta charset=utf-8>"
-                f"<meta http-equiv=refresh content='0;url={view_path}'>"
-                "<title>Opening dashboard…</title>"
-                "<p>Открываю дашборд с фильтрами… "
-                f"<a href='{view_path}'>{view_url}</a></p>"
+        wants_json = "application/json" in (request.headers.get("Accept") or "")
+        if wants_json:
+            return jsonify(
+                {
+                    "ok": True,
+                    "rf": token,
+                    "filters": incoming,
+                }
             )
-            return Response(html, mimetype="text/html; charset=utf-8")
+        # HTML viewer прямо в ответе POST (без GET /open)
+        filters = incoming
+        print(f"open filters={filters} rf={token}", flush=True)
+        return build_viewer(
+            filters=filters,
+            filter_token=token,
+            inject_screenshot=True,
+            auto_render=True,
+        )
 
     filters = _load_render_filters(token) or session.get("render_filters") or incoming or None
     if isinstance(filters, dict) and not filters:
@@ -1416,7 +1337,6 @@ def open_dashboard_with_filters():
         if not token:
             token = _store_render_filters(filters)
         else:
-            # обновить store нормализованными значениями (List и т.д.)
             RENDER_FILTER_STORE[token] = dict(filters)
 
     print(f"open filters={filters} rf={token}", flush=True)
@@ -1428,15 +1348,9 @@ def open_dashboard_with_filters():
     )
 
 
-@app.route("/open", methods=["GET", "POST"])
+@app.post("/open")
 def open_with_filters():
-    """Новый endpoint: передал фильтры → открылся дашборд уже с ними (без Submit)."""
-    return open_dashboard_with_filters()
-
-
-@app.route("/render", methods=["GET", "POST"])
-def render_with_filters():
-    """Алиас /open (совместимость)."""
+    """POST: фильтры → HTML дашборда (или JSON при Accept: application/json)."""
     return open_dashboard_with_filters()
 
 
@@ -1446,7 +1360,7 @@ def main() -> None:
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
     print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
-    print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
+    print(f"Open:     POST http://{HOST}:{PORT}/open  (filters → dashboard)", flush=True)
     print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
