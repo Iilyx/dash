@@ -36,6 +36,12 @@ from stimulsoft_reports.viewer import StiViewer
 from stimulsoft_reports.viewer.enums.StiParametersPanelPosition import (
     StiParametersPanelPosition,
 )
+from stimulsoft_reports.viewer.options.StiAppearanceOptions import StiAppearanceOptions
+
+# JS default=5: при t<=5 колонок всегда 1 → фильтры столбиком. Патчим класс,
+# чтобы getHtml() сериализовал override.
+if not hasattr(StiAppearanceOptions, "minParametersCountForMultiColumns"):
+    StiAppearanceOptions.minParametersCountForMultiColumns = 5
 
 ROOT = Path(__file__).resolve().parent
 _SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
@@ -96,7 +102,10 @@ def apply_filter_panel_ui(viewer_options) -> None:
     viewer_options.localization = "ru"
     appearance = viewer_options.appearance
     appearance.parametersPanelPosition = StiParametersPanelPosition.TOP
-    # много колонок → элементы в ряд, а не столбец слева
+    # иначе mobile JS форсит Left + 1 колонку
+    appearance.allowMobileMode = False
+    # Stimulsoft: columns = 1 если count <= minParametersCountForMultiColumns (дефолт 5)
+    appearance.minParametersCountForMultiColumns = 1
     appearance.parametersPanelColumnsCount = 8
 
 
