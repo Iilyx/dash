@@ -1,4 +1,7 @@
-/* Кнопка «Скрин».
+/* Скрин дашборда + Table/Pivot → PDF.
+ *
+ * UI-кнопка выключена по умолчанию (SHOT_SHOW_BUTTON / ?shot_ui=1).
+ * Авто: GET /shot или ?autoscreenshot=1 → ждёт рендер, PNG+PDF в exports/.
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
@@ -688,12 +691,36 @@
     return comps;
   }
 
+  function queryFlag(name) {
+    try {
+      var q = new URLSearchParams(window.location.search || "");
+      var v = (q.get(name) || "").trim().toLowerCase();
+      return v === "1" || v === "true" || v === "yes" || v === "on";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function autoShotEnabled() {
+    return !!(window.__dashAutoShot || queryFlag("autoscreenshot"));
+  }
+
+  function shotButtonEnabled() {
+    return !!(window.__dashShowShotButton || queryFlag("shot_ui"));
+  }
+
+  function wantBrowserDownload() {
+    return !autoShotEnabled();
+  }
+
   /**
    * Save на Table/Pivot → PDF A2 (как hover Save), с учётом drill-down.
-   * Скачивает PDF + кладёт в exports/.
+   * Кладёт PDF в exports/ (и скачивает в браузере, если не autoscreenshot).
+   * @returns {Promise<Array<{name:string,path?:string}>>}
    */
   async function exportTablesToPdf(report, root) {
-    if (!report) return 0;
+    var files = [];
+    if (!report) return files;
     var settings = dashboardPdfSettings();
     if (!settings) {
       // fallback: Report.StiExportFormat.Pdf → helper соберёт settings (A4)
@@ -704,7 +731,7 @@
     }
     if (settings == null) {
       console.warn("[dash-shot] PDF settings нет");
-      return 0;
+      return files;
     }
     try {
       console.log(
@@ -717,9 +744,8 @@
     var comps = tablesForExport(report, root || document);
     if (!comps.length) {
       console.warn("[dash-shot] Table/Pivot не найден на текущем уровне");
-      return 0;
+      return files;
     }
-    var saved = 0;
     for (var i = 0; i < comps.length; i++) {
       var el = comps[i];
       var base =
@@ -730,36 +756,42 @@
       setStatus("PDF A2 " + (el.name || base) + "…");
       try {
         var data = await exportElementAsync(el, settings);
-        try {
-          Stimulsoft.System.StiObject.saveAs(
-            data,
-            pdfName,
-            "application/pdf"
-          );
-        } catch (e) {
-          console.warn("[dash-shot] saveAs pdf", e);
+        if (wantBrowserDownload()) {
           try {
-            var b64dl = stiBytesToBase64(data);
-            var bin = atob(b64dl);
-            var arr = new Uint8Array(bin.length);
-            for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
-            downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
-          } catch (e2) {
-            console.warn("[dash-shot] blob pdf", e2);
+            Stimulsoft.System.StiObject.saveAs(
+              data,
+              pdfName,
+              "application/pdf"
+            );
+          } catch (e) {
+            console.warn("[dash-shot] saveAs pdf", e);
+            try {
+              var b64dl = stiBytesToBase64(data);
+              var bin = atob(b64dl);
+              var arr = new Uint8Array(bin.length);
+              for (var j = 0; j < bin.length; j++) arr[j] = bin.charCodeAt(j);
+              downloadBlob(new Blob([arr], { type: "application/pdf" }), pdfName);
+            } catch (e2) {
+              console.warn("[dash-shot] blob pdf", e2);
+            }
           }
         }
         try {
-          await postExportFile(pdfName, stiBytesToBase64(data), "pdf");
+          var body = await postExportFile(pdfName, stiBytesToBase64(data), "pdf");
+          files.push({
+            name: (body && body.name) || pdfName,
+            path: body && body.path,
+            kind: "pdf",
+          });
         } catch (e) {
           console.warn("[dash-shot] pdf upload", e);
         }
-        saved++;
         console.log("[dash-shot] table pdf", pdfName);
       } catch (err) {
         console.warn("[dash-shot] table pdf failed", el.name, err);
       }
     }
-    return saved;
+    return files;
   }
 
   function normalizeExportBytes(data) {
@@ -1352,10 +1384,12 @@
   }
 
   async function takeScreenshot() {
+    var result = { ok: false, png: null, pdfs: [], files: [], error: null };
     var root = captureRoot();
     if (!root) {
-      setStatus("панель не найдена");
-      return;
+      result.error = "панель не найдена";
+      setStatus(result.error);
+      return result;
     }
     var btn = document.getElementById("dashShotBtn");
     if (btn) btn.disabled = true;
@@ -1406,33 +1440,47 @@
         }, "image/png");
       });
       var name = "dashboard_" + stamp() + ".png";
-      downloadBlob(blob, name);
-      var pngOk = false;
+      if (wantBrowserDownload()) downloadBlob(blob, name);
       try {
         var b64 = await blobToBase64(blob);
         var body = await postExportFile(name, b64, "png");
-        pngOk = true;
-        setStatus("saved " + (body.name || name));
+        result.png = {
+          name: (body && body.name) || name,
+          path: body && body.path,
+          kind: "png",
+        };
+        result.files.push(result.png);
+        setStatus("saved " + result.png.name);
       } catch (err) {
-        setStatus("download ok");
+        setStatus(wantBrowserDownload() ? "download ok" : "png upload fail");
         console.warn(err);
+        if (!result.png) result.error = String((err && err.message) || err);
       }
 
       // дополнительно: Table/Pivot → PDF (все строки, как Save→но PDF)
       setStatus("таблица → PDF…");
-      var nPdf = 0;
       try {
-        nPdf = await exportTablesToPdf(report, root);
+        result.pdfs = await exportTablesToPdf(report, root);
+        for (var pi = 0; pi < result.pdfs.length; pi++) {
+          result.files.push(result.pdfs[pi]);
+        }
       } catch (err) {
         console.warn("[dash-shot] tables pdf", err);
       }
+      result.ok = !!(result.png || result.pdfs.length);
+      if (result.ok) result.error = null;
       setStatus(
-        (pngOk ? "saved " + name : "png download") +
-          (nPdf ? " | +" + nPdf + " pdf" : " | pdf нет")
+        (result.png ? "saved " + result.png.name : "png нет") +
+          (result.pdfs.length
+            ? " | +" + result.pdfs.length + " pdf"
+            : " | pdf нет")
       );
+      return result;
     } catch (err) {
       console.error(err);
-      setStatus(String((err && err.message) || err));
+      result.error = String((err && err.message) || err);
+      setStatus(result.error);
+      return result;
     } finally {
       try {
         restoreFilters();
@@ -1444,30 +1492,88 @@
     }
   }
 
+  function dashboardLooksReady() {
+    var report = findReport();
+    var root = captureRoot();
+    if (!report || !root) return false;
+    try {
+      var r = root.getBoundingClientRect();
+      if (!r || r.width < 80 || r.height < 80) return false;
+    } catch (e) {
+      return false;
+    }
+    return true;
+  }
+
+  function waitDashboardReady(maxMs) {
+    maxMs = maxMs || 60000;
+    return new Promise(function (resolve) {
+      var started = Date.now();
+      var t = setInterval(function () {
+        if (dashboardLooksReady() || Date.now() - started > maxMs) {
+          clearInterval(t);
+          // карты/Variables дорисовываются чуть позже
+          setTimeout(resolve, dashboardLooksReady() ? 1800 : 0);
+        }
+      }, 400);
+    });
+  }
+
+  async function runAutoShot() {
+    if (window.__dashShotStarted) return;
+    window.__dashShotStarted = true;
+    window.__dashShotDone = null;
+    try {
+      await waitDashboardReady(70000);
+      var result = await takeScreenshot();
+      window.__dashShotDone = result || {
+        ok: false,
+        error: "empty result",
+        files: [],
+        png: null,
+        pdfs: [],
+      };
+    } catch (err) {
+      window.__dashShotDone = {
+        ok: false,
+        error: String((err && err.message) || err),
+        files: [],
+        png: null,
+        pdfs: [],
+      };
+    }
+    console.log("[dash-shot] done", window.__dashShotDone);
+  }
+
   function mount() {
-    if (document.getElementById("dashShotBar")) return;
-    var bar = document.createElement("div");
-    bar.id = "dashShotBar";
-    bar.style.cssText =
-      "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
-      "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
-      "padding:6px 10px;border-radius:6px;";
-    var btn = document.createElement("button");
-    btn.id = "dashShotBtn";
-    btn.type = "button";
-    btn.textContent = "Скрин";
-    btn.style.cssText =
-      "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
-    btn.onclick = function () {
-      takeScreenshot();
-    };
-    var status = document.createElement("span");
-    status.id = "dashShotStatus";
-    status.style.cssText =
-      "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
-    bar.appendChild(btn);
-    bar.appendChild(status);
-    document.body.appendChild(bar);
+    if (shotButtonEnabled()) {
+      if (document.getElementById("dashShotBar")) return;
+      var bar = document.createElement("div");
+      bar.id = "dashShotBar";
+      bar.style.cssText =
+        "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
+        "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
+        "padding:6px 10px;border-radius:6px;";
+      var btn = document.createElement("button");
+      btn.id = "dashShotBtn";
+      btn.type = "button";
+      btn.textContent = "Скрин";
+      btn.style.cssText =
+        "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
+      btn.onclick = function () {
+        takeScreenshot();
+      };
+      var status = document.createElement("span");
+      status.id = "dashShotStatus";
+      status.style.cssText =
+        "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
+      bar.appendChild(btn);
+      bar.appendChild(status);
+      document.body.appendChild(bar);
+    }
+    if (autoShotEnabled()) {
+      setTimeout(runAutoShot, 0);
+    }
   }
 
   if (document.readyState === "loading") {

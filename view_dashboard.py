@@ -59,6 +59,8 @@ _RENDER_QUERY_SKIP = {
     "no_redirect",
     "redirect",
     "open",
+    "autoscreenshot",
+    "shot_ui",
 }
 
 
@@ -633,10 +635,12 @@ def build_viewer(
     filter_token: str | None = None,
     inject_screenshot: bool = True,
     auto_render: bool = False,
+    auto_shot: bool = False,
 ):
     """Собрать StiViewer.
 
     auto_render=True — /open: сразу дашборд с фильтрами.
+    auto_shot=True — после рендера PNG + PDF таблиц в exports/ (GET /shot).
     /viewer вызывает с auto_render=False.
     """
     viewer = StiViewer()
@@ -653,7 +657,8 @@ def build_viewer(
     # StiJavaScript всегда клеит `?sti_event=` к handler.url —
     # нельзя писать `/open?rf=…` (получится `?rf=…?sti_event=` → HTML вместо JS → Unexpected token).
     # rf остаётся в /mrt-render?rf= и в session; handler = чистый путь.
-    handler_path = "/open" if auto_render else "/viewer"
+    # /shot тоже ходит в /open (GetResource / Variables).
+    handler_path = "/open" if (auto_render or auto_shot) else "/viewer"
     try:
         viewer.handler._StiBaseHandler__url = handler_path  # noqa: SLF001
     except Exception:
@@ -666,12 +671,13 @@ def build_viewer(
             inject_screenshot=False,
             filter_token=filter_token,
             auto_render=auto_render,
+            auto_shot=auto_shot,
             handler_path=handler_path,
         )
 
     report = StiReport()
-    # /open → /mrt-render?rf=…; /viewer → сырой шаблон через /mrt-render без rf
-    if auto_render and filter_token:
+    # /open|/shot → /mrt-render?rf=…; /viewer → сырой шаблон через /mrt-render без rf
+    if (auto_render or auto_shot) and filter_token:
         report.loadFile(f"/mrt-render?rf={filter_token}")
     else:
         report.loadFile("/mrt-render")
@@ -681,7 +687,8 @@ def build_viewer(
         inject_screenshot=inject_screenshot,
         filters=filters,
         filter_token=filter_token,
-        auto_render=auto_render,
+        auto_render=auto_render or auto_shot,
+        auto_shot=auto_shot,
         handler_path=handler_path,
     )
 
@@ -714,8 +721,10 @@ def sti_process(component) -> bool:
     return handled
 
 
-def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
-    """Кнопка «Скрин» на странице viewer + window.__dashReport для bake карт."""
+def inject_screenshot_ui(
+    html: str, *, auto_render: bool = False, auto_shot: bool = False
+) -> str:
+    """Скрипт скрина (+ опц. кнопка) и window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
     auto_submit_js = ""
@@ -927,7 +936,21 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
         ver = int((ROOT / "screenshot_dashboard.js").stat().st_mtime)
     except OSError:
         ver = 1
-    tag = f'<script src="/screenshot-dashboard.js?v={ver}"></script>\n'
+    show_btn = (os.environ.get("SHOT_SHOW_BUTTON") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    flag_parts = []
+    if show_btn:
+        flag_parts.append("window.__dashShowShotButton=true;")
+    if auto_shot:
+        flag_parts.append("window.__dashAutoShot=true;")
+    flags = (
+        f"<script>{''.join(flag_parts)}</script>\n" if flag_parts else ""
+    )
+    tag = flags + f'<script src="/screenshot-dashboard.js?v={ver}"></script>\n'
     if "screenshot-dashboard.js" not in html:
         if "</body>" in html:
             html = html.replace("</body>", tag + "</body>", 1)
@@ -979,6 +1002,7 @@ def sti_response(
     filters: dict[str, object] | None = None,
     filter_token: str | None = None,
     auto_render: bool = False,
+    auto_shot: bool = False,
     handler_path: str = "/open",
 ):
     component.handler.framework = StiFrameworkType.FLASK
@@ -992,7 +1016,9 @@ def sti_response(
         if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
             # сначала __dashFilters, потом патч renderHtml (auto_render)
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
-            html = inject_screenshot_ui(html, auto_render=auto_render)
+            html = inject_screenshot_ui(
+                html, auto_render=auto_render, auto_shot=auto_shot
+            )
             html = inject_handler_url(html, filter_token, handler_path=handler_path)
             html = inject_filter_panel_layout(html)
             resp.set_data(html)
@@ -1184,6 +1210,31 @@ def openapi_spec() -> dict:
                     },
                 }
             },
+            "/shot": {
+                "get": {
+                    "tags": ["export"],
+                    "summary": "Открыть дашборд и сразу PNG + PDF таблиц в exports/",
+                    "description": (
+                        "Как /open, но без кнопки: страница сама снимает скрин и таблицы. "
+                        "Вызывать в браузере (на той машине, где крутится viewer)."
+                    ),
+                    "parameters": [
+                        {
+                            "name": "filters",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "string"},
+                            "description": 'JSON {"Name": value} или отдельные query-параметры',
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "HTML viewer; файлы появятся в exports/",
+                            "content": {"text/html": {"schema": {"type": "string"}}},
+                        }
+                    },
+                }
+            },
         },
         "components": {
             "schemas": {
@@ -1364,6 +1415,32 @@ def api_screenshot():
         return jsonify({"ok": False, "error": str(exc)}), 500
     print(f"screenshot saved: {out.resolve()}", flush=True)
     return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
+
+
+@app.get("/shot")
+def api_shot():
+    """Открыть дашборд с фильтрами и сразу снять PNG + PDF таблиц → exports/.
+
+    Без кнопки и без доп. зависимостей: страница в браузере сама делает снимок.
+    Фильтры как у /open.
+
+    GET /shot?trendtype=nocumulative&typenum=1000
+    GET /shot?filters={"trendtype":"nocumulative"}
+    """
+    incoming = _collect_incoming_filters()
+    filters: dict[str, object] = {}
+    if incoming:
+        filters = _normalize_filters_against_mrt(incoming)
+    token = _store_render_filters(filters)
+    session["render_filters"] = filters
+    print(f"shot filters={filters} rf={token}", flush=True)
+    return build_viewer(
+        filters=filters or None,
+        filter_token=token,
+        inject_screenshot=True,
+        auto_render=True,
+        auto_shot=True,
+    )
 
 
 @app.route("/mrt-render", methods=["GET", "POST"])
@@ -1555,6 +1632,7 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
     print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
     print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
+    print(f"Shot:     http://{HOST}:{PORT}/shot     (GET → PNG + table PDF)", flush=True)
     print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:
@@ -1562,7 +1640,7 @@ def main() -> None:
             webbrowser.open(f"http://{HOST}:{PORT}/viewer")
         except Exception:
             pass
-    app.run(host=HOST, port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
