@@ -109,17 +109,28 @@ def apply_filter_panel_ui(viewer_options) -> None:
     appearance.parametersPanelColumnsCount = 8
 
 
+def filter_param_width() -> int:
+    """Ширина контролов панели фильтров, px. FILTER_PARAM_WIDTH в .env."""
+    raw = (os.environ.get("FILTER_PARAM_WIDTH") or "180").strip() or "180"
+    try:
+        width = int(raw)
+    except ValueError:
+        width = 180
+    return max(80, min(width, 600))
+
+
 def inject_filter_panel_layout(html: str) -> str:
     """Шире контролы; кнопки Сброс/Применить в той же строке, что фильтры."""
     if "dashFilterPanelLayout" in html:
         return html
+    w = filter_param_width()
     block = (
         "<style id=\"dashFilterPanelLayout\">\n"
         ".stiJsViewerParametersPanel .stiJsViewerTextBoxDefault input,\n"
         ".stiJsViewerParametersPanel input.stiJsViewerTextBox,\n"
         ".stiJsViewerParametersPanel .stiJsViewerTextBox {\n"
-        "  min-width: 300px !important;\n"
-        "  width: 300px !important;\n"
+        f"  min-width: {w}px !important;\n"
+        f"  width: {w}px !important;\n"
         "}\n"
         ".stiJsViewerParametersPanel [id$=\"MainButtons\"] {\n"
         "  margin-top: 0 !important;\n"
@@ -127,7 +138,7 @@ def inject_filter_panel_layout(html: str) -> str:
         "}\n"
         "</style>\n"
         "<script>(function(){\n"
-        "  var PARAM_W = 300;\n"
+        f"  var PARAM_W = {w};\n"
         "  function widen(js){\n"
         "    try { js.options.currentParameterWidth = PARAM_W; } catch (e) {}\n"
         "    try {\n"
@@ -903,7 +914,7 @@ def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
     repl = (
         auto_block
         + "viewer.report = report;\n"
-        "try { report.parameterWidth = 300; } catch (ePw) {}\n"
+        f"try {{ report.parameterWidth = {filter_param_width()}; }} catch (ePw) {{}}\n"
         "window.__dashViewer = viewer;\n"
         "window.__dashReport = report;\n"
         "window.viewer = viewer;\n"
