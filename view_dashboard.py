@@ -20,6 +20,8 @@ import os
 import re
 import secrets
 import sys
+import threading
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +50,10 @@ _SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
 
 # token → {VariableName: value}; не только Flask session (Swagger/curl часто без cookie)
 RENDER_FILTER_STORE: dict[str, dict[str, object]] = {}
+# GET /shot → сигнал уже открытому /open (без перезагрузки дашборда)
+_SHOT_LOCK = threading.Lock()
+_SHOT_PENDING: dict[str, float] = {}
+_SHOT_RESULTS: dict[str, dict[str, object]] = {}
 _RENDER_QUERY_SKIP = {
     "run_queries",
     "sql",
@@ -722,7 +728,11 @@ def sti_process(component) -> bool:
 
 
 def inject_screenshot_ui(
-    html: str, *, auto_render: bool = False, auto_shot: bool = False
+    html: str,
+    *,
+    auto_render: bool = False,
+    auto_shot: bool = False,
+    filter_token: str | None = None,
 ) -> str:
     """Скрипт скрина (+ опц. кнопка) и window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
@@ -942,11 +952,18 @@ def inject_screenshot_ui(
         "yes",
         "on",
     }
+    # shot_key в session — чтобы GET /shot без ?rf= нашёл ту же вкладку
+    if "shot_key" not in session:
+        session["shot_key"] = secrets.token_urlsafe(10)
     flag_parts = []
     if show_btn:
         flag_parts.append("window.__dashShowShotButton=true;")
     if auto_shot:
         flag_parts.append("window.__dashAutoShot=true;")
+    if filter_token:
+        flag_parts.append(
+            f"window.__dashShotRf={json.dumps(filter_token)};"
+        )
     flags = (
         f"<script>{''.join(flag_parts)}</script>\n" if flag_parts else ""
     )
@@ -1017,7 +1034,10 @@ def sti_response(
             # сначала __dashFilters, потом патч renderHtml (auto_render)
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
             html = inject_screenshot_ui(
-                html, auto_render=auto_render, auto_shot=auto_shot
+                html,
+                auto_render=auto_render,
+                auto_shot=auto_shot,
+                filter_token=filter_token,
             )
             html = inject_handler_url(html, filter_token, handler_path=handler_path)
             html = inject_filter_panel_layout(html)
@@ -1213,10 +1233,10 @@ def openapi_spec() -> dict:
             "/shot": {
                 "get": {
                     "tags": ["export"],
-                    "summary": "Скрин + download (фильтры уже из /open)",
+                    "summary": "Сигнал открытому /open: скрин + download (без reload)",
                     "description": (
-                        "Сначала /open с фильтрами, потом GET /shot (или /shot?rf=TOKEN). "
-                        "Браузер скачает PNG и PDF таблиц; копии в exports/."
+                        "Держи /open в браузере. GET /shot только даёт сигнал вкладке — "
+                        "дашборд не перезагружается. Ждёт результат (JSON)."
                     ),
                     "parameters": [
                         {
@@ -1224,14 +1244,18 @@ def openapi_spec() -> dict:
                             "in": "query",
                             "required": False,
                             "schema": {"type": "string"},
-                            "description": "Токен от /open; иначе session",
+                            "description": "Токен от /open; иначе session cookie",
                         }
                     ],
                     "responses": {
                         "200": {
-                            "description": "HTML viewer; авто-скрин и download",
-                            "content": {"text/html": {"schema": {"type": "string"}}},
-                        }
+                            "description": "ok + files (png/pdfs)",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        },
+                        "504": {
+                            "description": "таймаут — нет открытого /open",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        },
                     },
                 }
             },
@@ -1417,36 +1441,92 @@ def api_screenshot():
     return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
 
 
+def _shot_client_key() -> str:
+    """Ключ сигнала: ?rf=… или cookie-session (та же, что у /open)."""
+    rf = (request.args.get("rf") or "").strip()
+    if rf:
+        return f"rf:{rf}"
+    if "shot_key" not in session:
+        session["shot_key"] = secrets.token_urlsafe(10)
+    return f"s:{session['shot_key']}"
+
+
+def _shot_wait_ms() -> int:
+    raw = (os.environ.get("SHOT_WAIT_MS") or "90000").strip() or "90000"
+    try:
+        return max(5000, int(raw))
+    except ValueError:
+        return 90000
+
+
+@app.get("/api/shot-poll")
+def api_shot_poll():
+    """Открытый /open опрашивает: есть ли запрос на скрин."""
+    key = _shot_client_key()
+    with _SHOT_LOCK:
+        pending = key in _SHOT_PENDING
+        if pending:
+            _SHOT_PENDING.pop(key, None)
+    return jsonify({"shoot": pending, "key": key})
+
+
+@app.post("/api/shot-done")
+def api_shot_done():
+    """Вкладка /open отдала результат скрина."""
+    key = _shot_client_key()
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {"ok": False, "error": "bad body"}
+    with _SHOT_LOCK:
+        _SHOT_RESULTS[key] = body
+    return jsonify({"ok": True})
+
+
 @app.get("/shot")
 def api_shot():
-    """Скрин + скачивание PNG/PDF. Фильтры уже из /open (session или ?rf=).
+    """Сигнал уже открытому /open: скрин + download, без перезагрузки дашборда.
 
-    1) /open?...filters...  → запомнил фильтры
-    2) GET /shot            → тот же дашборд, сразу скрин и download
-       GET /shot?rf=TOKEN   → явно по токену от /open
+    1) Браузер: /open?...  (вкладка остаётся открытой)
+    2) curl/GET /shot       → вкладка снимает PNG/PDF и скачивает
+       GET /shot?rf=TOKEN   → тот же rf, что у /open
     """
-    token = (request.args.get("rf") or "").strip() or None
-    filters = _load_render_filters(token) or session.get("render_filters") or {}
-    if not isinstance(filters, dict):
-        filters = {}
-    if filters:
-        filters = _normalize_filters_against_mrt(filters)
-        session["render_filters"] = filters
-        if not token:
-            token = _store_render_filters(filters)
-        else:
-            RENDER_FILTER_STORE[token] = dict(filters)
-    else:
-        token = token or _store_render_filters({})
-        session["render_filters"] = {}
-    print(f"shot rf={token} filters={filters}", flush=True)
-    return build_viewer(
-        filters=filters or None,
-        filter_token=token,
-        inject_screenshot=True,
-        auto_render=True,
-        auto_shot=True,
-    )
+    key = _shot_client_key()
+    with _SHOT_LOCK:
+        _SHOT_PENDING[key] = time.time()
+        _SHOT_RESULTS.pop(key, None)
+    print(f"shot signal key={key}", flush=True)
+
+    deadline = time.time() + (_shot_wait_ms() / 1000.0)
+    result: dict[str, object] | None = None
+    while time.time() < deadline:
+        with _SHOT_LOCK:
+            if key in _SHOT_RESULTS:
+                result = _SHOT_RESULTS.pop(key)
+                break
+        time.sleep(0.15)
+
+    if result is None:
+        with _SHOT_LOCK:
+            _SHOT_PENDING.pop(key, None)
+        return jsonify(
+            {
+                "ok": False,
+                "error": "timeout: открой /open в браузере и повтори GET /shot",
+                "key": key,
+            }
+        ), 504
+
+    ok = bool(result.get("ok"))
+    payload = {
+        "ok": ok,
+        "key": key,
+        "png": result.get("png"),
+        "pdfs": result.get("pdfs") or [],
+        "files": result.get("files") or [],
+        "error": result.get("error"),
+        "exports": str(EXPORT_DIR.resolve()),
+    }
+    return jsonify(payload), (200 if ok else 500)
 
 
 @app.route("/mrt-render", methods=["GET", "POST"])
@@ -1638,7 +1718,7 @@ def main() -> None:
     print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
     print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
     print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
-    print(f"Shot:     http://{HOST}:{PORT}/shot     (GET → PNG + table PDF)", flush=True)
+    print(f"Shot:     http://{HOST}:{PORT}/shot     (signal → open tab shoots)", flush=True)
     print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
     print(f"Screens:  {EXPORT_DIR.resolve()}", flush=True)
     if OPEN_BROWSER:

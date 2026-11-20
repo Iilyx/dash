@@ -1,7 +1,8 @@
 /* Скрин дашборда + Table/Pivot → PDF.
  *
  * UI-кнопка выключена по умолчанию (SHOT_SHOW_BUTTON / ?shot_ui=1).
- * Авто: GET /shot → ждёт рендер, скачивает PNG+PDF (и в exports/).
+ * GET /shot не перезагружает дашборд: вкладка /open поллит /api/shot-poll
+ * и по сигналу снимает PNG+PDF (download + exports/).
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
@@ -1513,9 +1514,48 @@
     });
   }
 
+  function shotPollUrl() {
+    var rf =
+      window.__dashShotRf ||
+      (function () {
+        try {
+          return new URLSearchParams(window.location.search || "").get("rf");
+        } catch (e) {
+          return null;
+        }
+      })();
+    var q = rf ? "?rf=" + encodeURIComponent(rf) : "";
+    return "/api/shot-poll" + q;
+  }
+
+  function shotDoneUrl() {
+    var rf = window.__dashShotRf;
+    if (!rf) {
+      try {
+        rf = new URLSearchParams(window.location.search || "").get("rf");
+      } catch (e) {
+        rf = null;
+      }
+    }
+    return "/api/shot-done" + (rf ? "?rf=" + encodeURIComponent(rf) : "");
+  }
+
+  async function reportShotDone(result) {
+    try {
+      await fetch(shotDoneUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify(result || { ok: false, error: "empty" }),
+      });
+    } catch (e) {
+      console.warn("[dash-shot] shot-done", e);
+    }
+  }
+
   async function runAutoShot() {
-    if (window.__dashShotStarted) return;
-    window.__dashShotStarted = true;
+    if (window.__dashShotBusy) return;
+    window.__dashShotBusy = true;
     window.__dashShotDone = null;
     try {
       await waitDashboardReady(70000);
@@ -1535,8 +1575,29 @@
         png: null,
         pdfs: [],
       };
+    } finally {
+      window.__dashShotBusy = false;
     }
     console.log("[dash-shot] done", window.__dashShotDone);
+    await reportShotDone(window.__dashShotDone);
+  }
+
+  function startShotPoller() {
+    if (window.__dashShotPoller) return;
+    window.__dashShotPoller = setInterval(function () {
+      if (window.__dashShotBusy) return;
+      fetch(shotPollUrl(), { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) {
+          return r.json();
+        })
+        .then(function (j) {
+          if (j && j.shoot) {
+            console.log("[dash-shot] signal → shoot");
+            runAutoShot();
+          }
+        })
+        .catch(function () {});
+    }, 800);
   }
 
   function mount() {
@@ -1565,6 +1626,8 @@
       bar.appendChild(status);
       document.body.appendChild(bar);
     }
+    // всегда слушаем GET /shot (без reload дашборда)
+    startShotPoller();
     if (autoShotEnabled()) {
       setTimeout(runAutoShot, 0);
     }
