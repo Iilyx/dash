@@ -516,11 +516,11 @@ def build_viewer(
         )
 
     report = StiReport()
-    # /open → пропатченный .mrt без RequestParameters; /viewer → обычный /mrt
+    # /open → /mrt-render?rf=…; /viewer → сырой шаблон через /mrt-render без rf
     if auto_render and filter_token:
         report.loadFile(f"/mrt-render?rf={filter_token}")
     else:
-        report.loadFile("/mrt")
+        report.loadFile("/mrt-render")
     viewer.report = report
     return sti_response(
         viewer,
@@ -1002,18 +1002,6 @@ def openapi_spec() -> dict:
                     },
                 }
             },
-            "/mrt": {
-                "get": {
-                    "tags": ["viewer"],
-                    "summary": "Сырой .mrt (JSON)",
-                    "responses": {
-                        "200": {
-                            "description": "MRT JSON",
-                            "content": {"application/json": {"schema": {"type": "object"}}},
-                        }
-                    },
-                }
-            },
             "/api/screenshot": {
                 "post": {
                     "tags": ["export"],
@@ -1220,23 +1208,18 @@ def api_screenshot():
     return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
 
 
-@app.route("/mrt", methods=["GET", "POST"])
-def serve_mrt():
-    """Обычный шаблон для /viewer и /designer — панель параметров как в .mrt."""
-    raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    resp = Response(raw, mimetype="application/json; charset=utf-8")
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
 @app.route("/mrt-render", methods=["GET", "POST"])
 def serve_mrt_render():
-    """Шаблон только для /open: RequestParameters=false + Value из фильтров."""
+    """Шаблон: без rf — сырой .mrt; с rf — Value фильтров для /open."""
     token = (request.args.get("rf") or "").strip() or None
+    raw = MRT_PATH.read_text(encoding="utf-8-sig")
+    if not token:
+        resp = Response(raw, mimetype="application/json; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     filters = _load_render_filters(token) or session.get("render_filters") or {}
     if not isinstance(filters, dict):
         filters = {}
-    raw = MRT_PATH.read_text(encoding="utf-8-sig")
     try:
         patched = patch_mrt_for_auto_render(raw, filters)
     except Exception as exc:
@@ -1261,7 +1244,7 @@ def designer():
         return sti_response(designer)
 
     report = StiReport()
-    report.loadFile("/mrt")
+    report.loadFile("/mrt-render")
     designer.report = report
     return sti_response(designer)
 
