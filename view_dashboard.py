@@ -48,8 +48,10 @@ if not hasattr(StiAppearanceOptions, "minParametersCountForMultiColumns"):
 ROOT = Path(__file__).resolve().parent
 _SAFE_NAME = re.compile(r"[^\w.\-]+", re.UNICODE)
 
-# token → {VariableName: value}; не только Flask session (Swagger/curl часто без cookie)
+# token → {VariableName: value}; legacy ?rf= (можно не использовать)
 RENDER_FILTER_STORE: dict[str, dict[str, object]] = {}
+# последние фильтры /open — без rf в URL (curl POST → браузер на /open)
+LATEST_RENDER_FILTERS: dict[str, object] = {}
 # GET /shot → сигнал уже открытому /open (без перезагрузки дашборда)
 _SHOT_LOCK = threading.Lock()
 _SHOT_PENDING: dict[str, float] = {}
@@ -397,11 +399,35 @@ def _store_render_filters(filters: dict[str, object]) -> str:
     return token
 
 
+def _remember_filters(filters: dict[str, object]) -> None:
+    """Session + last-wins (для /open без ?rf=)."""
+    data = dict(filters)
+    session["render_filters"] = data
+    LATEST_RENDER_FILTERS.clear()
+    LATEST_RENDER_FILTERS.update(data)
+
+
 def _load_render_filters(token: str | None) -> dict[str, object] | None:
     if not token:
         return None
     got = RENDER_FILTER_STORE.get(token)
     return dict(got) if isinstance(got, dict) else None
+
+
+def _resolve_filters(
+    token: str | None = None,
+    incoming: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    """rf (legacy) → session → LATEST → incoming."""
+    for cand in (
+        _load_render_filters(token),
+        session.get("render_filters"),
+        LATEST_RENDER_FILTERS,
+        incoming,
+    ):
+        if isinstance(cand, dict) and cand:
+            return dict(cand)
+    return None
 
 
 def make_prepare_variables(filters: dict[str, object]):
@@ -1128,8 +1154,8 @@ def openapi_spec() -> dict:
                     "tags": ["open"],
                     "summary": "Передать фильтры и открыть дашборд",
                     "description": (
-                        "Открывает браузер на /open?rf=TOKEN. "
-                        "Accept: application/json → {ok,url,rf}. ?open=0 — без браузера."
+                        "Открывает браузер на /open (без токена). "
+                        "Accept: application/json → {ok,url,filters}. ?open=0 — без браузера."
                     ),
                     "requestBody": {
                         "required": True,
@@ -1432,12 +1458,15 @@ def _shot_wait_ms() -> int:
 
 @app.get("/api/shot-poll")
 def api_shot_poll():
-    """Открытый /open|/viewer опрашивает: есть ли общий запрос на скрин."""
-    with _SHOT_LOCK:
-        pending = _SHOT_GLOBAL_KEY in _SHOT_PENDING
-        if pending:
-            _SHOT_PENDING.pop(_SHOT_GLOBAL_KEY, None)
-    return jsonify({"shoot": pending})
+    """Long-poll: ждёт сигнал GET /shot до ~25с (без спама каждые 0.8с)."""
+    deadline = time.time() + 25.0
+    while time.time() < deadline:
+        with _SHOT_LOCK:
+            if _SHOT_GLOBAL_KEY in _SHOT_PENDING:
+                _SHOT_PENDING.pop(_SHOT_GLOBAL_KEY, None)
+                return jsonify({"shoot": True})
+        time.sleep(0.1)
+    return jsonify({"shoot": False})
 
 
 @app.post("/api/shot-done")
@@ -1497,16 +1526,14 @@ def api_shot():
 
 @app.route("/mrt-render", methods=["GET", "POST"])
 def serve_mrt_render():
-    """Шаблон: без rf — сырой .mrt; с rf — Value фильтров для /open."""
+    """Шаблон: Value фильтров из session/LATEST (или legacy ?rf=). Без фильтров — сырой .mrt."""
     token = (request.args.get("rf") or "").strip() or None
     raw = MRT_PATH.read_text(encoding="utf-8-sig")
-    if not token:
+    filters = _resolve_filters(token) or {}
+    if not filters:
         resp = Response(raw, mimetype="application/json; charset=utf-8")
         resp.headers["Cache-Control"] = "no-store"
         return resp
-    filters = _load_render_filters(token) or session.get("render_filters") or {}
-    if not isinstance(filters, dict):
-        filters = {}
     try:
         patched = patch_mrt_for_auto_render(raw, filters)
     except Exception as exc:
@@ -1603,23 +1630,22 @@ def _collect_incoming_filters() -> dict[str, object]:
 def open_dashboard_with_filters():
     """Подставить фильтры и открыть уже построенный дашборд (без Submit).
 
-    Отдельно от /viewer (preview с ручным Submit).
+    Отдельно от /viewer (preview с ручным Submit). Без ?rf= в URL.
 
     GET  /open?trendtype=nocumulative&typenum=1000
     GET  /open?filters={"trendtype":"nocumulative","typenum":1000}
     POST /open  JSON {"filters":{"trendtype":"nocumulative","typenum":1000}}
-         → открывает браузер на /open?rf=TOKEN (или ?open=0 без браузера)
+         → открывает браузер на /open (или ?open=0 без браузера)
     """
-    token = (request.args.get("rf") or "").strip() or None
+    legacy_rf = (request.args.get("rf") or "").strip() or None
     incoming = _collect_incoming_filters()
     is_handler = _is_stimulsoft_handler_request()
 
     if incoming:
         incoming = _normalize_filters_against_mrt(incoming)
-        session["render_filters"] = incoming
-        token = _store_render_filters(incoming)
+        _remember_filters(incoming)
         if request.method == "POST" and not is_handler:
-            view_path = f"/open?rf={token}"
+            view_path = "/open"
             view_url = f"http://{HOST}:{PORT}{view_path}"
             open_flag = (request.args.get("open") or "1").strip().lower()
             if open_flag not in {"0", "false", "no", "off"}:
@@ -1628,7 +1654,6 @@ def open_dashboard_with_filters():
                     print(f"opened browser: {view_url}", flush=True)
                 except Exception as exc:
                     print(f"browser open failed: {exc}", flush=True)
-            # JSON удобен для Postman; HTML — для браузера
             wants_json = "application/json" in (request.headers.get("Accept") or "")
             if wants_json:
                 return jsonify(
@@ -1636,7 +1661,6 @@ def open_dashboard_with_filters():
                         "ok": True,
                         "url": view_url,
                         "path": view_path,
-                        "rf": token,
                         "filters": incoming,
                     }
                 )
@@ -1649,23 +1673,15 @@ def open_dashboard_with_filters():
             )
             return Response(html, mimetype="text/html; charset=utf-8")
 
-    filters = _load_render_filters(token) or session.get("render_filters") or incoming or None
-    if isinstance(filters, dict) and not filters:
-        filters = None
+    filters = _resolve_filters(legacy_rf, incoming)
     if filters:
         filters = _normalize_filters_against_mrt(filters)
-        # session нужна: handler POST идёт на /open без ?rf=
-        session["render_filters"] = filters
-        if not token:
-            token = _store_render_filters(filters)
-        else:
-            # обновить store нормализованными значениями (List и т.д.)
-            RENDER_FILTER_STORE[token] = dict(filters)
+        _remember_filters(filters)
 
-    print(f"open filters={filters} rf={token}", flush=True)
+    print(f"open filters={filters}", flush=True)
     return build_viewer(
         filters=filters,
-        filter_token=token,
+        filter_token=None,
         inject_screenshot=True,
         auto_render=True,
     )

@@ -1526,12 +1526,20 @@
     }
   }
 
-  async function runAutoShot() {
+  async function runAutoShot(opts) {
+    opts = opts || {};
     if (window.__dashShotBusy) return;
     window.__dashShotBusy = true;
     window.__dashShotDone = null;
     try {
-      await waitDashboardReady(70000);
+      // по сигналу /shot дашборд уже на экране — не ждать 70с
+      if (opts.skipWait) {
+        await new Promise(function (r) {
+          setTimeout(r, 50);
+        });
+      } else {
+        await waitDashboardReady(70000);
+      }
       var result = await takeScreenshot();
       window.__dashShotDone = result || {
         ok: false,
@@ -1557,8 +1565,12 @@
 
   function startShotPoller() {
     if (window.__dashShotPoller) return;
-    window.__dashShotPoller = setInterval(function () {
-      if (window.__dashShotBusy) return;
+    window.__dashShotPoller = true;
+    function loop() {
+      if (window.__dashShotBusy) {
+        setTimeout(loop, 400);
+        return;
+      }
       fetch("/api/shot-poll", { cache: "no-store" })
         .then(function (r) {
           return r.json();
@@ -1566,11 +1578,17 @@
         .then(function (j) {
           if (j && j.shoot) {
             console.log("[dash-shot] signal → shoot");
-            runAutoShot();
+            return runAutoShot({ skipWait: true }).then(function () {
+              loop();
+            });
           }
+          loop();
         })
-        .catch(function () {});
-    }, 800);
+        .catch(function () {
+          setTimeout(loop, 2000);
+        });
+    }
+    loop();
   }
 
   function mount() {
