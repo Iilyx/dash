@@ -12,7 +12,7 @@ docker compose up -d   # Postgres, опционально
 - Viewer: http://127.0.0.1:8040/viewer  
 - Open: `/open` (фильтры → готовый дашборд)  
 - Shot: вкладка `/open` + `GET /shot` → PNG + PDF таблиц в `exports/`  
-- Filters: `/filters` · с вопросом: `/filters?q=…` или `POST {"question":"…"}` → LLM выбирает `.mrt` из `dashboards/`  
+- Filters: `POST /filters` — без body: фильтры `MRT_PATH`; `{"question":"…"}` → LLM выбирает `.mrt`  
 - Boards: `/dashboards`  
 - Docs: `/docs`  
 
@@ -23,4 +23,4 @@ docker compose up -d   # Postgres, опционально
 - `instruction.md` — инструкция, как выбирать дашборд  
 - `*.mrt` — сами шаблоны  
 
-`/filters?q=…` → LLM читает инструкцию, выбирает `.mrt`, дальше filters по этому файлу.
+`POST /filters {"question":"…"}` → LLM читает инструкцию, выбирает `.mrt`, дальше filters по этому файлу.

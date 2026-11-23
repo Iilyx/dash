@@ -1065,31 +1065,29 @@ def openapi_spec() -> dict:
         },
         "paths": {
             "/filters": {
-                "get": {
+                "post": {
                     "tags": ["filters"],
-                    "summary": "Фильтры из .mrt; с ?q= — LLM по instruction.md выбирает .mrt",
+                    "summary": "Фильтры из .mrt; с question — LLM выбирает .mrt",
                     "description": (
-                        "Без q — MRT_PATH. С q/question — instruction.md + список *.mrt → LLM → filters. "
-                        "POST JSON: {\"question\":\"...\"}."
+                        "Без question — MRT_PATH. С question — instruction.md + *.mrt → LLM → filters."
                     ),
-                    "parameters": [
-                        {
-                            "name": "q",
-                            "in": "query",
-                            "schema": {"type": "string"},
-                            "description": "Вопрос пользователя → выбор dashboard",
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {"type": "string"},
+                                        "run_queries": {
+                                            "type": "boolean",
+                                            "default": True,
+                                        },
+                                    },
+                                }
+                            }
                         },
-                        {
-                            "name": "run_queries",
-                            "in": "query",
-                            "schema": {
-                                "type": "string",
-                                "enum": ["0", "1", "true", "false"],
-                                "default": "1",
-                            },
-                            "description": "1 — выполнить SQL dialog.source; 0 — только метаданные",
-                        },
-                    ],
+                    },
                     "responses": {
                         "200": {
                             "description": "Фильтры (+ dashboard при выборе)",
@@ -1098,31 +1096,6 @@ def openapi_spec() -> dict:
                                     "schema": {"$ref": "#/components/schemas/FiltersResponse"}
                                 }
                             },
-                        }
-                    },
-                },
-                "post": {
-                    "tags": ["filters"],
-                    "summary": "Как GET /filters?q=… (question в JSON)",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "question": {"type": "string"},
-                                        "q": {"type": "string"},
-                                        "run_queries": {"type": "boolean"},
-                                    },
-                                }
-                            }
-                        },
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Фильтры + выбранный dashboard",
-                            "content": {"application/json": {"schema": {"type": "object"}}},
                         }
                     },
                 },
@@ -1410,36 +1383,23 @@ def vendor_html2canvas():
     return resp
 
 
-def _filters_run_queries_flag() -> bool:
-    rq = (request.args.get("run_queries") or request.args.get("sql") or "1").strip().lower()
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        if isinstance(body, dict) and body.get("run_queries") is not None:
-            rq = str(body.get("run_queries")).strip().lower()
-    return rq not in {"0", "false", "no", "off"}
-
-
-def _filters_question() -> str:
-    q = (request.args.get("q") or request.args.get("question") or "").strip()
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        if isinstance(body, dict):
-            q = str(body.get("question") or body.get("q") or q or "").strip()
-    return q
-
-
-@app.route("/filters", methods=["GET", "POST"])
+@app.post("/filters")
 def filters():
     """Фильтры из .mrt.
 
-    Без вопроса — MRT_PATH.
-    С вопросом — instruction.md + список .mrt → LLM выбирает mrt → filters этого файла.
+    Без question — MRT_PATH.
+    С question — instruction.md + список .mrt → LLM выбирает mrt → filters этого файла.
     """
     from filters_mrt import extract_filters
-    from pick_dashboard import list_mrt_files, load_instruction, pick_dashboard
+    from pick_dashboard import pick_dashboard
 
-    run_queries = _filters_run_queries_flag()
-    question = _filters_question()
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    question = str(body.get("question") or "").strip()
+    rq = body.get("run_queries", True)
+    run_queries = str(rq).strip().lower() not in {"0", "false", "no", "off"}
+
     dashboard_info: dict[str, object] | None = None
     mrt_file = MRT_PATH
 
@@ -1806,7 +1766,7 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
-    print(f"Filters:  http://{HOST}:{PORT}/filters  (?q=… → LLM pick dashboard)", flush=True)
+    print(f"Filters:  POST http://{HOST}:{PORT}/filters  ({{question}} → LLM pick)", flush=True)
     print(f"Boards:   http://{HOST}:{PORT}/dashboards", flush=True)
     print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
     print(f"Shot:     http://{HOST}:{PORT}/shot     (signal → open tab shoots)", flush=True)
