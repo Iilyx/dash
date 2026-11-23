@@ -1067,9 +1067,11 @@ def openapi_spec() -> dict:
             "/filters": {
                 "post": {
                     "tags": ["filters"],
-                    "summary": "Фильтры из .mrt; с question — LLM выбирает .mrt",
+                    "summary": "Фильтры из .mrt; с question — pick + result",
                     "description": (
-                        "Без question — MRT_PATH. С question — instruction.md + *.mrt → LLM → filters."
+                        "Без question: {count, filters}. "
+                        "С question: + dashboard{mrt,mrt_path,description} "
+                        "и result{name:value} из вопроса (дыры — дефолты filters)."
                     ),
                     "requestBody": {
                         "required": False,
@@ -1256,29 +1258,35 @@ def openapi_spec() -> dict:
                 "FiltersResponse": {
                     "type": "object",
                     "properties": {
-                        "mrt": {"type": "string"},
-                        "kind": {"type": "string", "example": "category_filters"},
                         "count": {"type": "integer"},
-                        "run_queries": {"type": "boolean"},
-                        "database": {"type": "boolean"},
                         "filters": {
                             "type": "array",
                             "items": {"$ref": "#/components/schemas/FilterItem"},
+                        },
+                        "dashboard": {
+                            "type": "object",
+                            "description": "Только при question",
+                            "properties": {
+                                "mrt": {"type": "string"},
+                                "mrt_path": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                        "result": {
+                            "type": "object",
+                            "description": (
+                                "Только при question: name→value из вопроса, "
+                                "недостающее — дефолты из filters. Готово для POST /open."
+                            ),
+                            "additionalProperties": True,
+                            "example": {"Region": "Брестская", "Year": 2024},
                         },
                     },
                 },
                 "FilterItem": {
                     "type": "object",
                     "properties": {
-                        "index": {"type": "integer"},
-                        "name": {"type": "string"},
                         "alias": {"type": "string"},
-                        "category": {"type": "string", "example": "Фильтры"},
-                        "type": {"type": "string"},
-                        "choices_from": {
-                            "type": "string",
-                            "enum": ["items", "query", "none"],
-                        },
                         "choices": {
                             "type": "array",
                             "items": {
@@ -1286,12 +1294,12 @@ def openapi_spec() -> dict:
                                 "properties": {
                                     "key": {},
                                     "value": {},
+                                    "checked": {"type": "boolean"},
                                 },
                             },
                         },
-                        "sql": {"type": "string"},
-                        "query_ok": {"type": "boolean"},
-                        "query_error": {"type": "string"},
+                        "name": {"type": "string"},
+                        "value": {},
                     },
                 },
                 "RenderRequest": {
@@ -1387,11 +1395,15 @@ def vendor_html2canvas():
 def filters():
     """Фильтры из .mrt.
 
-    Без question — MRT_PATH.
-    С question — instruction.md + список .mrt → LLM выбирает mrt → filters этого файла.
+    Без question — count + filters (MRT_PATH).
+    С question — LLM выбирает mrt → filters → result {name:value} из вопроса (+ дефолты).
     """
     from filters_mrt import extract_filters
-    from pick_dashboard import pick_dashboard
+    from pick_dashboard import (
+        build_result,
+        extract_filter_values,
+        pick_dashboard,
+    )
 
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
@@ -1415,38 +1427,45 @@ def filters():
         )
     except Exception as exc:
         payload: dict[str, object] = {
-            "ok": False,
-            "mrt": mrt_file.name if isinstance(mrt_file, Path) else MRT_PATH.name,
-            "kind": "category_filters",
-            "error": str(exc),
             "count": 0,
             "filters": [],
+            "error": str(exc),
         }
-        if question:
-            payload["question"] = question
         if dashboard_info:
             payload["dashboard"] = {
                 "mrt": dashboard_info.get("mrt"),
-                "title": dashboard_info.get("title"),
+                "mrt_path": dashboard_info.get("mrt_path"),
                 "description": dashboard_info.get("description"),
-                "reason": dashboard_info.get("reason"),
             }
+            payload["result"] = {}
         return jsonify(payload), 500
 
-    if question and dashboard_info:
-        plan["ok"] = True
-        plan["question"] = question
-        plan["dashboard"] = {
-            "mrt": dashboard_info.get("mrt"),
-            "title": dashboard_info.get("title"),
-            "description": dashboard_info.get("description"),
-            "reason": dashboard_info.get("reason"),
-            "mrt_path": dashboard_info.get("mrt_path"),
-        }
-
-    resp = jsonify(plan)
-    resp.headers["Cache-Control"] = "no-store"
+    # ответ: count + filters (+ dashboard/result при question)
+    out: dict[str, object] = {
+        "count": plan.get("count", 0),
+        "filters": plan.get("filters") or [],
+    }
     if plan.get("mrt_stripped"):
+        out["error"] = plan.get("error")
+        out["mrt_stripped"] = True
+
+    if question and dashboard_info:
+        filt_list = list(out["filters"]) if isinstance(out["filters"], list) else []
+        try:
+            extracted = extract_filter_values(question, filt_list)
+        except Exception as exc:
+            print(f"extract_filter_values failed: {exc}", flush=True)
+            extracted = {}
+        out["dashboard"] = {
+            "mrt": dashboard_info.get("mrt"),
+            "mrt_path": dashboard_info.get("mrt_path"),
+            "description": dashboard_info.get("description"),
+        }
+        out["result"] = build_result(filt_list, extracted)
+
+    resp = jsonify(out)
+    resp.headers["Cache-Control"] = "no-store"
+    if out.get("mrt_stripped"):
         return resp, 422
     return resp
 

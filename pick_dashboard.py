@@ -27,12 +27,26 @@ PICK_SYSTEM = """Ты выбираешь один файл дашборда (.mr
 2) список доступных .mrt файлов.
 
 Ответь ТОЛЬКО JSON без markdown:
-{"mrt":"<точное имя файла из списка>","title":"<короткий заголовок>","description":"<1-2 предложения что за дашборд>","reason":"<почему выбран>"}
+{"mrt":"<точное имя файла из списка>","title":"<короткий заголовок>","description":"<полный текст: что за дашборд, для кого, что показывает>","reason":"<почему выбран>"}
 
 Правила:
 - mrt — только имя из списка (как есть, с .mrt);
 - если ничего идеально не подходит — выбери ближайший и объясни в reason;
-- description — для человека, понятным языком.
+- description — полный, понятным языком (не одно слово).
+"""
+
+FILTER_VALUES_SYSTEM = """Ты извлекаешь значения фильтров дашборда из вопроса пользователя.
+
+Тебе дан список фильтров: name, alias, choices (допустимые key/value), value (дефолт).
+
+Ответь ТОЛЬКО JSON-объектом без markdown:
+{"<name>":"<value>", ...}
+
+Правила:
+- ключи — только name из списка фильтров;
+- если в вопросе явно указано значение — поставь его (для choices бери key или value из списка);
+- если в вопросе фильтра нет — НЕ включай этот ключ (дефолт подставит сервер);
+- не выдумывай имена фильтров и значения вне choices (если choices не пустой).
 """
 
 
@@ -211,6 +225,9 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
 
     title = str(picked.get("title") or match["id"]).strip()
     description = str(picked.get("description") or "").strip()
+    if not description:
+        # кусок инструкции про этот .mrt — как полный fallback
+        description = _description_from_instruction(instruction, str(match["mrt"]))
     return {
         "id": match["id"],
         "mrt": match["mrt"],
@@ -222,3 +239,141 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
         "available_mrt": names,
         "llm_raw": picked,
     }
+
+
+def _description_from_instruction(instruction: str, mrt_name: str) -> str:
+    """Вытащить секцию instruction.md про этот .mrt (если есть)."""
+    stem = Path(mrt_name).stem
+    text = (instruction or "").strip()
+    if not text:
+        return ""
+    # ищем ## demo.mrt / ## demo
+    pat = re.compile(
+        rf"(?im)^##\s+({re.escape(mrt_name)}|{re.escape(stem)})\s*$"
+    )
+    m = pat.search(text)
+    if not m:
+        return text[:800].strip()
+    start = m.end()
+    nxt = re.search(r"(?m)^##\s+", text[start:])
+    end = start + nxt.start() if nxt else len(text)
+    return text[start:end].strip() or text[:800].strip()
+
+
+def _default_filter_value(filt: dict) -> object:
+    """Дефолт из filters: value, иначе checked choice, иначе первый choice."""
+    if "value" in filt and filt["value"] not in (None, ""):
+        return filt["value"]
+    choices = filt.get("choices") or []
+    if isinstance(choices, list):
+        for ch in choices:
+            if isinstance(ch, dict) and ch.get("checked"):
+                return ch.get("key") if ch.get("key") not in (None, "") else ch.get("value")
+        if choices and isinstance(choices[0], dict):
+            ch0 = choices[0]
+            if ch0.get("key") not in (None, ""):
+                return ch0["key"]
+            if ch0.get("value") not in (None, ""):
+                return ch0["value"]
+    return filt.get("value")
+
+
+def build_result(
+    filters: list[dict],
+    extracted: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """name→value: дефолты из filters, поверх — вычлененные из вопроса."""
+    by_name: dict[str, dict] = {}
+    for f in filters:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or "").strip()
+        if name:
+            by_name[name] = f
+
+    result: dict[str, object] = {}
+    for name, f in by_name.items():
+        result[name] = _default_filter_value(f)
+
+    if not extracted:
+        return result
+
+    # alias → name
+    alias_map: dict[str, str] = {}
+    for name, f in by_name.items():
+        alias = str(f.get("alias") or "").strip()
+        if alias:
+            alias_map[alias.lower()] = name
+        alias_map[name.lower()] = name
+
+    for raw_key, val in extracted.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        name = by_name[key]["name"] if key in by_name else alias_map.get(key.lower())
+        if not name:
+            continue
+        if val is None or val == "":
+            continue
+        result[str(name)] = val
+    return result
+
+
+def extract_filter_values(
+    question: str,
+    filters: list[dict],
+) -> dict[str, object]:
+    """LLM: из вопроса → {name: value} только по известным фильтрам."""
+    q = (question or "").strip()
+    if not q or not filters:
+        return {}
+
+    compact: list[dict[str, object]] = []
+    for f in filters:
+        if not isinstance(f, dict) or not f.get("name"):
+            continue
+        item: dict[str, object] = {
+            "name": f.get("name"),
+            "alias": f.get("alias") or f.get("name"),
+            "value": f.get("value"),
+        }
+        choices = f.get("choices") or []
+        if isinstance(choices, list) and choices:
+            # не раздуваем промпт: до 40 пунктов
+            slim = []
+            for ch in choices[:40]:
+                if not isinstance(ch, dict):
+                    continue
+                slim.append(
+                    {
+                        k: ch[k]
+                        for k in ("key", "value", "checked")
+                        if k in ch and ch[k] not in (None, "")
+                    }
+                )
+            item["choices"] = slim
+            if len(choices) > 40:
+                item["choices_truncated"] = True
+        compact.append(item)
+
+    if not compact:
+        return {}
+
+    user = (
+        f"Фильтры дашборда:\n{json.dumps(compact, ensure_ascii=False)}\n\n"
+        f"Вопрос пользователя:\n{q}"
+    )
+    content = _chat(
+        [
+            {"role": "system", "content": FILTER_VALUES_SYSTEM},
+            {"role": "user", "content": user},
+        ]
+    )
+    picked = _parse_json_object(content)
+    # только скаляры / простые значения
+    out: dict[str, object] = {}
+    for k, v in picked.items():
+        if isinstance(v, (dict, list)):
+            continue
+        out[str(k)] = v
+    return out
