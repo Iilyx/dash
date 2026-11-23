@@ -1269,7 +1269,13 @@ def openapi_spec() -> dict:
                             "properties": {
                                 "mrt": {"type": "string"},
                                 "mrt_path": {"type": "string"},
-                                "description": {"type": "string"},
+                                "description": {
+                                    "type": "string",
+                                    "description": (
+                                        "Секция instruction.md про этот .mrt "
+                                        "(заголовок + тело целиком)"
+                                    ),
+                                },
                             },
                         },
                         "result": {

@@ -27,12 +27,12 @@ PICK_SYSTEM = """Ты выбираешь один файл дашборда (.mr
 2) список доступных .mrt файлов.
 
 Ответь ТОЛЬКО JSON без markdown:
-{"mrt":"<точное имя файла из списка>","title":"<короткий заголовок>","description":"<полный текст: что за дашборд, для кого, что показывает>","reason":"<почему выбран>"}
+{"mrt":"<точное имя файла из списка>","title":"<короткий заголовок>","reason":"<почему выбран>"}
 
 Правила:
 - mrt — только имя из списка (как есть, с .mrt);
 - если ничего идеально не подходит — выбери ближайший и объясни в reason;
-- description — полный, понятным языком (не одно слово).
+- description в ответ не пиши — сервер возьмёт секцию из instruction.md.
 """
 
 FILTER_VALUES_SYSTEM = """Ты извлекаешь значения фильтров дашборда из вопроса пользователя.
@@ -224,10 +224,8 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
         ).strip()
 
     title = str(picked.get("title") or match["id"]).strip()
-    description = str(picked.get("description") or "").strip()
-    if not description:
-        # кусок инструкции про этот .mrt — как полный fallback
-        description = _description_from_instruction(instruction, str(match["mrt"]))
+    # description = вся секция instruction.md про этот .mrt (не LLM)
+    description = _description_from_instruction(instruction, str(match["mrt"]))
     return {
         "id": match["id"],
         "mrt": match["mrt"],
@@ -242,22 +240,22 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
 
 
 def _description_from_instruction(instruction: str, mrt_name: str) -> str:
-    """Вытащить секцию instruction.md про этот .mrt (если есть)."""
+    """Вся секция instruction.md про этот .mrt (заголовок + тело). Иначе весь файл."""
     stem = Path(mrt_name).stem
     text = (instruction or "").strip()
     if not text:
         return ""
-    # ищем ## demo.mrt / ## demo
+    # ## demo.mrt / ## demo
     pat = re.compile(
         rf"(?im)^##\s+({re.escape(mrt_name)}|{re.escape(stem)})\s*$"
     )
     m = pat.search(text)
     if not m:
-        return text[:800].strip()
-    start = m.end()
-    nxt = re.search(r"(?m)^##\s+", text[start:])
-    end = start + nxt.start() if nxt else len(text)
-    return text[start:end].strip() or text[:800].strip()
+        return text
+    start = m.start()
+    nxt = re.search(r"(?m)^##\s+", text[m.end() :])
+    end = m.end() + nxt.start() if nxt else len(text)
+    return text[start:end].strip()
 
 
 def _default_filter_value(filt: dict) -> object:
