@@ -1423,6 +1423,7 @@ def filters():
     if not isinstance(body, dict):
         body = {}
     question = str(body.get("question") or "").strip()
+    # пустой mrt → LLM pick; заполненный → только filters/result по этому файлу
     mrt_arg = str(body.get("mrt") or body.get("dashboard") or "").strip()
     rq = body.get("run_queries", True)
     run_queries = str(rq).strip().lower() not in {"0", "false", "no", "off"}
@@ -1431,11 +1432,12 @@ def filters():
     mrt_file = MRT_PATH
 
     try:
-        if question and mrt_arg:
-            # уже выбран — pick не зовём
+        if not question:
+            pass
+        elif mrt_arg:
             dashboard_info = resolve_dashboard(mrt_arg)
             mrt_file = Path(str(dashboard_info["mrt_path"]))
-        elif question:
+        else:
             dashboard_info = pick_dashboard(question)
             mrt_file = Path(str(dashboard_info["mrt_path"]))
 
