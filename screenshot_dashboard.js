@@ -1,13 +1,10 @@
 /* Скрин дашборда + Table/Pivot → PDF.
  *
- * UI-кнопка выключена по умолчанию (SHOT_SHOW_BUTTON / ?shot_ui=1).
- * GET /shot → сигнал вкладке /open (long-poll); без reload.
- * html2canvas с локального /vendor/html2canvas.min.js — без CDN/интернета.
+ * GET /shot → сигнал вкладке /open (long-poll), без reload.
+ * html2canvas: /vendor/html2canvas.min.js (offline, MIT).
  *
- * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
- * html2canvas iframe не видит → карта пустая.
- * Фикс: html2canvas всего iframe (карта + labels), размер = CSS-бокс iframe;
- * fallback — SVG с inline fill у text; прячем iframe, снимаем страницу.
+ * Stimulsoft кладёт RegionMap HTML в iframe → html2canvas его не видит;
+ * фикс: bake iframe/SVG, потом снимок страницы.
  */
 (function () {
   var HTML2CANVAS = "/vendor/html2canvas.min.js";
@@ -691,24 +688,6 @@
     return comps;
   }
 
-  function queryFlag(name) {
-    try {
-      var q = new URLSearchParams(window.location.search || "");
-      var v = (q.get(name) || "").trim().toLowerCase();
-      return v === "1" || v === "true" || v === "yes" || v === "on";
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function autoShotEnabled() {
-    return !!(window.__dashAutoShot || queryFlag("autoscreenshot"));
-  }
-
-  function shotButtonEnabled() {
-    return !!(window.__dashShowShotButton || queryFlag("shot_ui"));
-  }
-
   /**
    * Save на Table/Pivot → PDF A2 (как hover Save), с учётом drill-down.
    * Скачивает PDF + кладёт в exports/.
@@ -1385,8 +1364,6 @@
       setStatus(result.error);
       return result;
     }
-    var btn = document.getElementById("dashShotBtn");
-    if (btn) btn.disabled = true;
     var restoreMaps = function () {};
     var restoreFilters = function () {};
     setStatus("снимок…");
@@ -1482,35 +1459,7 @@
       try {
         restoreMaps();
       } catch (e) {}
-      if (btn) btn.disabled = false;
     }
-  }
-
-  function dashboardLooksReady() {
-    var report = findReport();
-    var root = captureRoot();
-    if (!report || !root) return false;
-    try {
-      var r = root.getBoundingClientRect();
-      if (!r || r.width < 80 || r.height < 80) return false;
-    } catch (e) {
-      return false;
-    }
-    return true;
-  }
-
-  function waitDashboardReady(maxMs) {
-    maxMs = maxMs || 60000;
-    return new Promise(function (resolve) {
-      var started = Date.now();
-      var t = setInterval(function () {
-        if (dashboardLooksReady() || Date.now() - started > maxMs) {
-          clearInterval(t);
-          // карты/Variables дорисовываются чуть позже
-          setTimeout(resolve, dashboardLooksReady() ? 1800 : 0);
-        }
-      }, 400);
-    });
   }
 
   async function reportShotDone(result) {
@@ -1532,15 +1481,9 @@
     window.__dashShotDone = null;
     var shotId = opts.id || null;
     try {
-      // по сигналу /shot дашборд уже на экране — не ждать 70с
-      if (opts.skipWait) {
-        await new Promise(function (r) {
-          setTimeout(r, 50);
-        });
-      } else {
-        await waitDashboardReady(70000);
-      }
-      // прогреть html2canvas заранее / на всякий случай
+      await new Promise(function (r) {
+        setTimeout(r, 50);
+      });
       await loadScript(HTML2CANVAS);
       var result = await takeScreenshot();
       window.__dashShotDone = result || {
@@ -1584,7 +1527,7 @@
           if (j && j.shoot && j.id && j.id !== lastId) {
             lastId = j.id;
             console.log("[dash-shot] signal → shoot", j.id);
-            return runAutoShot({ skipWait: true, id: j.id }).then(function () {
+            return runAutoShot({ id: j.id }).then(function () {
               loop();
             });
           }
@@ -1598,39 +1541,10 @@
   }
 
   function mount() {
-    if (shotButtonEnabled()) {
-      if (document.getElementById("dashShotBar")) return;
-      var bar = document.createElement("div");
-      bar.id = "dashShotBar";
-      bar.style.cssText =
-        "position:fixed;z-index:2147483646;top:8px;right:8px;display:flex;gap:8px;align-items:center;" +
-        "font:12px/1.2 ui-sans-serif,system-ui,sans-serif;background:rgba(20,20,20,.85);color:#fff;" +
-        "padding:6px 10px;border-radius:6px;";
-      var btn = document.createElement("button");
-      btn.id = "dashShotBtn";
-      btn.type = "button";
-      btn.textContent = "Скрин";
-      btn.style.cssText =
-        "cursor:pointer;border:0;border-radius:4px;padding:5px 10px;background:#eee;color:#111;font:inherit;";
-      btn.onclick = function () {
-        takeScreenshot();
-      };
-      var status = document.createElement("span");
-      status.id = "dashShotStatus";
-      status.style.cssText =
-        "max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9;";
-      bar.appendChild(btn);
-      bar.appendChild(status);
-      document.body.appendChild(bar);
-    }
-    // локальный html2canvas заранее — скрин не ждёт CDN
     loadScript(HTML2CANVAS).catch(function (e) {
       console.warn("[dash-shot] html2canvas preload", e);
     });
     startShotPoller();
-    if (autoShotEnabled()) {
-      setTimeout(runAutoShot, 0);
-    }
   }
 
   if (document.readyState === "loading") {

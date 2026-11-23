@@ -66,8 +66,6 @@ _RENDER_QUERY_SKIP = {
     "no_redirect",
     "redirect",
     "open",
-    "autoscreenshot",
-    "shot_ui",
 }
 
 
@@ -666,12 +664,10 @@ def build_viewer(
     filter_token: str | None = None,
     inject_screenshot: bool = True,
     auto_render: bool = False,
-    auto_shot: bool = False,
 ):
     """Собрать StiViewer.
 
     auto_render=True — /open: сразу дашборд с фильтрами.
-    auto_shot=True — после рендера PNG + PDF таблиц в exports/ (GET /shot).
     /viewer вызывает с auto_render=False.
     """
     viewer = StiViewer()
@@ -688,8 +684,7 @@ def build_viewer(
     # StiJavaScript всегда клеит `?sti_event=` к handler.url —
     # нельзя писать `/open?rf=…` (получится `?rf=…?sti_event=` → HTML вместо JS → Unexpected token).
     # rf остаётся в /mrt-render?rf= и в session; handler = чистый путь.
-    # /shot тоже ходит в /open (GetResource / Variables).
-    handler_path = "/open" if (auto_render or auto_shot) else "/viewer"
+    handler_path = "/open" if auto_render else "/viewer"
     try:
         viewer.handler._StiBaseHandler__url = handler_path  # noqa: SLF001
     except Exception:
@@ -702,13 +697,12 @@ def build_viewer(
             inject_screenshot=False,
             filter_token=filter_token,
             auto_render=auto_render,
-            auto_shot=auto_shot,
             handler_path=handler_path,
         )
 
     report = StiReport()
-    # /open|/shot → /mrt-render?rf=…; /viewer → сырой шаблон через /mrt-render без rf
-    if (auto_render or auto_shot) and filter_token:
+    # /open → /mrt-render?rf=…; /viewer → сырой шаблон через /mrt-render без rf
+    if auto_render and filter_token:
         report.loadFile(f"/mrt-render?rf={filter_token}")
     else:
         report.loadFile("/mrt-render")
@@ -718,8 +712,7 @@ def build_viewer(
         inject_screenshot=inject_screenshot,
         filters=filters,
         filter_token=filter_token,
-        auto_render=auto_render or auto_shot,
-        auto_shot=auto_shot,
+        auto_render=auto_render,
         handler_path=handler_path,
     )
 
@@ -752,10 +745,8 @@ def sti_process(component) -> bool:
     return handled
 
 
-def inject_screenshot_ui(
-    html: str, *, auto_render: bool = False, auto_shot: bool = False
-) -> str:
-    """Скрипт скрина (+ опц. кнопка) и window.__dashReport для bake карт."""
+def inject_screenshot_ui(html: str, *, auto_render: bool = False) -> str:
+    """Скрипт скрина (poll GET /shot) и window.__dashReport для bake карт."""
     needle = "viewer.report = report;\nviewer.renderHtml('viewerContent');"
     auto_block = ""
     auto_submit_js = ""
@@ -967,21 +958,7 @@ def inject_screenshot_ui(
         ver = int((ROOT / "screenshot_dashboard.js").stat().st_mtime)
     except OSError:
         ver = 1
-    show_btn = (os.environ.get("SHOT_SHOW_BUTTON") or "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    flag_parts = []
-    if show_btn:
-        flag_parts.append("window.__dashShowShotButton=true;")
-    if auto_shot:
-        flag_parts.append("window.__dashAutoShot=true;")
-    flags = (
-        f"<script>{''.join(flag_parts)}</script>\n" if flag_parts else ""
-    )
-    tag = flags + f'<script src="/screenshot-dashboard.js?v={ver}"></script>\n'
+    tag = f'<script src="/screenshot-dashboard.js?v={ver}"></script>\n'
     if "screenshot-dashboard.js" not in html:
         if "</body>" in html:
             html = html.replace("</body>", tag + "</body>", 1)
@@ -1033,7 +1010,6 @@ def sti_response(
     filters: dict[str, object] | None = None,
     filter_token: str | None = None,
     auto_render: bool = False,
-    auto_shot: bool = False,
     handler_path: str = "/open",
 ):
     component.handler.framework = StiFrameworkType.FLASK
@@ -1047,9 +1023,7 @@ def sti_response(
         if isinstance(raw, str) and ("viewerContent" in raw or "StiViewer" in raw):
             # сначала __dashFilters, потом патч renderHtml (auto_render)
             html = inject_filter_values_js(raw, filters, auto_render=auto_render)
-            html = inject_screenshot_ui(
-                html, auto_render=auto_render, auto_shot=auto_shot
-            )
+            html = inject_screenshot_ui(html, auto_render=auto_render)
             html = inject_handler_url(html, filter_token, handler_path=handler_path)
             html = inject_filter_panel_layout(html)
             resp.set_data(html)
