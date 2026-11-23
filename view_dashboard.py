@@ -1067,11 +1067,11 @@ def openapi_spec() -> dict:
             "/filters": {
                 "post": {
                     "tags": ["filters"],
-                    "summary": "Фильтры из .mrt; с question — pick + result",
+                    "summary": "Фильтры / pick / result",
                     "description": (
-                        "Без question: {count, filters}. "
-                        "С question: + dashboard{mrt,mrt_path,description} "
-                        "и result{name:value} из вопроса (дыры — дефолты filters)."
+                        "{} → count+filters (MRT_PATH). "
+                        "{question} → LLM pick + result. "
+                        "{mrt,question} → без pick, result из вопроса."
                     ),
                     "requestBody": {
                         "required": False,
@@ -1080,6 +1080,11 @@ def openapi_spec() -> dict:
                                 "schema": {
                                     "type": "object",
                                     "properties": {
+                                        "mrt": {
+                                            "type": "string",
+                                            "description": "Уже выбранный .mrt — только вместе с question",
+                                            "example": "demo.mrt",
+                                        },
                                         "question": {"type": "string"},
                                         "run_queries": {
                                             "type": "boolean",
@@ -1401,20 +1406,24 @@ def vendor_html2canvas():
 def filters():
     """Фильтры из .mrt.
 
-    Без question — count + filters (MRT_PATH).
-    С question — LLM выбирает mrt → filters → result {name:value} из вопроса (+ дефолты).
+    Режимы body:
+      {}                    → count+filters из MRT_PATH
+      {question}            → LLM pick .mrt + result из вопроса
+      {mrt, question}       → дашборд уже выбран, без pick, result из вопроса
     """
     from filters_mrt import extract_filters
     from pick_dashboard import (
         build_result,
         extract_filter_values,
         pick_dashboard,
+        resolve_dashboard,
     )
 
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         body = {}
     question = str(body.get("question") or "").strip()
+    mrt_arg = str(body.get("mrt") or body.get("dashboard") or "").strip()
     rq = body.get("run_queries", True)
     run_queries = str(rq).strip().lower() not in {"0", "false", "no", "off"}
 
@@ -1422,7 +1431,11 @@ def filters():
     mrt_file = MRT_PATH
 
     try:
-        if question:
+        if question and mrt_arg:
+            # уже выбран — pick не зовём
+            dashboard_info = resolve_dashboard(mrt_arg)
+            mrt_file = Path(str(dashboard_info["mrt_path"]))
+        elif question:
             dashboard_info = pick_dashboard(question)
             mrt_file = Path(str(dashboard_info["mrt_path"]))
 
@@ -1446,7 +1459,6 @@ def filters():
             payload["result"] = {}
         return jsonify(payload), 500
 
-    # ответ: count + filters (+ dashboard/result при question)
     out: dict[str, object] = {
         "count": plan.get("count", 0),
         "filters": plan.get("filters") or [],

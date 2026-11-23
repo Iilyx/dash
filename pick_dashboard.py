@@ -176,6 +176,58 @@ def _normalize_mrt_name(name: str) -> str:
     return n
 
 
+def _find_mrt(
+    mrt_name: str,
+    *,
+    dir_path: Path | None = None,
+) -> dict[str, object]:
+    """Найти .mrt в dashboards/ по имени (demo / demo.mrt)."""
+    base = dir_path or dashboards_dir()
+    mrt_list = list_mrt_files(base)
+    if not mrt_list:
+        raise RuntimeError(f"Нет *.mrt в {base}")
+    want = _normalize_mrt_name(mrt_name)
+    match = next((x for x in mrt_list if str(x["mrt"]) == want), None)
+    if match is None:
+        want_l = want.lower()
+        match = next(
+            (
+                x
+                for x in mrt_list
+                if str(x["mrt"]).lower() == want_l
+                or str(x["id"]).lower() == want_l.removesuffix(".mrt")
+            ),
+            None,
+        )
+    if match is None:
+        names = [str(x["mrt"]) for x in mrt_list]
+        raise RuntimeError(f"Нет mrt={want!r}. Доступны: {', '.join(names)}")
+    return match
+
+
+def resolve_dashboard(
+    mrt_name: str,
+    *,
+    dir_path: Path | None = None,
+) -> dict[str, object]:
+    """Дашборд уже выбран: без LLM, description из instruction.md."""
+    base = dir_path or dashboards_dir()
+    match = _find_mrt(mrt_name, dir_path=base)
+    instruction = load_instruction(base)
+    description = _description_from_instruction(instruction, str(match["mrt"]))
+    return {
+        "id": match["id"],
+        "mrt": match["mrt"],
+        "mrt_path": match["mrt_path"],
+        "title": str(match["id"]),
+        "description": description,
+        "reason": "mrt задан клиентом",
+        "instruction_used": bool(instruction),
+        "available_mrt": [str(x["mrt"]) for x in list_mrt_files(base)],
+        "picked": False,
+    }
+
+
 def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, object]:
     """Инструкция + список .mrt → LLM → выбранный mrt. Дальше filters/open с этим файлом."""
     base = dir_path or dashboards_dir()
@@ -207,16 +259,9 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
     )
     picked = _parse_json_object(content)
     want = _normalize_mrt_name(str(picked.get("mrt") or ""))
-    match = next((x for x in mrt_list if str(x["mrt"]) == want), None)
-    if match is None:
-        # иногда модель вернёт stem без расширения / другой регистр
-        want_l = want.lower()
-        match = next(
-            (x for x in mrt_list if str(x["mrt"]).lower() == want_l
-             or str(x["id"]).lower() == want_l.removesuffix(".mrt")),
-            None,
-        )
-    if match is None:
+    try:
+        match = _find_mrt(want, dir_path=base)
+    except RuntimeError:
         match = mrt_list[0]
         picked["reason"] = (
             f"LLM вернул неизвестный mrt={want!r}; взят {match['mrt']}. "
@@ -236,6 +281,7 @@ def pick_dashboard(question: str, *, dir_path: Path | None = None) -> dict[str, 
         "instruction_used": True,
         "available_mrt": names,
         "llm_raw": picked,
+        "picked": True,
     }
 
 
