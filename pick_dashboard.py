@@ -35,18 +35,20 @@ PICK_SYSTEM = """Ты выбираешь один файл дашборда (.mr
 - description в ответ не пиши — сервер возьмёт секцию из instruction.md.
 """
 
-FILTER_VALUES_SYSTEM = """Ты извлекаешь значения фильтров дашборда из вопроса пользователя.
+FILTER_VALUES_SYSTEM = """Ты заполняешь фильтры дашборда по вопросу пользователя.
 
-Тебе дан список фильтров: name, alias, choices (допустимые key/value), value (дефолт).
+На вход — JSON filters как в API: name, alias, choices[{key,value,checked}], value (дефолт).
+choices часто из SQL — это и есть допустимые значения.
 
-Ответь ТОЛЬКО JSON-объектом без markdown:
-{"<name>":"<value>", ...}
+Ответь ТОЛЬКО JSON без markdown:
+{"<name>": <value>, ...}
 
 Правила:
-- ключи — только name из списка фильтров;
-- если в вопросе явно указано значение — поставь его (для choices бери key или value из списка);
-- если в вопросе фильтра нет — НЕ включай этот ключ (дефолт подставит сервер);
-- не выдумывай имена фильтров и значения вне choices (если choices не пустой).
+- ключи объекта — только filters[].name;
+- если есть choices — верни РОВНО choices[].key выбранного пункта (не выдумывай);
+- по смыслу вопроса выбери подходящий пункт («Брест» → key «Брестская»);
+- фильтра нет в вопросе — ключ не включай (сервер оставит value/дефолт);
+- без choices — свободное значение из вопроса.
 """
 
 
@@ -106,7 +108,20 @@ def list_dashboards(dir_path: Path | None = None) -> list[dict[str, object]]:
     ]
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _llm_config() -> dict[str, object]:
+    max_tokens_raw = os.environ.get("LLM_MAX_TOKENS", "").strip()
+    max_tokens: int | None
+    try:
+        max_tokens = int(max_tokens_raw) if max_tokens_raw else None
+    except ValueError:
+        max_tokens = None
     return {
         "base_url": (
             os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080/v1").strip().rstrip("/")
@@ -114,7 +129,25 @@ def _llm_config() -> dict[str, object]:
         "api_key": os.environ.get("LLM_API_KEY", "").strip(),
         "model": os.environ.get("LLM_MODEL", "").strip(),
         "timeout": float(os.environ.get("LLM_TIMEOUT", "60") or "60"),
+        "max_tokens": max_tokens,
+        # размышление / thinking (Qwen, vLLM, …). None = не трогаем body
+        "reasoning": (
+            _env_bool("LLM_REASONING", False)
+            if os.environ.get("LLM_REASONING", "").strip() != ""
+            else None
+        ),
+        "reasoning_effort": (
+            os.environ.get("LLM_REASONING_EFFORT", "medium").strip() or "medium"
+        ),
     }
+
+
+def _strip_thinking(text: str) -> str:
+    """Убрать блоки рассуждения, оставить финальный ответ."""
+    s = text or ""
+    s = re.sub(r"<think>[\s\S]*?</think>", "", s, flags=re.I)
+    s = re.sub(r"<thinking>[\s\S]*?</thinking>", "", s, flags=re.I)
+    return s.strip()
 
 
 def _chat(messages: list[dict[str, str]], *, temperature: float = 0.1) -> str:
@@ -123,11 +156,20 @@ def _chat(messages: list[dict[str, str]], *, temperature: float = 0.1) -> str:
     if not model:
         raise RuntimeError("Задай LLM_MODEL в .env")
     url = f"{cfg['base_url']}/chat/completions"
-    body = {
+    body: dict[str, object] = {
         "model": model,
         "temperature": temperature,
         "messages": messages,
     }
+    if cfg["max_tokens"] is not None:
+        body["max_tokens"] = int(cfg["max_tokens"])
+    # вкл/выкл размышление — только если LLM_REASONING задан в .env
+    if cfg["reasoning"] is not None:
+        reasoning_on = bool(cfg["reasoning"])
+        body["chat_template_kwargs"] = {"enable_thinking": reasoning_on}
+        body["reasoning_effort"] = (
+            str(cfg["reasoning_effort"]) if reasoning_on else "none"
+        )
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     key = str(cfg["api_key"] or "")
@@ -144,7 +186,12 @@ def _chat(messages: list[dict[str, str]], *, temperature: float = 0.1) -> str:
         raise RuntimeError(f"LLM request failed: {exc}") from exc
     parsed = json.loads(raw)
     try:
-        return str(parsed["choices"][0]["message"]["content"])
+        msg = parsed["choices"][0]["message"]
+        content = msg.get("content")
+        if content in (None, "") and msg.get("reasoning_content"):
+            # некоторые бэкенды кладут ответ только в reasoning — не используем
+            content = msg.get("content") or ""
+        return _strip_thinking(str(content or ""))
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"bad LLM response: {raw[:400]}") from exc
 
@@ -304,62 +351,38 @@ def _description_from_instruction(instruction: str, mrt_name: str) -> str:
     return text[start:end].strip()
 
 
-def _default_filter_value(filt: dict) -> object:
-    """Дефолт из filters: value, иначе checked choice, иначе первый choice."""
-    if "value" in filt and filt["value"] not in (None, ""):
-        return filt["value"]
-    choices = filt.get("choices") or []
-    if isinstance(choices, list):
-        for ch in choices:
-            if isinstance(ch, dict) and ch.get("checked"):
-                return ch.get("key") if ch.get("key") not in (None, "") else ch.get("value")
-        if choices and isinstance(choices[0], dict):
-            ch0 = choices[0]
-            if ch0.get("key") not in (None, ""):
-                return ch0["key"]
-            if ch0.get("value") not in (None, ""):
-                return ch0["value"]
-    return filt.get("value")
-
-
 def build_result(
     filters: list[dict],
     extracted: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """name→value: дефолты из filters, поверх — вычлененные из вопроса."""
+    """name→value: filters[].value, поверх ответ LLM как есть."""
     by_name: dict[str, dict] = {}
+    alias_map: dict[str, str] = {}
     for f in filters:
         if not isinstance(f, dict):
             continue
         name = str(f.get("name") or "").strip()
-        if name:
-            by_name[name] = f
-
-    result: dict[str, object] = {}
-    for name, f in by_name.items():
-        result[name] = _default_filter_value(f)
-
-    if not extracted:
-        return result
-
-    # alias → name
-    alias_map: dict[str, str] = {}
-    for name, f in by_name.items():
+        if not name:
+            continue
+        by_name[name] = f
         alias = str(f.get("alias") or "").strip()
         if alias:
             alias_map[alias.lower()] = name
         alias_map[name.lower()] = name
 
+    result: dict[str, object] = {
+        name: f.get("value") for name, f in by_name.items()
+    }
+    if not extracted:
+        return result
+
     for raw_key, val in extracted.items():
         key = str(raw_key or "").strip()
-        if not key:
+        if not key or val is None or val == "":
             continue
-        name = by_name[key]["name"] if key in by_name else alias_map.get(key.lower())
-        if not name:
-            continue
-        if val is None or val == "":
-            continue
-        result[str(name)] = val
+        name = key if key in by_name else alias_map.get(key.lower())
+        if name:
+            result[str(name)] = val
     return result
 
 
@@ -367,11 +390,12 @@ def extract_filter_values(
     question: str,
     filters: list[dict],
 ) -> dict[str, object]:
-    """LLM: из вопроса → {name: value} только по известным фильтрам."""
+    """LLM работает с filters как есть → {name: value}."""
     q = (question or "").strip()
     if not q or not filters:
         return {}
 
+    # отдаём LLM тот же shape, что в /filters (name/alias/choices/value)
     compact: list[dict[str, object]] = []
     for f in filters:
         if not isinstance(f, dict) or not f.get("name"):
@@ -380,32 +404,16 @@ def extract_filter_values(
             "name": f.get("name"),
             "alias": f.get("alias") or f.get("name"),
             "value": f.get("value"),
+            "choices": f.get("choices") or [],
         }
-        choices = f.get("choices") or []
-        if isinstance(choices, list) and choices:
-            # не раздуваем промпт: до 40 пунктов
-            slim = []
-            for ch in choices[:40]:
-                if not isinstance(ch, dict):
-                    continue
-                slim.append(
-                    {
-                        k: ch[k]
-                        for k in ("key", "value", "checked")
-                        if k in ch and ch[k] not in (None, "")
-                    }
-                )
-            item["choices"] = slim
-            if len(choices) > 40:
-                item["choices_truncated"] = True
         compact.append(item)
 
     if not compact:
         return {}
 
     user = (
-        f"Фильтры дашборда:\n{json.dumps(compact, ensure_ascii=False)}\n\n"
-        f"Вопрос пользователя:\n{q}"
+        f"filters:\n{json.dumps(compact, ensure_ascii=False)}\n\n"
+        f"question:\n{q}"
     )
     content = _chat(
         [
@@ -414,7 +422,6 @@ def extract_filter_values(
         ]
     )
     picked = _parse_json_object(content)
-    # только скаляры / простые значения
     out: dict[str, object] = {}
     for k, v in picked.items():
         if isinstance(v, (dict, list)):
