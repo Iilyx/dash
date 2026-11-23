@@ -262,7 +262,7 @@ if not MRT_PATH.is_file():
 
 HOST = os.environ.get("VIEWER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VIEWER_PORT", "8040") or "8040")
-OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "1").lower() in {"1", "true", "yes"}
+OPEN_BROWSER = os.environ.get("VIEWER_OPEN", "0").lower() in {"1", "true", "yes"}
 EXPORT_DIR = path_of(os.environ.get("EXPORT_DIR", "exports").strip() or "exports")
 
 _db = os.environ.get("DATABASE_URL", "").strip()
