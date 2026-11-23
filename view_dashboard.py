@@ -1067,13 +1067,18 @@ def openapi_spec() -> dict:
             "/filters": {
                 "get": {
                     "tags": ["filters"],
-                    "summary": "Список фильтров из .mrt (+ SQL choices)",
+                    "summary": "Фильтры из .mrt; с ?q= — LLM по instruction.md выбирает .mrt",
                     "description": (
-                        "Variables с Category «Фильтр(ы)». "
-                        "`choices_from=items` — Keys/Values; "
-                        "`choices_from=query` — SqlCommand DataSource (по умолчанию выполняется)."
+                        "Без q — MRT_PATH. С q/question — instruction.md + список *.mrt → LLM → filters. "
+                        "POST JSON: {\"question\":\"...\"}."
                     ),
                     "parameters": [
+                        {
+                            "name": "q",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "description": "Вопрос пользователя → выбор dashboard",
+                        },
                         {
                             "name": "run_queries",
                             "in": "query",
@@ -1083,16 +1088,53 @@ def openapi_spec() -> dict:
                                 "default": "1",
                             },
                             "description": "1 — выполнить SQL dialog.source; 0 — только метаданные",
-                        }
+                        },
                     ],
                     "responses": {
                         "200": {
-                            "description": "Фильтры",
+                            "description": "Фильтры (+ dashboard при выборе)",
                             "content": {
                                 "application/json": {
                                     "schema": {"$ref": "#/components/schemas/FiltersResponse"}
                                 }
                             },
+                        }
+                    },
+                },
+                "post": {
+                    "tags": ["filters"],
+                    "summary": "Как GET /filters?q=… (question в JSON)",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {"type": "string"},
+                                        "q": {"type": "string"},
+                                        "run_queries": {"type": "boolean"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Фильтры + выбранный dashboard",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        }
+                    },
+                },
+            },
+            "/dashboards": {
+                "get": {
+                    "tags": ["filters"],
+                    "summary": "Список dashboards/*.md и наличие .mrt",
+                    "responses": {
+                        "200": {
+                            "description": "Каталог",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
                         }
                     },
                 }
@@ -1368,35 +1410,107 @@ def vendor_html2canvas():
     return resp
 
 
-@app.get("/filters")
-def filters():
-    """Variables с Category «Фильтр(ы)»: items или SQL dialog.source (SQL считается по умолчанию)."""
-    try:
-        from filters_mrt import extract_filters
+def _filters_run_queries_flag() -> bool:
+    rq = (request.args.get("run_queries") or request.args.get("sql") or "1").strip().lower()
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict) and body.get("run_queries") is not None:
+            rq = str(body.get("run_queries")).strip().lower()
+    return rq not in {"0", "false", "no", "off"}
 
-        # по умолчанию SQL выполняется; ?run_queries=0 — только метаданные
-        rq = (request.args.get("run_queries") or request.args.get("sql") or "1").strip().lower()
-        run_queries = rq not in {"0", "false", "no", "off"}
+
+def _filters_question() -> str:
+    q = (request.args.get("q") or request.args.get("question") or "").strip()
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            q = str(body.get("question") or body.get("q") or q or "").strip()
+    return q
+
+
+@app.route("/filters", methods=["GET", "POST"])
+def filters():
+    """Фильтры из .mrt.
+
+    Без вопроса — MRT_PATH.
+    С вопросом — instruction.md + список .mrt → LLM выбирает mrt → filters этого файла.
+    """
+    from filters_mrt import extract_filters
+    from pick_dashboard import list_mrt_files, load_instruction, pick_dashboard
+
+    run_queries = _filters_run_queries_flag()
+    question = _filters_question()
+    dashboard_info: dict[str, object] | None = None
+    mrt_file = MRT_PATH
+
+    try:
+        if question:
+            dashboard_info = pick_dashboard(question)
+            mrt_file = Path(str(dashboard_info["mrt_path"]))
+
         plan = extract_filters(
-            MRT_PATH,
+            mrt_file,
             run_queries=run_queries,
             database_url=_db or None,
         )
     except Exception as exc:
-        return jsonify(
-            {
-                "mrt": MRT_PATH.name,
-                "kind": "category_filters",
-                "error": str(exc),
-                "count": 0,
-                "filters": [],
+        payload: dict[str, object] = {
+            "ok": False,
+            "mrt": mrt_file.name if isinstance(mrt_file, Path) else MRT_PATH.name,
+            "kind": "category_filters",
+            "error": str(exc),
+            "count": 0,
+            "filters": [],
+        }
+        if question:
+            payload["question"] = question
+        if dashboard_info:
+            payload["dashboard"] = {
+                "mrt": dashboard_info.get("mrt"),
+                "title": dashboard_info.get("title"),
+                "description": dashboard_info.get("description"),
+                "reason": dashboard_info.get("reason"),
             }
-        ), 500
+        return jsonify(payload), 500
+
+    if question and dashboard_info:
+        plan["ok"] = True
+        plan["question"] = question
+        plan["dashboard"] = {
+            "mrt": dashboard_info.get("mrt"),
+            "title": dashboard_info.get("title"),
+            "description": dashboard_info.get("description"),
+            "reason": dashboard_info.get("reason"),
+            "mrt_path": dashboard_info.get("mrt_path"),
+        }
+
     resp = jsonify(plan)
     resp.headers["Cache-Control"] = "no-store"
     if plan.get("mrt_stripped"):
         return resp, 422
     return resp
+
+
+@app.get("/dashboards")
+def dashboards_list():
+    """Список .mrt в dashboards/ + есть ли instruction.md."""
+    from pick_dashboard import dashboards_dir, list_mrt_files, load_instruction
+
+    base = dashboards_dir()
+    items = list_mrt_files(base)
+    instruction = load_instruction(base)
+    return jsonify(
+        {
+            "ok": True,
+            "dir": str(base.resolve()),
+            "instruction": bool(instruction),
+            "instruction_preview": (instruction[:400] + "…")
+            if len(instruction) > 400
+            else instruction,
+            "count": len(items),
+            "mrt": [d["mrt"] for d in items],
+        }
+    )
 
 
 @app.post("/api/screenshot")
@@ -1692,7 +1806,8 @@ def main() -> None:
     print(f"MRT: {MRT_PATH.resolve()}", flush=True)
     print(f"Designer: http://{HOST}:{PORT}/designer", flush=True)
     print(f"Viewer:   http://{HOST}:{PORT}/viewer   (preview + Submit)", flush=True)
-    print(f"Filters:  http://{HOST}:{PORT}/filters", flush=True)
+    print(f"Filters:  http://{HOST}:{PORT}/filters  (?q=… → LLM pick dashboard)", flush=True)
+    print(f"Boards:   http://{HOST}:{PORT}/dashboards", flush=True)
     print(f"Open:     http://{HOST}:{PORT}/open     (filters → ready dashboard)", flush=True)
     print(f"Shot:     http://{HOST}:{PORT}/shot     (signal → open tab shoots)", flush=True)
     print(f"Swagger:  http://{HOST}:{PORT}/docs", flush=True)
