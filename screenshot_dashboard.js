@@ -1,8 +1,8 @@
 /* Скрин дашборда + Table/Pivot → PDF.
  *
  * UI-кнопка выключена по умолчанию (SHOT_SHOW_BUTTON / ?shot_ui=1).
- * GET /shot не перезагружает дашборд: вкладка /open поллит /api/shot-poll
- * и по сигналу снимает PNG+PDF (download + exports/).
+ * GET /shot → сигнал вкладке /open (long-poll); без reload.
+ * html2canvas с локального /vendor/html2canvas.min.js — без CDN/интернета.
  *
  * Stimulsoft кладёт RegionMap HTML в iframe (InsertHTMLContentToDashboardElement + document.write).
  * html2canvas iframe не видит → карта пустая.
@@ -10,8 +10,7 @@
  * fallback — SVG с inline fill у text; прячем iframe, снимаем страницу.
  */
 (function () {
-  var HTML2CANVAS =
-    "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+  var HTML2CANVAS = "/vendor/html2canvas.min.js";
   var SCALE = 2;
 
   function loadScript(src) {
@@ -1531,6 +1530,7 @@
     if (window.__dashShotBusy) return;
     window.__dashShotBusy = true;
     window.__dashShotDone = null;
+    var shotId = opts.id || null;
     try {
       // по сигналу /shot дашборд уже на экране — не ждать 70с
       if (opts.skipWait) {
@@ -1540,6 +1540,8 @@
       } else {
         await waitDashboardReady(70000);
       }
+      // прогреть html2canvas заранее / на всякий случай
+      await loadScript(HTML2CANVAS);
       var result = await takeScreenshot();
       window.__dashShotDone = result || {
         ok: false,
@@ -1559,6 +1561,7 @@
     } finally {
       window.__dashShotBusy = false;
     }
+    if (shotId) window.__dashShotDone.id = shotId;
     console.log("[dash-shot] done", window.__dashShotDone);
     await reportShotDone(window.__dashShotDone);
   }
@@ -1566,19 +1569,22 @@
   function startShotPoller() {
     if (window.__dashShotPoller) return;
     window.__dashShotPoller = true;
+    var lastId = null;
     function loop() {
       if (window.__dashShotBusy) {
         setTimeout(loop, 400);
         return;
       }
-      fetch("/api/shot-poll", { cache: "no-store" })
+      var q = lastId ? "?since=" + encodeURIComponent(lastId) : "";
+      fetch("/api/shot-poll" + q, { cache: "no-store" })
         .then(function (r) {
           return r.json();
         })
         .then(function (j) {
-          if (j && j.shoot) {
-            console.log("[dash-shot] signal → shoot");
-            return runAutoShot({ skipWait: true }).then(function () {
+          if (j && j.shoot && j.id && j.id !== lastId) {
+            lastId = j.id;
+            console.log("[dash-shot] signal → shoot", j.id);
+            return runAutoShot({ skipWait: true, id: j.id }).then(function () {
               loop();
             });
           }
@@ -1617,7 +1623,10 @@
       bar.appendChild(status);
       document.body.appendChild(bar);
     }
-    // всегда слушаем GET /shot (без reload дашборда)
+    // локальный html2canvas заранее — скрин не ждёт CDN
+    loadScript(HTML2CANVAS).catch(function (e) {
+      console.warn("[dash-shot] html2canvas preload", e);
+    });
     startShotPoller();
     if (autoShotEnabled()) {
       setTimeout(runAutoShot, 0);

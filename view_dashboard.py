@@ -54,7 +54,6 @@ RENDER_FILTER_STORE: dict[str, dict[str, object]] = {}
 LATEST_RENDER_FILTERS: dict[str, object] = {}
 # GET /shot → сигнал уже открытому /open (без перезагрузки дашборда)
 _SHOT_LOCK = threading.Lock()
-_SHOT_PENDING: dict[str, float] = {}
 _SHOT_RESULTS: dict[str, dict[str, object]] = {}
 _RENDER_QUERY_SKIP = {
     "run_queries",
@@ -1384,6 +1383,17 @@ def screenshot_dashboard_js():
     return resp
 
 
+@app.get("/vendor/html2canvas.min.js")
+def vendor_html2canvas():
+    """Локальная копия html2canvas — скрин без CDN/интернета."""
+    path = ROOT / "vendor" / "html2canvas.min.js"
+    if not path.is_file():
+        return jsonify({"ok": False, "error": "vendor/html2canvas.min.js missing"}), 404
+    resp = Response(path.read_bytes(), mimetype="application/javascript; charset=utf-8")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 @app.get("/filters")
 def filters():
     """Variables с Category «Фильтр(ы)»: items или SQL dialog.source (SQL считается по умолчанию)."""
@@ -1444,8 +1454,9 @@ def api_screenshot():
     return jsonify({"ok": True, "name": out.name, "path": str(out.resolve())})
 
 
-# Общий сигнал: GET /shot без параметров → любая открытая вкладка /open|/viewer
-_SHOT_GLOBAL_KEY = "*"
+# Общий сигнал: GET /shot → открытая вкладка /open|/viewer
+# pending не снимаем на poll (иначе сигнал терялся) — только на shot-done / timeout
+_SHOT_STATE: dict[str, object] = {"id": None, "at": 0.0}
 
 
 def _shot_wait_ms() -> int:
@@ -1458,63 +1469,72 @@ def _shot_wait_ms() -> int:
 
 @app.get("/api/shot-poll")
 def api_shot_poll():
-    """Long-poll: ждёт сигнал GET /shot до ~25с (без спама каждые 0.8с)."""
+    """Long-poll: ждёт сигнал GET /shot до ~25с. Pending не снимает."""
+    since = (request.args.get("since") or "").strip() or None
     deadline = time.time() + 25.0
     while time.time() < deadline:
         with _SHOT_LOCK:
-            if _SHOT_GLOBAL_KEY in _SHOT_PENDING:
-                _SHOT_PENDING.pop(_SHOT_GLOBAL_KEY, None)
-                return jsonify({"shoot": True})
+            sid = _SHOT_STATE.get("id")
+            if sid and sid != since:
+                return jsonify({"shoot": True, "id": sid})
         time.sleep(0.1)
-    return jsonify({"shoot": False})
+    return jsonify({"shoot": False, "id": None})
 
 
 @app.post("/api/shot-done")
 def api_shot_done():
-    """Вкладка отдала результат скрина на GET /shot."""
+    """Вкладка отдала результат; снимаем pending."""
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
         body = {"ok": False, "error": "bad body"}
+    sid = body.get("id")
     with _SHOT_LOCK:
-        _SHOT_RESULTS[_SHOT_GLOBAL_KEY] = body
+        if sid and _SHOT_STATE.get("id") == sid:
+            _SHOT_STATE["id"] = None
+        elif not sid:
+            _SHOT_STATE["id"] = None
+        _SHOT_RESULTS["*"] = body
     return jsonify({"ok": True})
 
 
 @app.get("/shot")
 def api_shot():
-    """Сигнал любой открытой вкладке /open: скрин + download, без токена и без reload.
+    """Сигнал открытой вкладке /open: скрин + download, без reload.
 
-    1) Браузер: /open?...  (вкладка остаётся открытой)
-    2) GET /shot           → вкладка снимает PNG/PDF и скачивает
+    Нужна открытая вкладка /open|/viewer (html2canvas локально, без CDN).
     """
-    key = _SHOT_GLOBAL_KEY
+    sid = secrets.token_urlsafe(8)
     with _SHOT_LOCK:
-        _SHOT_PENDING[key] = time.time()
-        _SHOT_RESULTS.pop(key, None)
-    print("shot signal (global)", flush=True)
+        _SHOT_STATE["id"] = sid
+        _SHOT_STATE["at"] = time.time()
+        _SHOT_RESULTS.pop("*", None)
+    print(f"shot signal id={sid}", flush=True)
 
     deadline = time.time() + (_shot_wait_ms() / 1000.0)
     result: dict[str, object] | None = None
     while time.time() < deadline:
         with _SHOT_LOCK:
-            if key in _SHOT_RESULTS:
-                result = _SHOT_RESULTS.pop(key)
+            if "*" in _SHOT_RESULTS:
+                result = _SHOT_RESULTS.pop("*")
                 break
         time.sleep(0.15)
 
     if result is None:
         with _SHOT_LOCK:
-            _SHOT_PENDING.pop(key, None)
+            if _SHOT_STATE.get("id") == sid:
+                _SHOT_STATE["id"] = None
         return jsonify(
             {
                 "ok": False,
                 "error": "timeout: открой /open в браузере и повтори GET /shot",
+                "id": sid,
             }
         ), 504
 
     ok = bool(result.get("ok"))
     payload = {
         "ok": ok,
+        "id": result.get("id") or sid,
         "png": result.get("png"),
         "pdfs": result.get("pdfs") or [],
         "files": result.get("files") or [],
